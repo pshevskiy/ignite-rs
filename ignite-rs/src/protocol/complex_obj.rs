@@ -123,6 +123,59 @@ impl ComplexObject {
     }
 }
 
+impl WritableType for IgniteValue {
+    fn write(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        match self {
+            IgniteValue::String(val) => {
+                write_u8(writer, TypeCode::String as u8)?;
+                write_string(writer, val)
+            }
+            IgniteValue::Long(val) => {
+                write_u8(writer, TypeCode::Long as u8)?;
+                write_i64(writer, *val)
+            }
+            IgniteValue::Int(val) => {
+                write_u8(writer, TypeCode::Int as u8)?;
+                write_i32(writer, *val)
+            }
+            IgniteValue::Short(val) => {
+                write_u8(writer, TypeCode::Short as u8)?;
+                write_i16(writer, *val)
+            }
+            IgniteValue::Bool(val) => {
+                write_u8(writer, TypeCode::Bool as u8)?;
+                write_u8(writer, if *val { 1 } else { 0 })
+            }
+            IgniteValue::Timestamp(big, little) => {
+                write_u8(writer, TypeCode::Timestamp as u8)?;
+                write_i64(writer, *big)?;
+                write_i32(writer, *little)
+            }
+            IgniteValue::Decimal(scale, data) => {
+                write_u8(writer, TypeCode::Decimal as u8)?;
+                write_i32(writer, *scale)?;
+                write_i32(writer, data.len() as i32)?;
+                writer.write_all(data)
+            }
+            IgniteValue::Null => write_null(writer),
+        }
+    }
+
+    fn size(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            IgniteValue::String(s) => 1 + size_of::<i32>() + s.len(),
+            IgniteValue::Long(_) => 1 + size_of::<i64>(),
+            IgniteValue::Int(_) => 1 + size_of::<i32>(),
+            IgniteValue::Short(_) => 1 + size_of::<i16>(),
+            IgniteValue::Bool(_) => 1 + size_of::<u8>(),
+            IgniteValue::Timestamp(_, _) => 1 + size_of::<i64>() + size_of::<i32>(),
+            IgniteValue::Decimal(_, data) => 1 + size_of::<i32>() + size_of::<i32>() + data.len(),
+            IgniteValue::Null => 1,
+        }
+    }
+}
+
 impl ReadableType for ComplexObject {
     fn read_unwrapped(type_code: TypeCode, reader: &mut impl Read) -> IgniteResult<Option<Self>> {
         let mut me = ComplexObject {

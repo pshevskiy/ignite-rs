@@ -1,6 +1,7 @@
 pub(crate) mod cache_config;
 pub(crate) mod key_value;
 
+#[derive(Debug, Copy, Clone)]
 pub(crate) enum OpCode {
     Handshake = 1,
     //cache configuration
@@ -35,6 +36,10 @@ pub(crate) enum OpCode {
     CacheGetSize = 1020,
     // sql & scan queries - https://ignite.apache.org/docs/latest/binary-client-protocol/sql-and-scan-queries
     QueryScan = 2000,
+    QueryClose = 0,
+    // SQL fields query
+    QuerySqlFields = 2004,
+    QuerySqlFieldsCursorGetPage = 2005,
 }
 
 impl Into<i16> for OpCode {

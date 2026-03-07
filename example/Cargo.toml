@@ -13,3 +13,12 @@ path = "../ignite-rs_derive"
 [dependencies.ignite-rs]
 path = "../ignite-rs"
 #features = ["ssl"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+ssl = ["ignite-rs/ssl"]

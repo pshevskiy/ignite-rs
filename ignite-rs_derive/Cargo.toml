@@ -8,7 +8,7 @@ description = "Apache Ignite thin client"
 homepage = "https://github.com/apohrebniak/ignite-rs"
 documentation = "https://github.com/apohrebniak/ignite-rs"
 repository = "https://github.com/apohrebniak/ignite-rs"
-readme = "../README.md"
+readme = "../ignite-rs/README.md"
 keywords = ["ignite","client"]
 categories = ["database"]
 

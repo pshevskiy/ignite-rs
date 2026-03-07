@@ -18,7 +18,7 @@ use crate::protocol::{
 use crate::ReadableType;
 use std::io;
 
-const MIN_CONFIG_PARAMS: i16 = 26;
+const MIN_CONFIG_PARAMS: i16 = 25;
 
 /// Cache Configuration Properties Codes
 #[derive(PartialOrd, PartialEq)]
@@ -99,9 +99,6 @@ pub(crate) fn get_cache_configuration_bytes(config: &CacheConfiguration) -> io::
 
     write_i16(&mut config_opts, IsOnheapCacheEnabled as i16)?;
     write_bool(&mut config_opts, config.onheap_cache_enabled)?;
-
-    write_i16(&mut config_opts, MaxQueryIterators as i16)?;
-    write_i32(&mut config_opts, config.max_query_iterators)?;
 
     write_i16(&mut config_opts, PartitionLossPolicy as i16)?;
     write_i32(
@@ -270,7 +267,7 @@ fn read_query_entities(reader: &mut impl Read) -> IgniteResult<Vec<QueryEntity>>
             query_fields,
             field_aliases,
             query_indexes,
-            default_value: None, //TODO
+            _default_value: None, //TODO
         })
     }
     Ok(result)

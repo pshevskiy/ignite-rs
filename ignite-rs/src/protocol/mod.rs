@@ -110,6 +110,7 @@ fn read_object(reader: &mut impl Read) -> IgniteResult<Option<()>> {
 pub fn read_wrapped_data<T: ReadableType>(reader: &mut impl Read) -> IgniteResult<Option<T>> {
     let type_code = TypeCode::try_from(read_u8(reader)?)?;
     match type_code {
+        TypeCode::Null => Ok(None),
         TypeCode::WrappedData => {
             read_i32(reader)?; // skip len
             let value = T::read(reader);

@@ -3,16 +3,17 @@ use quote::*;
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, FieldsNamed};
 
-#[proc_macro_derive(IgniteObj)]
+#[proc_macro_derive(IgniteObj, attributes(ignite_type_name))]
 pub fn derive_ignite_obj(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(item as DeriveInput);
-
     let type_name = &input.ident; // name of the struct
+    let type_id_override = get_type_name_override(&input).map(|s| string_to_java_hashcode(&s));
     let output = match input.data {
         Data::Struct(ref st) => match st.fields {
             Fields::Named(ref fields) => {
-                let write_tokens = impl_write_type(type_name, fields);
-                let read_tokens = impl_read_type(type_name, fields);
+                let type_id = type_id_override.unwrap_or_else(|| get_type_id(type_name));
+                let write_tokens = impl_write_type(type_name, fields, type_id);
+                let read_tokens = impl_read_type(type_name, fields, type_id);
 
                 quote! {
                     #write_tokens
@@ -28,8 +29,7 @@ pub fn derive_ignite_obj(item: proc_macro::TokenStream) -> proc_macro::TokenStre
 }
 
 /// Implements ignite_rs::WritableType trait
-fn impl_write_type(type_name: &Ident, fields: &FieldsNamed) -> TokenStream {
-    let type_id: i32 = get_type_id(type_name);
+fn impl_write_type(type_name: &Ident, fields: &FieldsNamed, type_id: i32) -> TokenStream {
     let schema_id = get_schema_id(fields);
 
     let fields_schema = fields.named.iter().map(|f| {
@@ -84,8 +84,7 @@ fn impl_write_type(type_name: &Ident, fields: &FieldsNamed) -> TokenStream {
 }
 
 /// Implements ReadableType trait
-fn impl_read_type(type_name: &Ident, fields: &FieldsNamed) -> TokenStream {
-    let exp_type_id: i32 = get_type_id(type_name);
+fn impl_read_type(type_name: &Ident, fields: &FieldsNamed, exp_type_id: i32) -> TokenStream {
     let fields_count = fields.named.len();
 
     let fields_read = fields.named.iter().map(|f| {
@@ -179,6 +178,25 @@ fn get_schema_id(fields: &FieldsNamed) -> i32 {
 /// Java-like hashcode of type's name
 fn get_type_id(ident: &Ident) -> i32 {
     string_to_java_hashcode(&ident.to_string())
+}
+
+fn get_type_name_override(input: &DeriveInput) -> Option<String> {
+    for attr in &input.attrs {
+        if attr.path.is_ident("ignite_type_name") {
+            if let Ok(syn::Meta::NameValue(nv)) = attr.parse_meta() {
+                if let syn::Lit::Str(ls) = nv.lit {
+                    return Some(ls.value());
+                }
+            } else if let Ok(syn::Meta::List(list)) = attr.parse_meta() {
+                for nested in list.nested.iter() {
+                    if let syn::NestedMeta::Lit(syn::Lit::Str(ls)) = nested {
+                        return Some(ls.value());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// FNV1 hash offset basis

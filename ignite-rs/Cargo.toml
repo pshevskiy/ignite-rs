@@ -8,24 +8,37 @@ description = "Apache Ignite thin client"
 homepage = "https://github.com/apohrebniak/ignite-rs"
 documentation = "https://github.com/apohrebniak/ignite-rs"
 repository = "https://github.com/apohrebniak/ignite-rs"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["ignite","client"]
 categories = ["database"]
 
 [dependencies]
-bufstream = "0.1.4"
+[dependencies.tokio]
+version = "1"
+features = ["net", "io-util", "sync"]
+
+[dependencies.tokio-rustls]
+version = "0.25"
+optional = true
 
 [dev-dependencies]
 hex-literal = "0.4.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
+criterion = { version = "0.5" }
 
 [dependencies.rustls]
-version = "0.17.0"
+version = "0.22"
 optional = true
 
-[dependencies.webpki]
-version = "0.21.3"
+[dependencies.rustls-pemfile]
+version = "1"
 optional = true
 
 [features]
 default = []
-ssl = ["rustls", "webpki"]
+ssl = ["rustls", "tokio-rustls", "rustls-pemfile"]
+rt-tokio = []
+
+[[bench]]
+name = "sync_async_bench"
+harness = false

@@ -51,7 +51,7 @@ pub(crate) struct CacheCreateWithNameReq<'a> {
 }
 
 impl CacheCreateWithNameReq<'_> {
-    pub(crate) fn from(name: &str) -> CacheCreateWithNameReq {
+    pub(crate) fn from(name: &str) -> CacheCreateWithNameReq<'_> {
         CacheCreateWithNameReq { name }
     }
 }
@@ -72,7 +72,7 @@ pub(crate) struct CacheGetOrCreateWithNameReq<'a> {
 }
 
 impl CacheGetOrCreateWithNameReq<'_> {
-    pub(crate) fn from(name: &str) -> CacheGetOrCreateWithNameReq {
+    pub(crate) fn from(name: &str) -> CacheGetOrCreateWithNameReq<'_> {
         CacheGetOrCreateWithNameReq { name }
     }
 }
@@ -123,7 +123,7 @@ pub(crate) struct CacheGetConfigReq<'a> {
 }
 
 impl CacheGetConfigReq<'_> {
-    pub(crate) fn from(name: &str) -> CacheGetConfigReq {
+    pub(crate) fn from(name: &str) -> CacheGetConfigReq<'_> {
         CacheGetConfigReq { name }
     }
 }
@@ -158,7 +158,7 @@ pub(crate) struct CacheDestroyReq<'a> {
 }
 
 impl CacheDestroyReq<'_> {
-    pub(crate) fn from(name: &str) -> CacheDestroyReq {
+    pub(crate) fn from(name: &str) -> CacheDestroyReq<'_> {
         CacheDestroyReq { name }
     }
 }

@@ -14,10 +14,10 @@ use crate::cache::WriteSynchronizationMode::{FullAsync, FullSync, PrimarySync};
 use crate::error::{IgniteError, IgniteResult};
 
 use crate::api::OpCode;
-use crate::connection::Connection;
+use crate::exec::{IgniteFuture, TokioExec};
+use crate::protocol::complex_obj::IgniteValue;
 use crate::{ReadableType, WritableType};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum AtomicityMode {
@@ -249,7 +249,7 @@ pub struct QueryEntity {
     pub(crate) query_fields: Vec<QueryField>,
     pub(crate) field_aliases: Vec<(String, String)>,
     pub(crate) query_indexes: Vec<QueryIndex>,
-    pub(crate) default_value: Option<String>, //TODO: find the issue where this field is listed
+    pub(crate) _default_value: Option<String>, //TODO: find the issue where this field is listed
 }
 
 #[derive(Clone, Debug)]
@@ -273,215 +273,534 @@ pub struct QueryIndex {
 /// Ignite key-value cache. This cache is strongly typed and reading/writing some other
 /// types leads to errors.
 /// All caches created from the single IgniteClient shares the common TCP connection
-pub struct Cache<K: WritableType + ReadableType, V: WritableType + ReadableType> {
+pub struct CacheCore<K: WritableType + ReadableType, V: WritableType + ReadableType> {
     id: i32,
     pub _name: String,
-    conn: Arc<Connection>,
+    exec: TokioExec,
     k_phantom: PhantomData<K>,
     v_phantom: PhantomData<V>,
 }
 
-impl<K: WritableType + ReadableType, V: WritableType + ReadableType> Cache<K, V> {
-    pub(crate) fn new(id: i32, name: String, conn: Arc<Connection>) -> Cache<K, V> {
-        Cache {
+impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K, V> {
+    pub(crate) fn new(id: i32, name: String, exec: TokioExec) -> CacheCore<K, V> {
+        CacheCore {
             id,
             _name: name,
-            conn,
+            exec,
             k_phantom: PhantomData,
             v_phantom: PhantomData,
         }
     }
 
     /// https://ignite.apache.org/docs/latest/binary-client-protocol/sql-and-scan-queries#op_query_scan
-    pub fn query_scan(&self, page_size: i32) -> IgniteResult<Vec<(Option<K>, Option<V>)>> {
-        self.conn
-            .send_and_read(
-                OpCode::QueryScan,
-                CacheReq::QueryScan::<K, V>(self.id, page_size),
-            )
-            .map(|resp: QueryScanResp<K, V>| resp.val)
+    fn query_scan_impl<'a>(
+        &'a self,
+        page_size: i32,
+    ) -> IgniteResultOrFuture<'a, Vec<(Option<K>, Option<V>)>> {
+        let fut = self.exec.send_and_read(
+            OpCode::QueryScan,
+            CacheReq::QueryScan::<K, V>(self.id, page_size),
+        );
+        self.exec.map(fut, |resp: QueryScanResp<K, V>| resp.val)
     }
 
-    pub fn get(&self, key: &K) -> IgniteResult<Option<V>> {
-        self.conn
-            .send_and_read(OpCode::CacheGet, CacheReq::Get::<K, V>(self.id, key))
-            .map(|resp: CacheDataObjectResp<V>| resp.val)
+    // SQL fields helpers
+
+    fn query_sql_fields_open_impl<'a>(
+        &'a self,
+        schema: Option<&'a str>,
+        sql: &'a str,
+        page_size: i32,
+        args: &'a [IgniteValue],
+    ) -> IgniteResultOrFuture<'a, crate::api::key_value::SqlFieldsOpenRespLong> {
+        self.exec.send_and_read(
+            OpCode::QuerySqlFields,
+            CacheReq::QuerySqlFieldsArgs::<K, V>(self.id, schema, page_size, sql, args),
+        )
     }
 
-    pub fn get_all(&self, keys: &[K]) -> IgniteResult<Vec<(Option<K>, Option<V>)>> {
-        self.conn
-            .send_and_read(OpCode::CacheGetAll, CacheReq::GetAll::<K, V>(self.id, keys))
-            .map(|resp: CachePairsResp<K, V>| resp.val)
+    fn query_sql_fields_page_impl<'a>(
+        &'a self,
+        cursor_id: i64,
+        page_size: i32,
+    ) -> IgniteResultOrFuture<'a, (Vec<i64>, bool)> {
+        let fut = self.exec.send_and_read(
+            OpCode::QuerySqlFieldsCursorGetPage,
+            CacheReq::CursorGetPage::<K, V>(cursor_id, page_size),
+        );
+        self.exec
+            .map(fut, |resp: crate::api::key_value::SqlFieldsPageRespLong| {
+                (resp.rows, resp.has_more)
+            })
     }
 
-    pub fn put(&self, key: &K, value: &V) -> IgniteResult<()> {
-        self.conn
+    fn query_close_impl<'a>(&'a self, cursor_id: i64) -> IgniteResultOrFuture<'a, ()> {
+        self.exec
+            .send(OpCode::QueryClose, CacheReq::CursorClose::<K, V>(cursor_id))
+    }
+
+    fn get_impl<'a>(&'a self, key: &'a K) -> IgniteResultOrFuture<'a, Option<V>> {
+        let fut = self
+            .exec
+            .send_and_read(OpCode::CacheGet, CacheReq::Get::<K, V>(self.id, key));
+        self.exec.map(fut, |resp: CacheDataObjectResp<V>| resp.val)
+    }
+
+    fn get_all_impl<'a>(
+        &'a self,
+        keys: &'a [K],
+    ) -> IgniteResultOrFuture<'a, Vec<(Option<K>, Option<V>)>> {
+        let fut = self
+            .exec
+            .send_and_read(OpCode::CacheGetAll, CacheReq::GetAll::<K, V>(self.id, keys));
+        self.exec.map(fut, |resp: CachePairsResp<K, V>| resp.val)
+    }
+
+    fn put_impl<'a>(&'a self, key: &'a K, value: &'a V) -> IgniteResultOrFuture<'a, ()> {
+        self.exec
             .send(OpCode::CachePut, CacheReq::Put::<K, V>(self.id, key, value))
     }
 
-    pub fn put_all(&self, pairs: &[(K, V)]) -> IgniteResult<()> {
-        self.conn.send(
+    fn put_all_impl<'a>(&'a self, pairs: &'a [(K, V)]) -> IgniteResultOrFuture<'a, ()> {
+        self.exec.send(
             OpCode::CachePutAll,
             CacheReq::PutAll::<K, V>(self.id, pairs),
         )
     }
 
-    pub fn contains_key(&self, key: &K) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheContainsKey,
-                CacheReq::ContainsKey::<K, V>(self.id, key),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn contains_key_impl<'a>(&'a self, key: &'a K) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheContainsKey,
+            CacheReq::ContainsKey::<K, V>(self.id, key),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn contains_keys(&self, keys: &[K]) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheContainsKeys,
-                CacheReq::ContainsKeys::<K, V>(self.id, keys),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn contains_keys_impl<'a>(&'a self, keys: &'a [K]) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheContainsKeys,
+            CacheReq::ContainsKeys::<K, V>(self.id, keys),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn get_and_put(&self, key: &K, value: &V) -> IgniteResult<Option<V>> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetAndPut,
-                CacheReq::GetAndPut::<K, V>(self.id, key, value),
-            )
-            .map(|resp: CacheDataObjectResp<V>| resp.val)
+    fn get_and_put_impl<'a>(
+        &'a self,
+        key: &'a K,
+        value: &'a V,
+    ) -> IgniteResultOrFuture<'a, Option<V>> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetAndPut,
+            CacheReq::GetAndPut::<K, V>(self.id, key, value),
+        );
+        self.exec.map(fut, |resp: CacheDataObjectResp<V>| resp.val)
     }
 
-    pub fn get_and_replace(&self, key: &K, value: &V) -> IgniteResult<Option<V>> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetAndReplace,
-                CacheReq::GetAndReplace::<K, V>(self.id, key, value),
-            )
-            .map(|resp: CacheDataObjectResp<V>| resp.val)
+    fn get_and_replace_impl<'a>(
+        &'a self,
+        key: &'a K,
+        value: &'a V,
+    ) -> IgniteResultOrFuture<'a, Option<V>> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetAndReplace,
+            CacheReq::GetAndReplace::<K, V>(self.id, key, value),
+        );
+        self.exec.map(fut, |resp: CacheDataObjectResp<V>| resp.val)
     }
 
-    pub fn get_and_remove(&self, key: &K) -> IgniteResult<Option<V>> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetAndRemove,
-                CacheReq::GetAndRemove::<K, V>(self.id, key),
-            )
-            .map(|resp: CacheDataObjectResp<V>| resp.val)
+    fn get_and_remove_impl<'a>(&'a self, key: &'a K) -> IgniteResultOrFuture<'a, Option<V>> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetAndRemove,
+            CacheReq::GetAndRemove::<K, V>(self.id, key),
+        );
+        self.exec.map(fut, |resp: CacheDataObjectResp<V>| resp.val)
     }
 
-    pub fn put_if_absent(&self, key: &K, value: &V) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CachePutIfAbsent,
-                CacheReq::PutIfAbsent::<K, V>(self.id, key, value),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn put_if_absent_impl<'a>(
+        &'a self,
+        key: &'a K,
+        value: &'a V,
+    ) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CachePutIfAbsent,
+            CacheReq::PutIfAbsent::<K, V>(self.id, key, value),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn get_and_put_if_absent(&self, key: &K, value: &V) -> IgniteResult<Option<V>> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetAndPutIfAbsent,
-                CacheReq::GetAndPutIfAbsent::<K, V>(self.id, key, value),
-            )
-            .map(|resp: CacheDataObjectResp<V>| resp.val)
+    fn get_and_put_if_absent_impl<'a>(
+        &'a self,
+        key: &'a K,
+        value: &'a V,
+    ) -> IgniteResultOrFuture<'a, Option<V>> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetAndPutIfAbsent,
+            CacheReq::GetAndPutIfAbsent::<K, V>(self.id, key, value),
+        );
+        self.exec.map(fut, |resp: CacheDataObjectResp<V>| resp.val)
     }
 
-    pub fn replace(&self, key: &K, value: &V) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheReplace,
-                CacheReq::Replace::<K, V>(self.id, key, value),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn replace_impl<'a>(&'a self, key: &'a K, value: &'a V) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheReplace,
+            CacheReq::Replace::<K, V>(self.id, key, value),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn replace_if_equals(&self, key: &K, old: &V, new: &V) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheReplaceIfEquals,
-                CacheReq::ReplaceIfEquals::<K, V>(self.id, key, old, new),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn replace_if_equals_impl<'a>(
+        &'a self,
+        key: &'a K,
+        old: &'a V,
+        new: &'a V,
+    ) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheReplaceIfEquals,
+            CacheReq::ReplaceIfEquals::<K, V>(self.id, key, old, new),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn clear(&self) -> IgniteResult<()> {
-        self.conn
+    fn clear_impl<'a>(&'a self) -> IgniteResultOrFuture<'a, ()> {
+        self.exec
             .send(OpCode::CacheClear, CacheReq::Clear::<K, V>(self.id))
     }
 
-    pub fn clear_key(&self, key: &K) -> IgniteResult<()> {
-        self.conn.send(
+    fn clear_key_impl<'a>(&'a self, key: &'a K) -> IgniteResultOrFuture<'a, ()> {
+        self.exec.send(
             OpCode::CacheClearKey,
             CacheReq::ClearKey::<K, V>(self.id, key),
         )
     }
 
-    pub fn clear_keys(&self, keys: &[K]) -> IgniteResult<()> {
-        self.conn.send(
+    fn clear_keys_impl<'a>(&'a self, keys: &'a [K]) -> IgniteResultOrFuture<'a, ()> {
+        self.exec.send(
             OpCode::CacheClearKeys,
             CacheReq::ClearKeys::<K, V>(self.id, keys),
         )
     }
 
-    pub fn remove_key(&self, key: &K) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheRemoveKey,
-                CacheReq::RemoveKey::<K, V>(self.id, key),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn remove_key_impl<'a>(&'a self, key: &'a K) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheRemoveKey,
+            CacheReq::RemoveKey::<K, V>(self.id, key),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn remove_if_equals(&self, key: &K, value: &V) -> IgniteResult<bool> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheRemoveIfEquals,
-                CacheReq::RemoveIfEquals::<K, V>(self.id, key, value),
-            )
-            .map(|resp: CacheBoolResp| resp.flag)
+    fn remove_if_equals_impl<'a>(
+        &'a self,
+        key: &'a K,
+        value: &'a V,
+    ) -> IgniteResultOrFuture<'a, bool> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheRemoveIfEquals,
+            CacheReq::RemoveIfEquals::<K, V>(self.id, key, value),
+        );
+        self.exec.map(fut, |resp: CacheBoolResp| resp.flag)
     }
 
-    pub fn get_size(&self) -> IgniteResult<i64> {
+    fn get_size_impl<'a>(&'a self) -> IgniteResultOrFuture<'a, i64> {
         let modes = Vec::new();
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetSize,
-                CacheReq::GetSize::<K, V>(self.id, modes),
-            )
-            .map(|resp: CacheSizeResp| resp.size)
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetSize,
+            CacheReq::GetSize::<K, V>(self.id, modes),
+        );
+        self.exec.map(fut, |resp: CacheSizeResp| resp.size)
     }
 
-    pub fn get_size_peek_mode(&self, mode: CachePeekMode) -> IgniteResult<i64> {
+    fn get_size_peek_mode_impl<'a>(&'a self, mode: CachePeekMode) -> IgniteResultOrFuture<'a, i64> {
         let modes = vec![mode];
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetSize,
-                CacheReq::GetSize::<K, V>(self.id, modes),
-            )
-            .map(|resp: CacheSizeResp| resp.size)
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetSize,
+            CacheReq::GetSize::<K, V>(self.id, modes),
+        );
+        self.exec.map(fut, |resp: CacheSizeResp| resp.size)
     }
 
-    pub fn get_size_peek_modes(&self, modes: Vec<CachePeekMode>) -> IgniteResult<i64> {
-        self.conn
-            .send_and_read(
-                OpCode::CacheGetSize,
-                CacheReq::GetSize::<K, V>(self.id, modes),
-            )
-            .map(|resp: CacheSizeResp| resp.size)
+    fn get_size_peek_modes_impl<'a>(
+        &'a self,
+        modes: Vec<CachePeekMode>,
+    ) -> IgniteResultOrFuture<'a, i64> {
+        let fut = self.exec.send_and_read(
+            OpCode::CacheGetSize,
+            CacheReq::GetSize::<K, V>(self.id, modes),
+        );
+        self.exec.map(fut, |resp: CacheSizeResp| resp.size)
     }
 
-    pub fn remove_keys(&self, keys: &[K]) -> IgniteResult<()> {
-        self.conn.send(
+    fn remove_keys_impl<'a>(&'a self, keys: &'a [K]) -> IgniteResultOrFuture<'a, ()> {
+        self.exec.send(
             OpCode::CacheRemoveKeys,
             CacheReq::RemoveKeys::<K, V>(self.id, keys),
         )
     }
 
-    pub fn remove_all(&self) -> IgniteResult<()> {
-        self.conn
+    fn remove_all_impl<'a>(&'a self) -> IgniteResultOrFuture<'a, ()> {
+        self.exec
             .send(OpCode::CacheRemoveAll, CacheReq::RemoveAll::<K, V>(self.id))
     }
 }
+
+// Helper alias to shorten generic return type usage
+type IgniteResultOrFuture<'a, T> = IgniteFuture<'a, T>;
+
+// Async specialization API (Tokio)
+impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K, V> {
+    pub async fn query_scan(&self, page_size: i32) -> IgniteResult<Vec<(Option<K>, Option<V>)>> {
+        self.query_scan_impl(page_size).await
+    }
+    pub async fn query_sql_fields_long_with_args(
+        &self,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+    ) -> IgniteResult<Vec<i64>> {
+        let resp = self
+            .query_sql_fields_open_impl(None, sql, page_size, args)
+            .await?;
+        // Best-effort close; ignore error to preserve original return type
+        let _ = self.query_close_impl(resp.cursor_id).await;
+        Ok(resp.rows)
+    }
+    pub async fn query_sql_fields_long_with_args_schema(
+        &self,
+        schema: &str,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+    ) -> IgniteResult<Vec<i64>> {
+        let resp = self
+            .query_sql_fields_open_impl(Some(schema), sql, page_size, args)
+            .await?;
+        let _ = self.query_close_impl(resp.cursor_id).await;
+        Ok(resp.rows)
+    }
+    pub async fn query_close(&self, cursor_id: i64) -> IgniteResult<()> {
+        self.query_close_impl(cursor_id).await
+    }
+    pub async fn query_sql_fields_long_open_with_args(
+        &self,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+    ) -> IgniteResult<(i64, Vec<i64>, bool)> {
+        let resp = self
+            .query_sql_fields_open_impl(None, sql, page_size, args)
+            .await?;
+        Ok((resp.cursor_id, resp.rows, resp.has_more))
+    }
+    pub async fn query_sql_fields_long_open_with_args_schema(
+        &self,
+        schema: &str,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+    ) -> IgniteResult<(i64, Vec<i64>, bool)> {
+        let resp = self
+            .query_sql_fields_open_impl(Some(schema), sql, page_size, args)
+            .await?;
+        Ok((resp.cursor_id, resp.rows, resp.has_more))
+    }
+    pub async fn query_sql_fields_long_get_page(
+        &self,
+        cursor_id: i64,
+        page_size: i32,
+    ) -> IgniteResult<(Vec<i64>, bool)> {
+        self.query_sql_fields_page_impl(cursor_id, page_size).await
+    }
+    pub async fn query_sql_fields_long_fetch_up_to_with_args(
+        &self,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+        max: usize,
+    ) -> IgniteResult<(Vec<i64>, bool)> {
+        let mut out = Vec::new();
+        let open = self
+            .query_sql_fields_open_impl(None, sql, page_size, args)
+            .await?;
+        let cursor_id = open.cursor_id;
+        for pk in open.rows.into_iter() {
+            out.push(pk);
+            if out.len() >= max {
+                let _ = self.query_close_impl(cursor_id).await;
+                return Ok((out, true));
+            }
+        }
+        let mut has_more = open.has_more;
+        while has_more {
+            let (rows, more) = self
+                .query_sql_fields_page_impl(cursor_id, page_size)
+                .await?;
+            for pk in rows.into_iter() {
+                out.push(pk);
+                if out.len() >= max {
+                    let _ = self.query_close_impl(cursor_id).await;
+                    return Ok((out, true));
+                }
+            }
+            has_more = more;
+        }
+        let _ = self.query_close_impl(cursor_id).await;
+        Ok((out, false))
+    }
+    pub async fn query_sql_fields_long_fetch_up_to_with_args_schema(
+        &self,
+        schema: &str,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+        max: usize,
+    ) -> IgniteResult<(Vec<i64>, bool)> {
+        let mut out = Vec::new();
+        let open = self
+            .query_sql_fields_open_impl(Some(schema), sql, page_size, args)
+            .await?;
+        let cursor_id = open.cursor_id;
+        for pk in open.rows.into_iter() {
+            out.push(pk);
+            if out.len() >= max {
+                let _ = self.query_close_impl(cursor_id).await;
+                return Ok((out, true));
+            }
+        }
+        let mut has_more = open.has_more;
+        while has_more {
+            let (rows, more) = self
+                .query_sql_fields_page_impl(cursor_id, page_size)
+                .await?;
+            for pk in rows.into_iter() {
+                out.push(pk);
+                if out.len() >= max {
+                    let _ = self.query_close_impl(cursor_id).await;
+                    return Ok((out, true));
+                }
+            }
+            has_more = more;
+        }
+        let _ = self.query_close_impl(cursor_id).await;
+        Ok((out, false))
+    }
+    pub async fn query_sql_fields_long_fetch_all_with_args(
+        &self,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+    ) -> IgniteResult<Vec<i64>> {
+        let mut all = Vec::new();
+        let open = self
+            .query_sql_fields_open_impl(None, sql, page_size, args)
+            .await?;
+        let cursor_id = open.cursor_id;
+        all.extend(open.rows);
+        let mut has_more = open.has_more;
+        while has_more {
+            let (rows, more) = self
+                .query_sql_fields_page_impl(cursor_id, page_size)
+                .await?;
+            all.extend(rows);
+            has_more = more;
+        }
+        // ensure cursor close
+        let _ = self.query_close_impl(cursor_id).await;
+        Ok(all)
+    }
+    pub async fn query_sql_fields_long_fetch_all_with_args_schema(
+        &self,
+        schema: &str,
+        sql: &str,
+        page_size: i32,
+        args: &[IgniteValue],
+    ) -> IgniteResult<Vec<i64>> {
+        let mut all = Vec::new();
+        let open = self
+            .query_sql_fields_open_impl(Some(schema), sql, page_size, args)
+            .await?;
+        let cursor_id = open.cursor_id;
+        all.extend(open.rows);
+        let mut has_more = open.has_more;
+        while has_more {
+            let (rows, more) = self
+                .query_sql_fields_page_impl(cursor_id, page_size)
+                .await?;
+            all.extend(rows);
+            has_more = more;
+        }
+        let _ = self.query_close_impl(cursor_id).await;
+        Ok(all)
+    }
+    pub async fn get(&self, key: &K) -> IgniteResult<Option<V>> {
+        self.get_impl(key).await
+    }
+    pub async fn get_all(&self, keys: &[K]) -> IgniteResult<Vec<(Option<K>, Option<V>)>> {
+        self.get_all_impl(keys).await
+    }
+    pub async fn put(&self, key: &K, value: &V) -> IgniteResult<()> {
+        self.put_impl(key, value).await
+    }
+    pub async fn put_all(&self, pairs: &[(K, V)]) -> IgniteResult<()> {
+        self.put_all_impl(pairs).await
+    }
+    pub async fn contains_key(&self, key: &K) -> IgniteResult<bool> {
+        self.contains_key_impl(key).await
+    }
+    pub async fn contains_keys(&self, keys: &[K]) -> IgniteResult<bool> {
+        self.contains_keys_impl(keys).await
+    }
+    pub async fn get_and_put(&self, key: &K, value: &V) -> IgniteResult<Option<V>> {
+        self.get_and_put_impl(key, value).await
+    }
+    pub async fn get_and_replace(&self, key: &K, value: &V) -> IgniteResult<Option<V>> {
+        self.get_and_replace_impl(key, value).await
+    }
+    pub async fn get_and_remove(&self, key: &K) -> IgniteResult<Option<V>> {
+        self.get_and_remove_impl(key).await
+    }
+    pub async fn put_if_absent(&self, key: &K, value: &V) -> IgniteResult<bool> {
+        self.put_if_absent_impl(key, value).await
+    }
+    pub async fn get_and_put_if_absent(&self, key: &K, value: &V) -> IgniteResult<Option<V>> {
+        self.get_and_put_if_absent_impl(key, value).await
+    }
+    pub async fn replace(&self, key: &K, value: &V) -> IgniteResult<bool> {
+        self.replace_impl(key, value).await
+    }
+    pub async fn replace_if_equals(&self, key: &K, old: &V, new: &V) -> IgniteResult<bool> {
+        self.replace_if_equals_impl(key, old, new).await
+    }
+    pub async fn clear(&self) -> IgniteResult<()> {
+        self.clear_impl().await
+    }
+    pub async fn clear_key(&self, key: &K) -> IgniteResult<()> {
+        self.clear_key_impl(key).await
+    }
+    pub async fn clear_keys(&self, keys: &[K]) -> IgniteResult<()> {
+        self.clear_keys_impl(keys).await
+    }
+    pub async fn remove_key(&self, key: &K) -> IgniteResult<bool> {
+        self.remove_key_impl(key).await
+    }
+    pub async fn remove_if_equals(&self, key: &K, value: &V) -> IgniteResult<bool> {
+        self.remove_if_equals_impl(key, value).await
+    }
+    pub async fn get_size(&self) -> IgniteResult<i64> {
+        self.get_size_impl().await
+    }
+    pub async fn get_size_peek_mode(&self, mode: CachePeekMode) -> IgniteResult<i64> {
+        self.get_size_peek_mode_impl(mode).await
+    }
+    pub async fn get_size_peek_modes(&self, modes: Vec<CachePeekMode>) -> IgniteResult<i64> {
+        self.get_size_peek_modes_impl(modes).await
+    }
+    pub async fn remove_keys(&self, keys: &[K]) -> IgniteResult<()> {
+        self.remove_keys_impl(keys).await
+    }
+    pub async fn remove_all(&self) -> IgniteResult<()> {
+        self.remove_all_impl().await
+    }
+}
+
+// Async cache aliases.
+pub type Cache<K, V> = CacheCore<K, V>;
+pub type AsyncCache<K, V> = CacheCore<K, V>;
