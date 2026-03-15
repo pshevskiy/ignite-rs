@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="
+        http://www.springframework.org/schema/beans
+        http://www.springframework.org/schema/beans/spring-beans.xsd">
+
+    <bean class="org.apache.ignite.configuration.IgniteConfiguration">
+        <property name="localHost" value="0.0.0.0"/>
+        __ADDRESS_RESOLVER_PROPERTY__
+
+        <property name="discoverySpi">
+            <bean class="org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi">
+                <property name="localPort" value="47500"/>
+                <property name="localPortRange" value="0"/>
+                <property name="ipFinder">
+                    <bean class="org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder">
+                        <property name="addresses">
+                            <list>
+                                __DISCOVERY_NODE_ADDRESSES__
+                            </list>
+                        </property>
+                    </bean>
+                </property>
+            </bean>
+        </property>
+
+        <property name="communicationSpi">
+            <bean class="org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi">
+                <property name="localPort" value="47100"/>
+                <property name="localPortRange" value="0"/>
+            </bean>
+        </property>
+
+        <property name="clientConnectorConfiguration">
+            <bean class="org.apache.ignite.configuration.ClientConnectorConfiguration">
+                <property name="host" value="0.0.0.0"/>
+                <property name="port" value="10800"/>
+                <property name="portRange" value="0"/>
+                <property name="handshakeTimeout" value="5000"/>
+                <property name="idleTimeout" value="1000"/>
+                <property name="thinClientConfiguration">
+                    <bean class="org.apache.ignite.configuration.ThinClientConfiguration">
+                        <property name="maxActiveComputeTasksPerConnection" value="0"/>
+                    </bean>
+                </property>
+            </bean>
+        </property>
+    </bean>
+</beans>

@@ -5,7 +5,9 @@ use ignite_rs::{client_config_from_ca_and_client_pem, client_config_from_ca_pem}
 
 #[cfg(feature = "ssl")]
 #[derive(serde::Deserialize)]
-struct RootCfg { app: AppCfg }
+struct RootCfg {
+    app: AppCfg,
+}
 
 #[cfg(feature = "ssl")]
 #[derive(serde::Deserialize)]
@@ -51,18 +53,27 @@ async fn main() {
         .expect("thin-client.addresses must contain at least one entry")
         .to_string();
 
-    let tls = cfg.app.thin_client.tls.expect("thin-client.tls block required for tls_smoke");
+    let tls = cfg
+        .app
+        .thin_client
+        .tls
+        .expect("thin-client.tls block required for tls_smoke");
     let ca = tls.ca_pem.expect("thin-client.tls.ca_pem is required");
-    let sni = tls.server_name.expect("thin-client.tls.server_name is required");
+    let sni = tls
+        .server_name
+        .expect("thin-client.tls.server_name is required");
 
     let client_conf = match (tls.client_cert_pem, tls.client_key_pem) {
         (Some(cert), Some(key)) => {
-            client_config_from_ca_and_client_pem(&addr, &ca, &cert, &key, &sni).expect("invalid mTLS config")
+            client_config_from_ca_and_client_pem(&addr, &ca, &cert, &key, &sni)
+                .expect("invalid mTLS config")
         }
         _ => client_config_from_ca_pem(&addr, &ca, &sni).expect("invalid TLS config"),
     };
 
-    let client = new_client(client_conf).await.expect("ignite connect failed");
+    let client = new_client(client_conf)
+        .await
+        .expect("ignite connect failed");
     let names = client
         .get_cache_names()
         .await

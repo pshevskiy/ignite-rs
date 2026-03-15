@@ -1,45 +1,147 @@
 use crate::api::OpCode;
-use crate::connection_async::AsyncConnection;
 use crate::error::IgniteResult;
+use crate::query::continuous::CacheListenerRegistry;
+use crate::topology::TopologySnapshot;
+use crate::transport::{ChannelManager, RequestRoute, ResponseMeta, SqlFieldsCapabilities};
 use crate::{ReadableReq, WriteableReq};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-
-pub(crate) type IgniteFuture<'a, T> = Pin<Box<dyn Future<Output = IgniteResult<T>> + 'a>>;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub(crate) struct TokioExec {
-    pub(crate) conn: Arc<AsyncConnection>,
+    pub(crate) transport: Arc<ChannelManager>,
+    pub(crate) cache_listener_registry: Arc<CacheListenerRegistry>,
 }
 
 impl TokioExec {
-    pub(crate) fn new(conn: Arc<AsyncConnection>) -> Self {
-        Self { conn }
+    pub(crate) fn new(transport: Arc<ChannelManager>) -> Self {
+        Self {
+            transport,
+            cache_listener_registry: CacheListenerRegistry::new(),
+        }
     }
 
-    pub(crate) fn send<'a>(
-        &'a self,
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<crate::events::ClientEvent> {
+        self.transport.subscribe_events()
+    }
+
+    pub(crate) async fn send(&self, op_code: OpCode, data: impl WriteableReq) -> IgniteResult<()> {
+        self.transport.send(op_code, data).await
+    }
+
+    pub(crate) async fn send_with_route(
+        &self,
         op_code: OpCode,
-        data: impl WriteableReq + 'a,
-    ) -> IgniteFuture<'a, ()> {
-        Box::pin(async move { self.conn.send(op_code, data).await })
+        data: impl WriteableReq,
+        route: RequestRoute,
+    ) -> IgniteResult<()> {
+        self.transport.send_with_route(op_code, data, route).await
     }
 
-    pub(crate) fn send_and_read<'a, T: ReadableReq + 'a>(
-        &'a self,
+    pub(crate) async fn send_and_read<T: ReadableReq>(
+        &self,
         op_code: OpCode,
-        data: impl WriteableReq + 'a,
-    ) -> IgniteFuture<'a, T> {
-        Box::pin(async move { self.conn.send_and_read::<T>(op_code, data).await })
+        data: impl WriteableReq,
+    ) -> IgniteResult<T> {
+        self.transport.send_and_read::<T>(op_code, data).await
     }
 
-    pub(crate) fn map<'a, T, U, F>(&'a self, ret: IgniteFuture<'a, T>, f: F) -> IgniteFuture<'a, U>
-    where
-        T: 'a,
-        U: 'a,
-        F: FnOnce(T) -> U + 'a,
-    {
-        Box::pin(async move { ret.await.map(f) })
+    pub(crate) async fn send_and_read_with_route<T: ReadableReq>(
+        &self,
+        op_code: OpCode,
+        data: impl WriteableReq,
+        route: RequestRoute,
+    ) -> IgniteResult<T> {
+        self.transport
+            .send_and_read_with_route::<T>(op_code, data, route)
+            .await
+    }
+
+    pub(crate) async fn send_and_read_with_meta<T: ReadableReq>(
+        &self,
+        op_code: OpCode,
+        data: impl WriteableReq,
+        route: RequestRoute,
+    ) -> IgniteResult<(T, ResponseMeta)> {
+        self.transport
+            .send_and_read_with_meta::<T>(op_code, data, route)
+            .await
+    }
+
+    pub(crate) async fn register_notification_listener(
+        &self,
+        address: &str,
+        op_code: i16,
+        resource_id: i64,
+    ) -> IgniteResult<
+        mpsc::UnboundedReceiver<IgniteResult<crate::connection_async::NotificationFrame>>,
+    > {
+        self.transport
+            .register_notification_listener(address, op_code, resource_id)
+            .await
+    }
+
+    pub(crate) async fn remove_notification_listener(
+        &self,
+        address: &str,
+        op_code: i16,
+        resource_id: i64,
+    ) {
+        self.transport
+            .remove_notification_listener(address, op_code, resource_id)
+            .await
+    }
+
+    pub(crate) async fn topology_snapshot(&self) -> TopologySnapshot {
+        self.transport.topology_snapshot().await
+    }
+
+    pub(crate) async fn affinity_node_for_key(
+        &self,
+        cache_id: i32,
+        marshaled_key: &[u8],
+        primary: bool,
+    ) -> Option<String> {
+        self.transport
+            .affinity_node_for_key(cache_id, marshaled_key, primary)
+            .await
+    }
+
+    pub(crate) async fn affinity_node_for_partition(
+        &self,
+        cache_id: i32,
+        partition: i32,
+        primary: bool,
+    ) -> Option<String> {
+        self.transport
+            .affinity_node_for_partition(cache_id, partition, primary)
+            .await
+    }
+
+    pub(crate) async fn invalidate_affinity_cache(&self, cache_id: i32) {
+        self.transport.invalidate_affinity_cache(cache_id).await;
+    }
+
+    pub(crate) async fn sql_fields_capabilities(&self) -> SqlFieldsCapabilities {
+        self.transport.sql_fields_capabilities().await
+    }
+
+    pub(crate) fn register_cache_listener_name(
+        &self,
+        cache_id: i32,
+        name: &str,
+        close_tx: mpsc::UnboundedSender<()>,
+    ) -> IgniteResult<()> {
+        self.cache_listener_registry
+            .register(cache_id, name, close_tx)
+    }
+
+    pub(crate) fn deregister_cache_listener_name(
+        &self,
+        cache_id: i32,
+        name: &str,
+    ) -> Option<mpsc::UnboundedSender<()>> {
+        self.cache_listener_registry.deregister(cache_id, name)
     }
 }

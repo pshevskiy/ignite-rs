@@ -1,57 +1,80 @@
 use crate::cache::{QueryEntity, QueryField};
 use crate::error::{IgniteError, IgniteResult};
 use crate::protocol::{
-    read_bool, read_i16, read_i32, read_i64, read_string, read_u16, read_u8, write_i16, write_i32,
-    write_i64, write_null, write_string, write_u16, write_u8, TypeCode, COMPLEX_OBJ_HEADER_LEN,
-    FLAG_COMPACT_FOOTER, FLAG_HAS_SCHEMA, FLAG_OFFSET_ONE_BYTE, FLAG_OFFSET_TWO_BYTES,
-    FLAG_USER_TYPE, HAS_RAW_DATA,
+    read_bool, read_enum, read_f32, read_f64, read_i16, read_i32, read_i64, read_string, read_u16,
+    read_u8, write_enum, write_f32, write_f64, write_i16, write_i32, write_i64, write_null,
+    write_string, write_u16, write_u8, TypeCode, COMPLEX_OBJ_HEADER_LEN, FLAG_COMPACT_FOOTER,
+    FLAG_HAS_SCHEMA, FLAG_OFFSET_ONE_BYTE, FLAG_OFFSET_TWO_BYTES, FLAG_USER_TYPE, HAS_RAW_DATA,
 };
 use crate::utils::{bytes_to_java_hashcode, get_schema_id, string_to_java_hashcode};
+use crate::{binary_registry, Enum};
 use crate::{ReadableType, WritableType};
 use std::convert::TryFrom;
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum IgniteValue {
+    Byte(u8),
     String(String),
     Long(i64),
     Int(i32),
     Short(i16),
+    Float(f32),
+    Double(f64),
+    Char(u16),
     Bool(bool),
+    Uuid(i64, i64),
+    Date(i64),
+    Time(i64),
+    Binary(Vec<u8>),
+    Object(Box<ComplexObject>),
+    Array(Vec<IgniteValue>),
+    Enum(Enum),
     Timestamp(i64, i32), // milliseconds since 1 Jan 1970 UTC, Nanosecond fraction of a millisecond.
     Decimal(i32, Vec<u8>), // scale, big int value in bytes
     Null,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum IgniteType {
+    Byte,
     String,
     Long,
     Int,
     Short,
+    Float,
+    Double,
+    Char,
     Bool,
+    Uuid,
+    Date,
+    Time,
+    Binary,
+    Object,
+    Array,
     Timestamp,
     Decimal(i32, i32), // precision, scale
+    Enum,
     Null,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct IgniteField {
     pub name: String,
     pub r#type: IgniteType,
 }
 
 // https://apacheignite.readme.io/docs/binary-client-protocol-data-format#schema
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ComplexObjectSchema {
     pub type_name: String,
     pub fields: Vec<IgniteField>,
 }
 
 // https://apacheignite.readme.io/docs/binary-client-protocol-data-format#complex-object
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ComplexObject {
     pub schema: Arc<ComplexObjectSchema>,
     pub values: Vec<IgniteValue>,
@@ -68,6 +91,10 @@ impl ComplexObject {
             )?;
             write_i32(&mut schema, COMPLEX_OBJ_HEADER_LEN + values.len() as i32)?;
             match val {
+                IgniteValue::Byte(val) => {
+                    write_u8(&mut values, TypeCode::Byte as u8)?;
+                    write_u8(&mut values, *val)?;
+                }
                 IgniteValue::String(val) => {
                     write_u8(&mut values, TypeCode::String as u8)?;
                     write_string(&mut values, val)?
@@ -84,9 +111,54 @@ impl ComplexObject {
                     write_u8(&mut values, TypeCode::Short as u8)?;
                     write_i16(&mut values, *val)?;
                 }
+                IgniteValue::Float(val) => {
+                    write_u8(&mut values, TypeCode::Float as u8)?;
+                    write_f32(&mut values, *val)?;
+                }
+                IgniteValue::Double(val) => {
+                    write_u8(&mut values, TypeCode::Double as u8)?;
+                    write_f64(&mut values, *val)?;
+                }
+                IgniteValue::Char(val) => {
+                    write_u8(&mut values, TypeCode::Char as u8)?;
+                    write_u16(&mut values, *val)?;
+                }
                 IgniteValue::Bool(val) => {
                     write_u8(&mut values, TypeCode::Bool as u8)?;
                     write_u8(&mut values, *val as u8)?;
+                }
+                IgniteValue::Uuid(most, least) => {
+                    write_u8(&mut values, TypeCode::Uuid as u8)?;
+                    write_i64(&mut values, *most)?;
+                    write_i64(&mut values, *least)?;
+                }
+                IgniteValue::Date(val) => {
+                    write_u8(&mut values, TypeCode::Date as u8)?;
+                    write_i64(&mut values, *val)?;
+                }
+                IgniteValue::Time(val) => {
+                    write_u8(&mut values, TypeCode::Time as u8)?;
+                    write_i64(&mut values, *val)?;
+                }
+                IgniteValue::Binary(val) => {
+                    write_u8(&mut values, TypeCode::ArrByte as u8)?;
+                    write_i32(&mut values, val.len() as i32)?;
+                    values.write_all(val)?;
+                }
+                IgniteValue::Object(val) => {
+                    val.write(&mut values)?;
+                }
+                IgniteValue::Array(items) => {
+                    write_u8(&mut values, TypeCode::ArrObj as u8)?;
+                    write_i32(&mut values, -1)?;
+                    write_i32(&mut values, items.len() as i32)?;
+                    for item in items {
+                        item.write(&mut values)?;
+                    }
+                }
+                IgniteValue::Enum(val) => {
+                    write_u8(&mut values, TypeCode::Enum as u8)?;
+                    write_enum(&mut values, *val)?;
                 }
                 IgniteValue::Timestamp(big, little) => {
                     write_u8(&mut values, TypeCode::Timestamp as u8)?;
@@ -105,6 +177,18 @@ impl ComplexObject {
             }
         }
         Ok((values, schema))
+    }
+
+    pub fn type_name(&self) -> &str {
+        self.schema.type_name()
+    }
+
+    pub fn field(&self, name: &str) -> Option<&IgniteValue> {
+        self.schema
+            .fields
+            .iter()
+            .position(|field| field.name == name)
+            .and_then(|idx| self.values.get(idx))
     }
 
     pub fn get_offset_flags(offsets: &[i32]) -> u16 {
@@ -126,6 +210,10 @@ impl ComplexObject {
 impl WritableType for IgniteValue {
     fn write(&self, writer: &mut dyn Write) -> std::io::Result<()> {
         match self {
+            IgniteValue::Byte(val) => {
+                write_u8(writer, TypeCode::Byte as u8)?;
+                write_u8(writer, *val)
+            }
             IgniteValue::String(val) => {
                 write_u8(writer, TypeCode::String as u8)?;
                 write_string(writer, val)
@@ -142,9 +230,53 @@ impl WritableType for IgniteValue {
                 write_u8(writer, TypeCode::Short as u8)?;
                 write_i16(writer, *val)
             }
+            IgniteValue::Float(val) => {
+                write_u8(writer, TypeCode::Float as u8)?;
+                write_f32(writer, *val)
+            }
+            IgniteValue::Double(val) => {
+                write_u8(writer, TypeCode::Double as u8)?;
+                write_f64(writer, *val)
+            }
+            IgniteValue::Char(val) => {
+                write_u8(writer, TypeCode::Char as u8)?;
+                write_u16(writer, *val)
+            }
             IgniteValue::Bool(val) => {
                 write_u8(writer, TypeCode::Bool as u8)?;
                 write_u8(writer, if *val { 1 } else { 0 })
+            }
+            IgniteValue::Uuid(most, least) => {
+                write_u8(writer, TypeCode::Uuid as u8)?;
+                write_i64(writer, *most)?;
+                write_i64(writer, *least)
+            }
+            IgniteValue::Date(val) => {
+                write_u8(writer, TypeCode::Date as u8)?;
+                write_i64(writer, *val)
+            }
+            IgniteValue::Time(val) => {
+                write_u8(writer, TypeCode::Time as u8)?;
+                write_i64(writer, *val)
+            }
+            IgniteValue::Binary(data) => {
+                write_u8(writer, TypeCode::ArrByte as u8)?;
+                write_i32(writer, data.len() as i32)?;
+                writer.write_all(data)
+            }
+            IgniteValue::Object(value) => value.write(writer),
+            IgniteValue::Array(items) => {
+                write_u8(writer, TypeCode::ArrObj as u8)?;
+                write_i32(writer, -1)?;
+                write_i32(writer, items.len() as i32)?;
+                for item in items {
+                    item.write(writer)?;
+                }
+                Ok(())
+            }
+            IgniteValue::Enum(val) => {
+                write_u8(writer, TypeCode::Enum as u8)?;
+                write_enum(writer, *val)
             }
             IgniteValue::Timestamp(big, little) => {
                 write_u8(writer, TypeCode::Timestamp as u8)?;
@@ -164,15 +296,127 @@ impl WritableType for IgniteValue {
     fn size(&self) -> usize {
         use std::mem::size_of;
         match self {
+            IgniteValue::Byte(_) => 1 + size_of::<u8>(),
             IgniteValue::String(s) => 1 + size_of::<i32>() + s.len(),
             IgniteValue::Long(_) => 1 + size_of::<i64>(),
             IgniteValue::Int(_) => 1 + size_of::<i32>(),
             IgniteValue::Short(_) => 1 + size_of::<i16>(),
+            IgniteValue::Float(_) => 1 + size_of::<f32>(),
+            IgniteValue::Double(_) => 1 + size_of::<f64>(),
+            IgniteValue::Char(_) => 1 + size_of::<u16>(),
             IgniteValue::Bool(_) => 1 + size_of::<u8>(),
+            IgniteValue::Uuid(_, _) => 1 + size_of::<i64>() + size_of::<i64>(),
+            IgniteValue::Date(_) | IgniteValue::Time(_) => 1 + size_of::<i64>(),
+            IgniteValue::Binary(data) => 1 + size_of::<i32>() + data.len(),
+            IgniteValue::Object(value) => value.size(),
+            IgniteValue::Array(items) => {
+                1 + size_of::<i32>()
+                    + size_of::<i32>()
+                    + items.iter().map(IgniteValue::size).sum::<usize>()
+            }
+            IgniteValue::Enum(_) => 1 + size_of::<i32>() + size_of::<i32>(),
             IgniteValue::Timestamp(_, _) => 1 + size_of::<i64>() + size_of::<i32>(),
             IgniteValue::Decimal(_, data) => 1 + size_of::<i32>() + size_of::<i32>() + data.len(),
             IgniteValue::Null => 1,
         }
+    }
+}
+
+impl IgniteValue {
+    pub fn ignite_type(&self) -> IgniteType {
+        match self {
+            IgniteValue::Byte(_) => IgniteType::Byte,
+            IgniteValue::String(_) => IgniteType::String,
+            IgniteValue::Long(_) => IgniteType::Long,
+            IgniteValue::Int(_) => IgniteType::Int,
+            IgniteValue::Short(_) => IgniteType::Short,
+            IgniteValue::Float(_) => IgniteType::Float,
+            IgniteValue::Double(_) => IgniteType::Double,
+            IgniteValue::Char(_) => IgniteType::Char,
+            IgniteValue::Bool(_) => IgniteType::Bool,
+            IgniteValue::Uuid(_, _) => IgniteType::Uuid,
+            IgniteValue::Date(_) => IgniteType::Date,
+            IgniteValue::Time(_) => IgniteType::Time,
+            IgniteValue::Binary(_) => IgniteType::Binary,
+            IgniteValue::Object(_) => IgniteType::Object,
+            IgniteValue::Array(_) => IgniteType::Array,
+            IgniteValue::Enum(_) => IgniteType::Enum,
+            IgniteValue::Timestamp(_, _) => IgniteType::Timestamp,
+            IgniteValue::Decimal(_, _) => IgniteType::Decimal(0, 0),
+            IgniteValue::Null => IgniteType::Null,
+        }
+    }
+}
+
+impl From<u8> for IgniteValue {
+    fn from(value: u8) -> Self {
+        IgniteValue::Byte(value)
+    }
+}
+
+impl From<i16> for IgniteValue {
+    fn from(value: i16) -> Self {
+        IgniteValue::Short(value)
+    }
+}
+
+impl From<i32> for IgniteValue {
+    fn from(value: i32) -> Self {
+        IgniteValue::Int(value)
+    }
+}
+
+impl From<i64> for IgniteValue {
+    fn from(value: i64) -> Self {
+        IgniteValue::Long(value)
+    }
+}
+
+impl From<f32> for IgniteValue {
+    fn from(value: f32) -> Self {
+        IgniteValue::Float(value)
+    }
+}
+
+impl From<f64> for IgniteValue {
+    fn from(value: f64) -> Self {
+        IgniteValue::Double(value)
+    }
+}
+
+impl From<bool> for IgniteValue {
+    fn from(value: bool) -> Self {
+        IgniteValue::Bool(value)
+    }
+}
+
+impl From<String> for IgniteValue {
+    fn from(value: String) -> Self {
+        IgniteValue::String(value)
+    }
+}
+
+impl From<&str> for IgniteValue {
+    fn from(value: &str) -> Self {
+        IgniteValue::String(value.to_string())
+    }
+}
+
+impl From<Vec<u8>> for IgniteValue {
+    fn from(value: Vec<u8>) -> Self {
+        IgniteValue::Binary(value)
+    }
+}
+
+impl From<ComplexObject> for IgniteValue {
+    fn from(value: ComplexObject) -> Self {
+        IgniteValue::Object(Box::new(value))
+    }
+}
+
+impl From<Enum> for IgniteValue {
+    fn from(value: Enum) -> Self {
+        IgniteValue::Enum(value)
     }
 }
 
@@ -186,25 +430,123 @@ impl ReadableType for ComplexObject {
             values: vec![],
         };
         match type_code {
+            TypeCode::Byte => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Byte".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Byte(read_u8(reader)?));
+            }
             TypeCode::String => {
-                let str = read_string(reader).unwrap();
-                let field = IgniteValue::String(str);
-                me.values.push(field); // TODO: set type_name to "java.lang.Long"
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.String".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::String(read_string(reader)?));
             }
             TypeCode::Long => {
-                let val = read_i64(reader).unwrap();
-                let field = IgniteValue::Long(val);
-                me.values.push(field);
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Long".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Long(read_i64(reader)?));
             }
             TypeCode::Int => {
-                let val = read_i32(reader).unwrap();
-                let field = IgniteValue::Int(val);
-                me.values.push(field);
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Integer".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Int(read_i32(reader)?));
             }
             TypeCode::Short => {
-                let val = read_i16(reader).unwrap();
-                let field = IgniteValue::Short(val);
-                me.values.push(field);
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Short".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Short(read_i16(reader)?));
+            }
+            TypeCode::Float => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Float".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Float(read_f32(reader)?));
+            }
+            TypeCode::Double => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Double".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Double(read_f64(reader)?));
+            }
+            TypeCode::Char => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Character".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Char(read_u16(reader)?));
+            }
+            TypeCode::Bool => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Boolean".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Bool(read_bool(reader)?));
+            }
+            TypeCode::Uuid => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.util.UUID".to_string(),
+                    fields: vec![],
+                });
+                me.values
+                    .push(IgniteValue::Uuid(read_i64(reader)?, read_i64(reader)?));
+            }
+            TypeCode::Date => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.sql.Date".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Date(read_i64(reader)?));
+            }
+            TypeCode::Time => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.sql.Time".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Time(read_i64(reader)?));
+            }
+            TypeCode::ArrByte => {
+                let len = read_i32(reader)?;
+                let mut data = vec![0; len as usize];
+                reader.read_exact(&mut data)?;
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "byte[]".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Binary(data));
+            }
+            TypeCode::ArrObj => {
+                read_i32(reader)?;
+                let len = read_i32(reader)?;
+                let mut values = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    let item = ComplexObject::read(reader)?
+                        .map(flatten_complex_value)
+                        .unwrap_or(IgniteValue::Null);
+                    values.push(item);
+                }
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Object[]".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Array(values));
+            }
+            TypeCode::Enum | TypeCode::BinaryEnum => {
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Enum".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Enum(read_enum(reader)?));
             }
             TypeCode::ComplexObj => {
                 // read header minus type code
@@ -221,10 +563,10 @@ impl ReadableType for ComplexObject {
                 let _type_code = read_u8(&mut header)?; // offset 0
                 assert_eq!(read_u8(&mut header)?, 1, "Only version 1 supported"); // version
                 let flags = read_u16(&mut header)?; // offset 2
-                let _type_id = read_i32(&mut header)?; // offset 4
+                let type_id = read_i32(&mut header)?; // offset 4
                 let _hash_code = read_i32(&mut header)?; // offset 8
                 let object_len = read_i32(&mut header)? as usize; // offset 12
-                let _schema_id = read_i32(&mut header)?; // offset 16
+                let schema_id = read_i32(&mut header)?; // offset 16
                 let field_indexes_offset = read_i32(&mut header)? as usize; // offset 20
 
                 // compute stuff we need to read body
@@ -257,11 +599,47 @@ impl ReadableType for ComplexObject {
                 while (remainder.position() as usize) < field_indexes_offset {
                     let field_type = TypeCode::try_from(read_u8(&mut remainder)?)?;
                     let val = match field_type {
+                        TypeCode::Byte => IgniteValue::Byte(read_u8(&mut remainder)?),
                         TypeCode::String => IgniteValue::String(read_string(&mut remainder)?),
                         TypeCode::Long => IgniteValue::Long(read_i64(&mut remainder)?),
                         TypeCode::Int => IgniteValue::Int(read_i32(&mut remainder)?),
                         TypeCode::Short => IgniteValue::Short(read_i16(&mut remainder)?),
+                        TypeCode::Float => IgniteValue::Float(read_f32(&mut remainder)?),
+                        TypeCode::Double => IgniteValue::Double(read_f64(&mut remainder)?),
+                        TypeCode::Char => IgniteValue::Char(read_u16(&mut remainder)?),
                         TypeCode::Bool => IgniteValue::Bool(read_bool(&mut remainder)?),
+                        TypeCode::Uuid => {
+                            IgniteValue::Uuid(read_i64(&mut remainder)?, read_i64(&mut remainder)?)
+                        }
+                        TypeCode::Date => IgniteValue::Date(read_i64(&mut remainder)?),
+                        TypeCode::Time => IgniteValue::Time(read_i64(&mut remainder)?),
+                        TypeCode::ArrByte => {
+                            let len = read_i32(&mut remainder)?;
+                            let mut buf = vec![0; len as usize];
+                            remainder.read_exact(&mut buf)?;
+                            IgniteValue::Binary(buf)
+                        }
+                        TypeCode::ArrObj => {
+                            read_i32(&mut remainder)?;
+                            let len = read_i32(&mut remainder)?;
+                            let mut values = Vec::with_capacity(len as usize);
+                            for _ in 0..len {
+                                let item = ComplexObject::read(&mut remainder)?
+                                    .map(flatten_complex_value)
+                                    .unwrap_or(IgniteValue::Null);
+                                values.push(item);
+                            }
+                            IgniteValue::Array(values)
+                        }
+                        TypeCode::Enum | TypeCode::BinaryEnum => {
+                            IgniteValue::Enum(read_enum(&mut remainder)?)
+                        }
+                        TypeCode::ComplexObj => IgniteValue::Object(Box::new(
+                            ComplexObject::read_unwrapped(TypeCode::ComplexObj, &mut remainder)?
+                                .ok_or_else(|| {
+                                    IgniteError::from("missing nested complex object")
+                                })?,
+                        )),
                         TypeCode::Timestamp => {
                             let big = read_i64(&mut remainder)?;
                             let little = read_i32(&mut remainder)?;
@@ -282,17 +660,38 @@ impl ReadableType for ComplexObject {
                     };
                     me.values.push(val);
                 }
+                if let Some(schema) = binary_registry::schema_for(type_id, schema_id) {
+                    me.schema = schema;
+                }
                 // the remainder of bytes are offsets to fields which we have already read
             }
-            _ => todo!("Unsupported type code: {:?}", type_code),
+            TypeCode::Null => {
+                me.values.push(IgniteValue::Null);
+            }
+            _ => {
+                return Err(IgniteError::from(
+                    format!("Unsupported type code: {:?}", type_code).as_str(),
+                ))
+            }
         }
         Ok(Some(me))
     }
 }
 
+fn flatten_complex_value(value: ComplexObject) -> IgniteValue {
+    if value.schema.fields.is_empty() && value.values.len() == 1 {
+        return value.values.into_iter().next().unwrap_or(IgniteValue::Null);
+    }
+
+    IgniteValue::Object(Box::new(value))
+}
+
 impl WritableType for ComplexObject {
     fn write(&self, writer: &mut dyn Write) -> std::io::Result<()> {
-        // Handle primitives as ComplexObjects for simplicity
+        // Primitive wrappers are serialized as the underlying Ignite value.
+        if self.schema.fields.is_empty() && self.values.len() == 1 {
+            return self.values[0].write(writer);
+        }
         if self.schema.type_name == "java.lang.Long" {
             let val = self
                 .values
@@ -321,6 +720,7 @@ impl WritableType for ComplexObject {
         }
 
         // write fields to vec so we can hash
+        binary_registry::register_complex_schema(self.schema.as_ref());
         let (values, schema) = self.get_data()?;
 
         // https://apacheignite.readme.io/docs/binary-client-protocol-data-format#complex-object
@@ -343,6 +743,9 @@ impl WritableType for ComplexObject {
     }
 
     fn size(&self) -> usize {
+        if self.schema.fields.is_empty() && self.values.len() == 1 {
+            return self.values[0].size();
+        }
         if self.schema.type_name == "java.lang.Long" {
             return size_of::<i64>() + 1;
         }
@@ -497,10 +900,18 @@ impl ComplexObjectSchema {
         let mut fields = vec![];
         for f in qry_fields.iter() {
             let t: IgniteType = match f.type_name.as_str() {
+                "java.lang.Byte" => IgniteType::Byte,
                 "java.lang.Long" => IgniteType::Long,
                 "java.lang.Short" => IgniteType::Short,
                 "java.lang.String" => IgniteType::String,
+                "java.lang.Float" => IgniteType::Float,
+                "java.lang.Double" => IgniteType::Double,
+                "java.lang.Character" => IgniteType::Char,
                 "java.sql.Timestamp" => IgniteType::Timestamp,
+                "java.sql.Date" => IgniteType::Date,
+                "java.sql.Time" => IgniteType::Time,
+                "java.util.UUID" => IgniteType::Uuid,
+                "byte[]" => IgniteType::Binary,
                 "java.lang.Integer" => IgniteType::Int,
                 "java.lang.Boolean" => IgniteType::Bool,
                 "java.math.BigDecimal" => IgniteType::Decimal(f.precision, f.scale),

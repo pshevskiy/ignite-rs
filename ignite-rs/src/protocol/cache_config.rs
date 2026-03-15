@@ -2,8 +2,8 @@ use std::convert::TryFrom;
 use std::io::{Read, Write};
 
 use crate::cache::{
-    AtomicityMode, CacheMode, IndexType, PartitionLossPolicy, RebalanceMode,
-    WriteSynchronizationMode,
+    AtomicityMode, CacheMode, ExpiryDuration, ExpiryPolicy, IndexType, PartitionLossPolicy,
+    RebalanceMode, WriteSynchronizationMode,
 };
 use crate::cache::{
     CacheConfiguration, CacheKeyConfiguration, QueryEntity, QueryField, QueryIndex,
@@ -53,6 +53,7 @@ pub(crate) enum ConfigPropertyCode {
     SqlSchema = 203,
     CacheKeyConfigurations = 401,
     QueryEntities = 200,
+    ExpirePolicy = 407,
 }
 
 impl Into<i16> for ConfigPropertyCode {
@@ -174,6 +175,14 @@ pub(crate) fn get_cache_configuration_bytes(config: &CacheConfiguration) -> io::
         write_query_entities(&mut config_opts, v)?;
         config_param_len += 1;
     }
+    if let Some(expiry_policy) = config.expiry_policy {
+        write_i16(&mut config_opts, ExpirePolicy as i16)?;
+        write_bool(&mut config_opts, true)?;
+        write_i64(&mut config_opts, expiry_policy.create.to_wire())?;
+        write_i64(&mut config_opts, expiry_policy.update.to_wire())?;
+        write_i64(&mut config_opts, expiry_policy.access.to_wire())?;
+        config_param_len += 1;
+    }
 
     let mut bytes = Vec::<u8>::new();
     write_i32(&mut bytes, config_opts.len() as i32)?;
@@ -215,6 +224,15 @@ pub(crate) fn read_cache_configuration(reader: &mut impl Read) -> IgniteResult<C
         write_synchronization_mode: WriteSynchronizationMode::try_from(read_i32(reader)?)?,
         cache_key_configurations: Some(read_cache_key_configs(reader)?),
         query_entities: Some(read_query_entities(reader)?),
+        expiry_policy: if read_bool(reader)? {
+            Some(ExpiryPolicy::new(
+                ExpiryDuration::from_wire(read_i64(reader)?),
+                ExpiryDuration::from_wire(read_i64(reader)?),
+                ExpiryDuration::from_wire(read_i64(reader)?),
+            ))
+        } else {
+            None
+        },
     };
     Ok(config)
 }

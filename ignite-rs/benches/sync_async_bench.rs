@@ -5,6 +5,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ignite_rs::{new_client, ClientConfig};
 
@@ -201,6 +202,109 @@ fn bench_put_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_shared_client_keyed_ops(c: &mut Criterion) {
+    let conc_levels = [1usize, 2, 4, 8];
+    let iters = parse_env_usize("IGNITE_BENCH_ITERS", 100);
+    let cache_base = read_env("IGNITE_BENCH_CACHE", "BENCH_CACHE_SHARED");
+
+    for &(group_name, op_name) in &[
+        ("shared_client_get_async", "get"),
+        ("shared_client_put_async", "put"),
+        ("shared_client_contains_key_async", "contains_key"),
+        ("shared_client_get_and_put_async", "get_and_put"),
+    ] {
+        let mut group = c.benchmark_group(group_name);
+        let cache_name = format!("{}_{}", cache_base, op_name);
+
+        run_local(async {
+            let client = new_client(make_config()).await.expect("client");
+            let cache = client
+                .get_or_create_cache::<i32, i32>(&cache_name)
+                .await
+                .expect("cache");
+            for key in 0..((conc_levels.iter().copied().max().unwrap_or(1) * iters) as i32) {
+                cache.put(&key, &key).await.expect("seed");
+            }
+        });
+
+        for &conc in &conc_levels {
+            let cache_name = cache_name.clone();
+            group.throughput(Throughput::Elements((conc * iters) as u64));
+            group.bench_with_input(
+                BenchmarkId::from_parameter(conc),
+                &conc,
+                move |b, &concurrency| {
+                    let cache_name = cache_name.clone();
+                    b.iter_custom(|_| {
+                        let cache_name = cache_name.clone();
+                        run_local(async move {
+                            let client = Arc::new(new_client(make_config()).await.expect("client"));
+                            let cache = Arc::new(
+                                client
+                                    .get_or_create_cache::<i32, i32>(&cache_name)
+                                    .await
+                                    .expect("cache"),
+                            );
+                            let start = Instant::now();
+                            let mut tasks = Vec::with_capacity(concurrency);
+
+                            for w in 0..concurrency {
+                                let cache = Arc::clone(&cache);
+                                tasks.push(tokio::task::spawn_local(async move {
+                                    let base = (w * iters) as i32;
+                                    for i in 0..iters {
+                                        let key = base + i as i32;
+                                        match op_name {
+                                            "get" => {
+                                                black_box(cache.get(&key).await.expect("get"));
+                                            }
+                                            "put" => {
+                                                cache.put(&key, &key).await.expect("put");
+                                            }
+                                            "contains_key" => {
+                                                black_box(
+                                                    cache
+                                                        .contains_key(&key)
+                                                        .await
+                                                        .expect("contains_key"),
+                                                );
+                                            }
+                                            "get_and_put" => {
+                                                black_box(
+                                                    cache
+                                                        .get_and_put(&key, &(key + 1))
+                                                        .await
+                                                        .expect("get_and_put"),
+                                                );
+                                            }
+                                            _ => unreachable!("unexpected shared-client op"),
+                                        }
+                                    }
+                                }));
+                            }
+
+                            for task in tasks {
+                                task.await.expect("task");
+                            }
+
+                            let dur = start.elapsed();
+                            write_sample(
+                                group_name,
+                                concurrency,
+                                (concurrency * iters) as u64,
+                                dur,
+                            );
+                            dur
+                        })
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
 fn bench_put_get_bytes(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_get_async_bytes");
     let conc_levels = [1usize, 2, 4, 8];
@@ -345,6 +449,7 @@ fn bench_put_all_get_all(c: &mut Criterion) {
 pub fn criterion_benches(c: &mut Criterion) {
     bench_get_cache_names(c);
     bench_put_get(c);
+    bench_shared_client_keyed_ops(c);
     bench_put_all_get_all(c);
     bench_put_get_bytes(c);
 }

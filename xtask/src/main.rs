@@ -1,0 +1,527 @@
+use anyhow::{bail, Context, Result};
+use bollard::container::{ListContainersOptions, RemoveContainerOptions};
+use bollard::network::ListNetworksOptions;
+use bollard::Docker;
+use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+
+const FIXTURE_MANAGED_LABEL: &str = "io.github.ignite-rs.fixture.managed";
+const FIXTURE_PROFILE_LABEL: &str = "io.github.ignite-rs.fixture.profile";
+const WORKSPACE_MANIFEST: &str = "Cargo.toml";
+const CLIENT_PACKAGE: &str = "ignite-rs";
+
+fn main() -> Result<()> {
+    let mut args = env::args().skip(1);
+    match args.next().as_deref() {
+        Some("test-matrix") => {
+            let bucket = parse_bucket_arg(args.collect::<Vec<_>>().as_slice())?;
+            run_test_matrix(bucket)
+        }
+        Some(other) => bail!("unknown xtask command: {other}"),
+        None => bail!("usage: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix [--bucket <name>]"),
+    }
+}
+
+fn parse_bucket_arg(args: &[String]) -> Result<Option<Bucket>> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--bucket" => Ok(Some(Bucket::parse(value)?)),
+        _ => bail!(
+            "usage: test-matrix [--bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>]"
+        ),
+    }
+}
+
+fn run_test_matrix(bucket_filter: Option<Bucket>) -> Result<()> {
+    let workspace_root = workspace_root();
+    let matrix = load_matrix(&workspace_root)?;
+
+    let mut stages = Vec::new();
+    if let Some(bucket) = bucket_filter {
+        stages.push(bucket);
+    } else {
+        stages.extend(Bucket::ordered());
+    }
+
+    run_cargo_check(&workspace_root)?;
+
+    let needs_non_ssl = stages.iter().any(|bucket| !bucket.requires_ssl_feature());
+    let needs_ssl = stages.iter().any(|bucket| bucket.requires_ssl_feature());
+
+    if needs_non_ssl {
+        run_compile_stage(&workspace_root, false)?;
+        run_unit_stage(&workspace_root, false)?;
+    }
+
+    if !stages.is_empty() {
+        for bucket in stages
+            .iter()
+            .copied()
+            .filter(|bucket| !bucket.requires_ssl_feature())
+        {
+            run_bucket(&workspace_root, &matrix, bucket)?;
+        }
+    }
+
+    if needs_ssl {
+        run_compile_stage(&workspace_root, true)?;
+        run_unit_stage(&workspace_root, true)?;
+        for bucket in stages
+            .iter()
+            .copied()
+            .filter(|bucket| bucket.requires_ssl_feature())
+        {
+            run_bucket(&workspace_root, &matrix, bucket)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask must live directly under the workspace root")
+        .to_path_buf()
+}
+
+fn load_matrix(workspace_root: &Path) -> Result<TestMatrix> {
+    let path = workspace_root.join("ignite-rs/tests/test_matrix.toml");
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read test matrix {}", path.display()))?;
+    let matrix: TestMatrix = toml::from_str(&raw)
+        .with_context(|| format!("failed to parse test matrix {}", path.display()))?;
+    matrix.validate()?;
+    Ok(matrix)
+}
+
+fn run_cargo_check(workspace_root: &Path) -> Result<()> {
+    run_command(
+        workspace_root,
+        "cargo check",
+        &["cargo", "check", "--manifest-path", WORKSPACE_MANIFEST],
+        &[],
+    )
+}
+
+fn run_compile_stage(workspace_root: &Path, ssl: bool) -> Result<()> {
+    let mut args = vec![
+        "cargo",
+        "test",
+        "--manifest-path",
+        WORKSPACE_MANIFEST,
+        "--tests",
+        "--no-run",
+    ];
+    if ssl {
+        args.push("--features");
+        args.push("ssl");
+    }
+    run_command(
+        workspace_root,
+        if ssl {
+            "cargo test --features ssl --tests --no-run"
+        } else {
+            "cargo test --tests --no-run"
+        },
+        &args,
+        &[],
+    )
+}
+
+fn run_unit_stage(workspace_root: &Path, ssl: bool) -> Result<()> {
+    let mut args = vec![
+        "cargo",
+        "test",
+        "--manifest-path",
+        WORKSPACE_MANIFEST,
+        "--package",
+        CLIENT_PACKAGE,
+        "--lib",
+        "--bins",
+        "--examples",
+    ];
+    if ssl {
+        args.push("--features");
+        args.push("ssl");
+    }
+    run_command(
+        workspace_root,
+        if ssl {
+            "cargo test --package ignite-rs --lib --bins --examples --features ssl"
+        } else {
+            "cargo test --package ignite-rs --lib --bins --examples"
+        },
+        &args,
+        &[],
+    )
+}
+
+fn run_bucket(workspace_root: &Path, matrix: &TestMatrix, bucket: Bucket) -> Result<()> {
+    let suites = matrix.bucket(bucket);
+    if suites.is_empty() {
+        bail!(
+            "bucket {} has no suites in the test matrix",
+            bucket.as_str()
+        );
+    }
+
+    let live_profiles = suites
+        .iter()
+        .filter_map(|suite| suite.live_profile())
+        .collect::<BTreeSet<_>>();
+    let envs = bucket_env(bucket);
+
+    if !live_profiles.is_empty() {
+        cleanup_profiles(workspace_root, &live_profiles)
+            .with_context(|| format!("failed to clean fixtures before {}", bucket.as_str()))?;
+    }
+
+    for suite in suites {
+        run_suite(workspace_root, bucket, suite, &envs).with_context(|| {
+            format!(
+                "bucket={} test={} profile={} features={:?} exact={}",
+                bucket.as_str(),
+                suite.test,
+                suite.profile,
+                suite.features,
+                suite.exact.as_deref().unwrap_or("<none>")
+            )
+        })?;
+    }
+
+    if !live_profiles.is_empty() {
+        cleanup_profiles(workspace_root, &live_profiles)
+            .with_context(|| format!("failed to clean fixtures after {}", bucket.as_str()))?;
+    }
+
+    Ok(())
+}
+
+fn run_suite(
+    workspace_root: &Path,
+    bucket: Bucket,
+    suite: &SuiteEntry,
+    envs: &[(String, String)],
+) -> Result<()> {
+    let mut args = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "--manifest-path".to_string(),
+        WORKSPACE_MANIFEST.to_string(),
+        "--package".to_string(),
+        CLIENT_PACKAGE.to_string(),
+    ];
+    if !suite.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(suite.features.join(" "));
+    }
+    args.push("--test".to_string());
+    args.push(suite.test.clone());
+    if let Some(exact) = &suite.exact {
+        args.push(exact.clone());
+    }
+    args.push("--".to_string());
+    if suite.exact.is_some() {
+        args.push("--exact".to_string());
+    }
+    if bucket.is_live() || suite.serial {
+        args.push("--test-threads=1".to_string());
+    }
+    if bucket.is_live() {
+        args.push("--nocapture".to_string());
+    }
+
+    let label = format!(
+        "bucket={} test={} profile={} exact={}",
+        bucket.as_str(),
+        suite.test,
+        suite.profile,
+        suite.exact.as_deref().unwrap_or("<none>")
+    );
+
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command(workspace_root, &label, &arg_refs, envs)
+}
+
+fn bucket_env(bucket: Bucket) -> Vec<(String, String)> {
+    let mut envs = vec![("CARGO_TERM_COLOR".to_string(), "always".to_string())];
+    if bucket.is_live() {
+        envs.push((
+            "IGNITE_TEST_CONTAINER_NAME".to_string(),
+            format!("ignite-rs-matrix-{}", bucket.as_str().replace('_', "-")),
+        ));
+        envs.push((
+            "IGNITE_TEST_LOCK_STALE_MS".to_string(),
+            env::var("IGNITE_TEST_LOCK_STALE_MS").unwrap_or_else(|_| "1000".to_string()),
+        ));
+    }
+    envs
+}
+
+fn run_command(
+    workspace_root: &Path,
+    label: &str,
+    args: &[&str],
+    envs: &[(String, String)],
+) -> Result<()> {
+    println!("==> {label}");
+    println!("$ {}", args.join(" "));
+
+    let mut command = Command::new(args[0]);
+    command.args(&args[1..]).current_dir(workspace_root);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start command for {label}"))?;
+    ensure_success(status, args, label)
+}
+
+fn ensure_success(status: ExitStatus, args: &[&str], label: &str) -> Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+
+    bail!(
+        "command failed for {label}: {} (exit status: {status})",
+        args.join(" ")
+    )
+}
+
+fn cleanup_profiles(workspace_root: &Path, profiles: &BTreeSet<String>) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("failed to start cleanup runtime")?;
+    runtime.block_on(async move {
+        let docker = connect_docker().context("failed to connect to Docker-compatible API")?;
+        for profile in profiles {
+            cleanup_profile_resources(&docker, profile).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let state_root = workspace_root
+        .join("..")
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    cleanup_state_files(&state_root, profiles)?;
+    Ok(())
+}
+
+fn cleanup_state_files(_workspace_root: &Path, profiles: &BTreeSet<String>) -> Result<()> {
+    let shared_root = env::temp_dir().join("ignite-rs-shared-fixtures");
+    for profile in profiles {
+        let _ = fs::remove_file(shared_root.join(format!("{profile}.lock")));
+        let _ = fs::remove_file(shared_root.join(format!("{profile}.state")));
+        let _ = fs::remove_dir_all(
+            shared_root
+                .join("configs")
+                .join(sanitize_identifier(profile)),
+        );
+    }
+    Ok(())
+}
+
+async fn cleanup_profile_resources(docker: &Docker, profile: &str) -> Result<()> {
+    let containers = docker
+        .list_containers(Some(ListContainersOptions::<String> {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .with_context(|| format!("failed to list containers for profile {profile}"))?;
+
+    for container in containers {
+        let labels = container.labels.unwrap_or_default();
+        let names = container.names.unwrap_or_default();
+        let matches_profile = labels
+            .get(FIXTURE_PROFILE_LABEL)
+            .map(|value| value == profile)
+            .unwrap_or(false)
+            || names.iter().any(|name| name.contains(profile));
+
+        if !labels
+            .get(FIXTURE_MANAGED_LABEL)
+            .map(|value| value == "true")
+            .unwrap_or(false)
+            && !matches_profile
+        {
+            continue;
+        }
+
+        let id = container
+            .id
+            .clone()
+            .or_else(|| names.first().cloned())
+            .unwrap_or_else(|| profile.to_string());
+
+        let _ = docker
+            .remove_container(
+                &id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
+    let networks = docker
+        .list_networks::<String>(Some(ListNetworksOptions {
+            ..Default::default()
+        }))
+        .await
+        .with_context(|| format!("failed to list networks for profile {profile}"))?;
+
+    for network in networks {
+        let labels = network.labels.unwrap_or_default();
+        let name = network.name.unwrap_or_default();
+        let matches_profile = labels
+            .get(FIXTURE_PROFILE_LABEL)
+            .map(|value| value == profile)
+            .unwrap_or(false)
+            || name.contains(profile);
+
+        if !matches_profile {
+            continue;
+        }
+
+        let network_id = network.id.unwrap_or(name);
+        let _ = docker.remove_network(&network_id).await;
+    }
+
+    Ok(())
+}
+
+fn connect_docker() -> Result<Docker> {
+    if env::var_os("DOCKER_HOST").is_some() {
+        Ok(Docker::connect_with_http_defaults()?)
+    } else {
+        Docker::connect_with_local_defaults()
+            .or_else(|_| Docker::connect_with_http_defaults())
+            .context("no reachable local Docker-compatible socket")
+    }
+}
+
+fn sanitize_identifier(input: &str) -> String {
+    let mut ident = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            ident.push(ch);
+        } else {
+            ident.push('-');
+        }
+    }
+    ident
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Bucket {
+    Pure,
+    SingleNode,
+    Cluster3,
+    Cluster3Churn,
+    Auth,
+    Ssl,
+}
+
+impl Bucket {
+    fn ordered() -> [Bucket; 6] {
+        [
+            Bucket::Pure,
+            Bucket::SingleNode,
+            Bucket::Cluster3,
+            Bucket::Cluster3Churn,
+            Bucket::Auth,
+            Bucket::Ssl,
+        ]
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pure" => Ok(Bucket::Pure),
+            "single_node" => Ok(Bucket::SingleNode),
+            "cluster3" => Ok(Bucket::Cluster3),
+            "cluster3_churn" => Ok(Bucket::Cluster3Churn),
+            "auth" => Ok(Bucket::Auth),
+            "ssl" => Ok(Bucket::Ssl),
+            other => bail!("unknown bucket: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Bucket::Pure => "pure",
+            Bucket::SingleNode => "single_node",
+            Bucket::Cluster3 => "cluster3",
+            Bucket::Cluster3Churn => "cluster3_churn",
+            Bucket::Auth => "auth",
+            Bucket::Ssl => "ssl",
+        }
+    }
+
+    fn is_live(self) -> bool {
+        self != Bucket::Pure
+    }
+
+    fn requires_ssl_feature(self) -> bool {
+        matches!(self, Bucket::Auth | Bucket::Ssl)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TestMatrix {
+    suite: Vec<SuiteEntry>,
+}
+
+impl TestMatrix {
+    fn validate(&self) -> Result<()> {
+        if self.suite.is_empty() {
+            bail!("test matrix is empty");
+        }
+
+        for suite in &self.suite {
+            let _ = Bucket::parse(&suite.bucket)?;
+        }
+
+        Ok(())
+    }
+
+    fn bucket(&self, bucket: Bucket) -> Vec<&SuiteEntry> {
+        self.suite
+            .iter()
+            .filter(|suite| suite.bucket == bucket.as_str())
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SuiteEntry {
+    test: String,
+    bucket: String,
+    profile: String,
+    #[serde(rename = "scope")]
+    _scope: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    serial: bool,
+    #[serde(default)]
+    exact: Option<String>,
+}
+
+impl SuiteEntry {
+    fn live_profile(&self) -> Option<String> {
+        if self.profile == "none" {
+            None
+        } else {
+            Some(self.profile.clone())
+        }
+    }
+}

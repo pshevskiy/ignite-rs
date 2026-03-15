@@ -1,0 +1,639 @@
+[[suite]]
+test = "affinity_metrics_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "atomic_long_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "binary_configuration_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "blocking_tx_ops_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "client_configuration_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "client_ordered_collection_warn_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "cluster_api_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "cluster_group_cluster_restart_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "cluster_group_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "compute_task_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "connection_protocol_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "data_replication_operations_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "fixture_env_pure_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "ignite_binary_query_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "ignite_binary_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "ignite_client_connection_event_listener_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "ignite_client_request_event_listener_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "ignite_set_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "inactive_cluster_cache_request_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "invoke_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "metadata_registration_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "optimized_marshaller_classes_cached_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "parity_audit_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "performance_regression_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "recovery_mode_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "reliable_channel_duplication_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "sanity_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "service_awareness_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "services_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "thin_client_enpoints_discovery_test"
+bucket = "cluster3_churn"
+profile = "cluster3-churn"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "thin_client_non_transactional_operations_in_tx_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "thin_client_partition_awareness_balancing_test"
+bucket = "cluster3"
+profile = "cluster3"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "thin_client_partition_awareness_discovery_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "thin_client_partition_awareness_multi_dc_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "thin_client_partition_awareness_resource_release_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "timeout_protocol_test"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+[[suite]]
+test = "cache_async_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "cache_entry_listeners_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "cache_exceptions_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "client_cache_configuration_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "concurrent_real_async_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "connect_to_starting_node_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "connection_live_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "extra_column_in_h2_rows_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "fixture_env_single_node_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "functional_query_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "functional_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "load_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "reliability_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+exact = "should_keep_idle_client_connected_with_heartbeats"
+
+[[suite]]
+test = "reliability_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+exact = "should_allow_idle_connection_to_drop_when_heartbeats_are_disabled"
+
+[[suite]]
+test = "reliable_channel_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+exact = "should_allow_duplicated_addresses_against_live_node"
+
+[[suite]]
+test = "reliable_channel_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+exact = "should_connect_using_live_port_range_address"
+
+[[suite]]
+test = "reliable_channel_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+exact = "should_connect_using_next_configured_address_when_first_is_unreachable"
+
+[[suite]]
+test = "timeout_live_test"
+bucket = "single_node"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "async_channel_test"
+bucket = "cluster3"
+profile = "cluster-3"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "fixture_env_cluster3_test"
+bucket = "cluster3"
+profile = "cluster-3"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "ignite_client_lifecycle_event_listener_test"
+bucket = "cluster3"
+profile = "cluster-3"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "thin_client_partition_awareness_stable_topology_test"
+bucket = "cluster3"
+profile = "cluster-3"
+scope = "cargo_session"
+features = []
+serial = true
+
+[[suite]]
+test = "fixture_env_cluster3_churn_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+
+[[suite]]
+test = "fixture_env_single_node_churn_test"
+bucket = "cluster3_churn"
+profile = "single-node-churn"
+scope = "process"
+features = []
+serial = true
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_continue_live_operations_during_cluster_churn_and_fail_when_all_nodes_go_down"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_recover_single_server_after_connection_drop"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_recover_single_server_with_duplicated_address_after_connection_drop"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_retry_cache_get_with_read_only_retry_policy_after_connection_drop"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_throttle_reconnect_attempts_within_configured_window"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_propagate_custom_retry_policy_errors_to_caller"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_disable_failover_when_retry_policy_is_never_after_connection_drop"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_disable_failover_when_explicit_never_retry_policy_is_used"
+
+[[suite]]
+test = "reliability_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_fail_live_scan_cursor_after_cluster_connection_loss"
+
+[[suite]]
+test = "reliable_channel_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_reconnect_using_live_refreshed_dynamic_address_set"
+
+[[suite]]
+test = "reliable_channel_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+exact = "should_reconnect_to_same_live_address_when_dynamic_address_set_is_stable"
+
+[[suite]]
+test = "thin_client_partition_awareness_unstable_topology_test"
+bucket = "cluster3_churn"
+profile = "cluster-3-churn"
+scope = "process"
+features = []
+serial = true
+
+[[suite]]
+test = "fixture_env_auth_test"
+bucket = "auth"
+profile = "single-node-auth"
+scope = "cargo_session"
+features = ["ssl"]
+serial = true
+
+[[suite]]
+test = "security_auth_test"
+bucket = "auth"
+profile = "single-node-auth"
+scope = "cargo_session"
+features = ["ssl"]
+serial = true
+
+[[suite]]
+test = "fixture_env_tls_test"
+bucket = "ssl"
+profile = "single-node-tls"
+scope = "cargo_session"
+features = ["ssl"]
+serial = true
+
+[[suite]]
+test = "fixture_env_mtls_test"
+bucket = "ssl"
+profile = "single-node-mtls"
+scope = "cargo_session"
+features = ["ssl"]
+serial = true
+
+[[suite]]
+test = "security_tls_test"
+bucket = "ssl"
+profile = "single-node-mtls"
+scope = "cargo_session"
+features = ["ssl"]
+serial = true
+
+[[suite]]
+test = "ssl_parameters_test"
+bucket = "ssl"
+profile = "none"
+scope = "none"
+features = ["ssl"]
+serial = false

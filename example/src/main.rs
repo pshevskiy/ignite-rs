@@ -48,7 +48,7 @@ async fn main() {
 #[cfg(feature = "ssl")]
 fn main() {
     eprintln!(
-        "Default example is TCP-only. For TLS, run: cargo run --manifest-path crates/example/Cargo.toml --features ssl --bin tls_smoke"
+        "Default example is TCP-only. For TLS, run: cargo run --manifest-path ignite-rs/example/Cargo.toml --features ssl --bin tls_smoke"
     );
 }
 

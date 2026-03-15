@@ -1,44 +1,21 @@
-# ignite-rs — Apache Ignite thin client (sync + async)
+# ignite-rs — Apache Ignite thin client (async-first)
 
-Rust thin client for Apache Ignite with high-performance sync and Tokio-based async APIs. Optional TLS is supported for both sync (rustls) and async (tokio-rustls). This crate also includes helpers, tests, and benchmarks to compare sync vs async performance.
+Rust thin client for Apache Ignite with an async-first Tokio API. Optional TLS is supported via `rustls` and `tokio-rustls`.
 
 ## Features
 
-- Sync and async clients with shared encoding/decoding for zero duplication
-- Optional TLS (server-auth and mutual TLS)
-- Helper constructors to build `ClientConfig` from PEM files (no direct rustls usage needed)
-- Integration tests including async TLS
-- Criterion benchmarks for concurrent sync vs async, with byte-size parameterization and CSV reporting
+- Async-first client surface for cache, query, transactions, binary/data structures, cluster, services, and compute
+- TLS helpers for server-auth and mutual TLS setups
+- Continuous query listeners and transport/lifecycle event subscriptions
+- Conflict replication cache operations for dump/DR-style restore flows
+- Suite-shaped integration tests aligned with Apache Ignite thin-client coverage
+- Benchmarks for transport and cache hot paths
 
-## Crate Feature Flags
+## Feature Flags
 
-- `rt-tokio`: enables async client (`AsyncClient`) built on Tokio
-- `ssl`: enables TLS (rustls 0.22, tokio-rustls 0.25 for async)
-
-Enable features in your build:
-
-```
-cargo build --manifest-path crates/ignite-rs/Cargo.toml --features rt-tokio
-cargo build --manifest-path crates/ignite-rs/Cargo.toml --features "rt-tokio,ssl"
-```
+- `ssl`: enables TLS support
 
 ## Usage
-
-### Synchronous client
-
-```rust
-use ignite_rs::{new_client, ClientConfig, Ignite};
-
-fn main() -> ignite_rs::error::IgniteResult<()> {
-    let conf = ClientConfig::new("127.0.0.1:10800");
-    let mut client = new_client(conf)?;
-    let names = client.get_cache_names()?;
-    println!("{:?}", names);
-    Ok(())
-}
-```
-
-### Asynchronous client (Tokio)
 
 ```rust
 use ignite_rs::{AsyncClient, ClientConfig};
@@ -46,124 +23,74 @@ use ignite_rs::{AsyncClient, ClientConfig};
 #[tokio::main]
 async fn main() -> ignite_rs::error::IgniteResult<()> {
     let conf = ClientConfig::new("127.0.0.1:10800");
-    let client = AsyncClient::new_async(conf).await?;
+    let client = AsyncClient::new(conf).await?;
     let names = client.get_cache_names().await?;
     println!("{:?}", names);
     Ok(())
 }
 ```
 
-## TLS Helpers (no rustls in your code)
-
-When built with `ssl`, the crate exposes helpers to build `ClientConfig` from PEM files.
-
-- Server-auth only (CA PEM + SNI):
+## TLS Helpers
 
 ```rust
 use ignite_rs::client_config_from_ca_pem;
 
-let conf = client_config_from_ca_pem(
-    "127.0.0.1:15443",
-    "./ca.pem",
-    "localhost",
-)?;
+#[tokio::main]
+async fn main() -> ignite_rs::error::IgniteResult<()> {
+    let conf = client_config_from_ca_pem(
+        "127.0.0.1:15443",
+        "./ca.pem",
+        "localhost",
+    )?;
+    let client = ignite_rs::new_client(conf).await?;
+    println!("{:?}", client.get_cache_names().await?);
+    Ok(())
+}
 ```
 
-- Mutual TLS (CA PEM + client cert PEM + client key PEM + SNI):
+For mutual TLS, use `client_config_from_ca_and_client_pem(...)`.
 
-```rust
-use ignite_rs::client_config_from_ca_and_client_pem;
+## Tests
 
-let conf = client_config_from_ca_and_client_pem(
-    "127.0.0.1:15443",
-    "./ca.pem",
-    "./client.crt.pem",
-    "./client.key.pem",
-    "localhost",
-)?;
-```
-
-These helpers work for both the sync and async clients.
-
-## Async TLS Integration Tests
-
-Tests fail if required env vars are missing. Run with features and env set:
-
-```
-export IGNITE_TLS_ADDR=127.0.0.1:15443
-export IGNITE_TLS_SERVER_NAME=localhost
-export IGNITE_TLS_CA_PEM=/path/to/ca.pem
-# Optional strict assertion
-export IGNITE_EXPECTED_CACHE_NAMES=SQL_PUBLIC_RAINBOW
-
-# Server-auth only
-cargo test --manifest-path crates/ignite-rs/Cargo.toml --features "rt-tokio,ssl"
-
-# Mutual TLS
-export IGNITE_TLS_CLIENT_CERT_PEM=/path/to/client.crt.pem
-export IGNITE_TLS_CLIENT_KEY_PEM=/path/to/client.key.pem
-cargo test --manifest-path crates/ignite-rs/Cargo.toml --features "rt-tokio,ssl"
-```
-
-Tests live in `crates/ignite-rs/tests/async_tls.rs` and use the TLS helper to avoid rustls imports.
-
-## Benchmarks (concurrent, sync vs async)
-
-Criterion benchmarks live at `crates/ignite-rs/benches/sync_async_bench.rs`. They measure ops/sec under concurrent load for:
-
-- get_cache_names (sync/async)
-- put_get (sync/async)
-- put_all_get_all (sync/async)
-- put_get with `Vec<u8>` values (size-param: sync/async)
-
-Environment variables:
-
-- `IGNITE_ADDR` (default `127.0.0.1:10800`)
-- `IGNITE_BENCH_ITERS` (per-worker iterations, default `100`)
-- `IGNITE_BENCH_BATCH` (batch size for put_all/get_all, default `100`)
-- `IGNITE_BENCH_SIZES` (comma-separated payload sizes for bytes benches, default `16,128,1024,8192`)
-- `IGNITE_BENCH_CACHE` (base cache name; caches auto-created)
-- Reporting: `IGNITE_BENCH_REPORT` for per-sample CSV path (default `target/criterion/ignite_summary.csv`)
-
-Run benches (sync + async without TLS):
-
-```
-IGNITE_ADDR=127.0.0.1:10800 \
-  cargo bench --manifest-path crates/ignite-rs/Cargo.toml \
-  --features rt-tokio --bench sync_async_bench
-```
-
-### Summary tool (conclusion: async vs sync)
-
-The bench writes per-sample CSV rows and an aggregate summary tool reads them to compute mean/median/p90/p95 and compare async vs sync.
-
-- Binary: `bench_summary`
-- Inputs: per-sample CSV (default `target/criterion/ignite_summary.csv`)
-- Outputs: aggregate CSV at `target/criterion/ignite_summary_agg.csv` and a human-readable comparison printed to stdout
-
-Run:
-
-```
-(cd crates/ignite-rs && cargo run --bin bench_summary)
-```
-
-Example conclusion (from a local run without TLS):
-
-- get_cache_names: async/sync median ratio ≈ 1.04x (comparable)
-- put_get: async/sync median ratio ≈ 1.01x (comparable)
-- put_all_get_all: async/sync median ratio ≈ 0.99x (comparable)
-- put_get_bytes (16/256B): async/sync median ratio ≈ 1.03x/1.02x (comparable)
-
-Overall, async and sync throughput are comparable across tested operations and concurrencies. Async is slightly ahead on some single-key operations while sync can match or edge out on some batch workloads.
+- Canonical full-matrix runner: `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix`
+- One bucket only: `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`
+- Targeted debugging remains available through direct `cargo test ...` commands.
+- TLS integration files: `ignite-rs/ignite-rs/tests/ssl_parameters_test.rs` and `ignite-rs/ignite-rs/tests/security_test.rs`
+- Live fixture profiles and overrides:
+  - Prefer `ignite_scope(IgniteProfile::...)` or `connect_profile(...)` in integration tests; those helpers select the correct live fixture profile and reuse shared managed environments within a process.
+  - `IGNITE_ADDR`: external plain single-node endpoint.
+  - `IGNITE_3NODE_ADDRS`: external comma-separated 3-node endpoint list.
+  - `IGNITE_AUTH_ADDR`, `IGNITE_AUTH_USERNAME`, `IGNITE_AUTH_PASSWORD`: external auth-enabled endpoint and credentials.
+  - `IGNITE_TLS_ADDR`, `IGNITE_TLS_SERVER_NAME`, `IGNITE_TLS_CA_PEM`: external TLS endpoint and trust material.
+  - `IGNITE_TLS_CLIENT_CERT_PEM`, `IGNITE_TLS_CLIENT_KEY_PEM`: external mTLS client material.
+  - `IGNITE_DELAYED_HANDSHAKE_ADDR`: external endpoint used by the live delayed-handshake proxy test.
+  - `IGNITE_TEST_IMAGE` and `IGNITE_TEST_TAG`: override the Ignite image name/tag used by the fixture.
+  - `IGNITE_TEST_CONTAINER_NAME`: override the shared fixture container base name.
+  - `IGNITE_TEST_START_RETRIES` and `IGNITE_TEST_START_DELAY_MS`: widen startup polling for slower CI runners.
+  - `DOCKER_HOST`: point managed fixtures at a Docker-compatible remote API endpoint.
+  - `TESTCONTAINERS_HOST_OVERRIDE`: override the host part of published fixture addresses when the Docker API is remote.
+  - Managed fixtures use the Docker API directly. If `DOCKER_HOST` is unset, the fixture falls back to the default local socket for the current platform.
+- Auto-provisioned profiles:
+  - plain single-node
+  - plain 3-node cluster
+  - auth-enabled single-node
+  - TLS single-node
+  - mutual-TLS single-node
+  - delayed-handshake proxy over a live single-node fixture
 
 ## Notes
 
-- The async client uses a single connection guarded by a Tokio mutex to mirror the sync client’s single-connection semantics. For higher true parallelism across requests, use multiple clients/connections.
-- Encoding/decoding paths are shared between sync and async to avoid duplication and dynamic dispatch.
+- `Client` and `AsyncClient` are aliases of the same Tokio-backed client type.
+- The transport currently multiplexes requests over one active connection. Use multiple clients when you need parallel request throughput.
+- Event subscriptions are available through `client.events().subscribe()`.
+- Continuous query listeners are available through `cache.continuous_query(...)`.
+- Conflict replication helpers live in `ignite_rs::replication` and are sent through `cache.put_all_conflict(...)` / `cache.remove_all_conflict(...)`.
+- There is no separate blocking/sync wrapper in the parity surface.
+- TLS parity is `rustls`-equivalent. Legacy Java TLS 1.1 / legacy-cipher exact parity is not targeted.
 
 ## Dev Tips
 
-- Format: `cargo fmt`
-- Lint: `cargo clippy --all-targets -D warnings`
-- Tests: `cargo test --manifest-path crates/ignite-rs/Cargo.toml`
-- Example: `cargo run --manifest-path crates/example/Cargo.toml`
+- Build: `cargo build --manifest-path ignite-rs/ignite-rs/Cargo.toml`
+- Format: `cargo fmt --manifest-path ignite-rs/Cargo.toml --all`
+- Bench compile: `cargo bench --manifest-path ignite-rs/ignite-rs/Cargo.toml --no-run`
+- Example: `cargo run --manifest-path ignite-rs/example/Cargo.toml`

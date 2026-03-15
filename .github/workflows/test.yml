@@ -4,14 +4,9 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Test
+  pure:
+    name: Pure
     runs-on: ubuntu-latest
-    services:
-      ignite:
-        image: apacheignite/ignite:2.15.0
-        ports:
-          - 10800:10800
     steps:
       - name: Checkout source code
         uses: actions/checkout@v2
@@ -23,14 +18,117 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Install dependencies
-        run: |
-          sudo apt update -qq
-          sudo apt install -qq -y openjdk-8-jre openjdk-8-jdk wget maven
-          wget -q https://repo1.maven.org/maven2/org/apache/ignite/ignite-core/2.15.0/ignite-core-2.15.0.jar
-          wget -q https://repo.maven.apache.org/maven2/sqlline/sqlline/1.12.0/sqlline-1.12.0-jar-with-dependencies.jar
-          java -cp "./*" sqlline.SqlLine -d org.apache.ignite.IgniteJdbcThinDriver -u jdbc:ignite:thin://127.0.0.1 -n ignite -p ignite -f 'ignite-rs/tests/resources/rainbow.sql'
+      - name: Run pure bucket
+        env:
+          CARGO_TERM_COLOR: always
+        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket pure
 
-      - name: Test
-        run: |
-          cargo test
+  single-node:
+    name: Single Node
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run single-node bucket
+        env:
+          CARGO_TERM_COLOR: always
+          IGNITE_TEST_TAG: 2.15.0
+          IGNITE_TEST_START_RETRIES: 60
+          IGNITE_TEST_START_DELAY_MS: 1000
+        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket single_node
+
+  cluster3:
+    name: Cluster3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run cluster3 bucket
+        env:
+          CARGO_TERM_COLOR: always
+          IGNITE_TEST_TAG: 2.15.0
+          IGNITE_TEST_START_RETRIES: 60
+          IGNITE_TEST_START_DELAY_MS: 1000
+        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket cluster3
+
+  cluster3-churn:
+    name: Cluster3 Churn
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run cluster3 churn bucket
+        env:
+          CARGO_TERM_COLOR: always
+          IGNITE_TEST_TAG: 2.15.0
+          IGNITE_TEST_START_RETRIES: 60
+          IGNITE_TEST_START_DELAY_MS: 1000
+        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket cluster3_churn
+
+  auth:
+    name: Auth
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run auth bucket
+        env:
+          CARGO_TERM_COLOR: always
+          IGNITE_TEST_TAG: 2.15.0
+          IGNITE_TEST_START_RETRIES: 60
+          IGNITE_TEST_START_DELAY_MS: 1000
+        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket auth
+
+  ssl:
+    name: SSL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run ssl bucket
+        env:
+          CARGO_TERM_COLOR: always
+          IGNITE_TEST_TAG: 2.15.0
+          IGNITE_TEST_START_RETRIES: 60
+          IGNITE_TEST_START_DELAY_MS: 1000
+        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket ssl

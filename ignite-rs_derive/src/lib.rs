@@ -7,7 +7,8 @@ use syn::{Data, DeriveInput, Fields, FieldsNamed};
 pub fn derive_ignite_obj(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(item as DeriveInput);
     let type_name = &input.ident; // name of the struct
-    let type_id_override = get_type_name_override(&input).map(|s| string_to_java_hashcode(&s));
+    let type_id_override =
+        get_type_name_override(&input).map(|s| string_to_java_hashcode(&s.to_lowercase()));
     let output = match input.data {
         Data::Struct(ref st) => match st.fields {
             Fields::Named(ref fields) => {
@@ -31,6 +32,16 @@ pub fn derive_ignite_obj(item: proc_macro::TokenStream) -> proc_macro::TokenStre
 /// Implements ignite_rs::WritableType trait
 fn impl_write_type(type_name: &Ident, fields: &FieldsNamed, type_id: i32) -> TokenStream {
     let schema_id = get_schema_id(fields);
+    let schema_fields = fields.named.iter().map(|f| {
+        let field_name = &f.ident;
+        let ty = infer_ignite_type_tokens(&f.ty);
+        quote_spanned! { field_name.span() =>
+            ignite_rs::protocol::complex_obj::IgniteField {
+                name: stringify!(#field_name).to_string(),
+                r#type: #ty,
+            }
+        }
+    });
 
     let fields_schema = fields.named.iter().map(|f| {
         let field_name = &f.ident;
@@ -51,6 +62,11 @@ fn impl_write_type(type_name: &Ident, fields: &FieldsNamed, type_id: i32) -> Tok
     quote! {
         impl ignite_rs::WritableType for #type_name {
             fn write(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+                let schema = ignite_rs::protocol::complex_obj::ComplexObjectSchema {
+                    type_name: stringify!(#type_name).to_string(),
+                    fields: vec![#(#schema_fields),*],
+                };
+                ignite_rs::register_complex_object_schema(&schema);
                 ignite_rs::protocol::write_u8(writer, ignite_rs::protocol::TypeCode::ComplexObj as u8)?;
                 ignite_rs::protocol::write_u8(writer,1)?; //version. always 1
                 ignite_rs::protocol::write_u16(writer, ignite_rs::protocol::FLAG_USER_TYPE|ignite_rs::protocol::FLAG_HAS_SCHEMA)?; //flags
@@ -177,7 +193,7 @@ fn get_schema_id(fields: &FieldsNamed) -> i32 {
 
 /// Java-like hashcode of type's name
 fn get_type_id(ident: &Ident) -> i32 {
-    string_to_java_hashcode(&ident.to_string())
+    string_to_java_hashcode(&ident.to_string().to_lowercase())
 }
 
 fn get_type_name_override(input: &DeriveInput) -> Option<String> {
@@ -197,6 +213,23 @@ fn get_type_name_override(input: &DeriveInput) -> Option<String> {
         }
     }
     None
+}
+
+fn infer_ignite_type_tokens(ty: &syn::Type) -> TokenStream {
+    let ty_str = quote!(#ty).to_string().replace(' ', "");
+    match ty_str.as_str() {
+        "u8" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Byte),
+        "u16" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Char),
+        "i16" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Short),
+        "i32" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Int),
+        "i64" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Long),
+        "f32" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Float),
+        "f64" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Double),
+        "bool" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Bool),
+        "String" => quote!(ignite_rs::protocol::complex_obj::IgniteType::String),
+        "Vec<u8>" => quote!(ignite_rs::protocol::complex_obj::IgniteType::Binary),
+        _ => quote!(ignite_rs::protocol::complex_obj::IgniteType::Object),
+    }
 }
 
 /// FNV1 hash offset basis

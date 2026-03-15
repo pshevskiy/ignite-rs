@@ -15,7 +15,7 @@ categories = ["database"]
 [dependencies]
 [dependencies.tokio]
 version = "1"
-features = ["net", "io-util", "sync"]
+features = ["net", "io-util", "sync", "time"]
 
 [dependencies.tokio-rustls]
 version = "0.25"
@@ -25,6 +25,10 @@ optional = true
 hex-literal = "0.4.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
 criterion = { version = "0.5" }
+ignite-rs_derive = { path = "../ignite-rs_derive" }
+testcontainers = { version = "0.15", features = ["experimental"] }
+bollard = "0.13"
+futures-util = "0.3"
 
 [dependencies.rustls]
 version = "0.22"

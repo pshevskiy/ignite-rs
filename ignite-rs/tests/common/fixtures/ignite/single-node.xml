@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="
+        http://www.springframework.org/schema/beans
+        http://www.springframework.org/schema/beans/spring-beans.xsd">
+
+    <bean class="org.apache.ignite.configuration.IgniteConfiguration">
+        <property name="igniteInstanceName" value="ignite-rs-single-node"/>
+
+        <property name="localHost" value="0.0.0.0"/>
+
+        <property name="clientConnectorConfiguration">
+            <bean class="org.apache.ignite.configuration.ClientConnectorConfiguration">
+                <property name="host" value="0.0.0.0"/>
+                <property name="port" value="10800"/>
+                <property name="portRange" value="0"/>
+                <property name="handshakeTimeout" value="500"/>
+                <property name="idleTimeout" value="1000"/>
+            </bean>
+        </property>
+    </bean>
+</beans>

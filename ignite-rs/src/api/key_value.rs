@@ -1,4 +1,4 @@
-use crate::cache::CachePeekMode;
+use crate::cache::{CachePeekMode, ExpiryPolicy};
 use crate::error::IgniteResult;
 use crate::protocol::complex_obj::{ComplexObject, IgniteValue};
 use crate::protocol::{
@@ -11,83 +11,147 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 
 // https://apacheignite.readme.io/docs/binary-client-protocol-key-value-operations#op_cache_get
-const MAGIC_BYTE: u8 = 0;
-const CACHE_ID_MAGIC_BYTE_SIZE: usize = 5;
+pub(crate) const KEEP_BINARY_FLAG_MASK: u8 = 0x01;
+pub(crate) const TRANSACTIONAL_FLAG_MASK: u8 = 0x02;
+pub(crate) const EXPIRY_POLICY_FLAG_MASK: u8 = 0x04;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CacheInfo {
+    pub(crate) cache_id: i32,
+    pub(crate) flags: u8,
+    pub(crate) expiry_policy: Option<ExpiryPolicy>,
+    pub(crate) tx_id: Option<i32>,
+}
+
+impl CacheInfo {
+    pub(crate) const fn new(cache_id: i32) -> Self {
+        Self {
+            cache_id,
+            flags: 0,
+            expiry_policy: None,
+            tx_id: None,
+        }
+    }
+
+    pub(crate) const fn with_keep_binary(mut self, keep_binary: bool) -> Self {
+        if keep_binary {
+            self.flags |= KEEP_BINARY_FLAG_MASK;
+        }
+        self
+    }
+
+    pub(crate) const fn with_tx_id(mut self, tx_id: Option<i32>) -> Self {
+        self.tx_id = tx_id;
+        if tx_id.is_some() {
+            self.flags |= TRANSACTIONAL_FLAG_MASK;
+        }
+        self
+    }
+
+    pub(crate) const fn with_expiry_policy(mut self, expiry_policy: Option<ExpiryPolicy>) -> Self {
+        self.expiry_policy = expiry_policy;
+        if expiry_policy.is_some() {
+            self.flags |= EXPIRY_POLICY_FLAG_MASK;
+        }
+        self
+    }
+}
+
+pub(crate) fn write_cache_info(writer: &mut dyn Write, info: CacheInfo) -> io::Result<()> {
+    write_i32(writer, info.cache_id)?;
+    write_u8(writer, info.flags)?;
+    if let Some(expiry_policy) = info.expiry_policy {
+        write_i64(writer, expiry_policy.create.to_wire())?;
+        write_i64(writer, expiry_policy.update.to_wire())?;
+        write_i64(writer, expiry_policy.access.to_wire())?;
+    }
+    if let Some(tx_id) = info.tx_id {
+        write_i32(writer, tx_id)?;
+    }
+    Ok(())
+}
+
+pub(crate) const fn cache_info_size(info: CacheInfo) -> usize {
+    4 + 1
+        + if info.expiry_policy.is_some() {
+            8 * 3
+        } else {
+            0
+        }
+        + if info.tx_id.is_some() { 4 } else { 0 }
+}
+
+#[allow(dead_code)]
 pub(crate) enum CacheReq<'a, K: WritableType, V: WritableType> {
-    Get(i32, &'a K),
-    GetAll(i32, &'a [K]),
-    Put(i32, &'a K, &'a V),
-    PutAll(i32, &'a [(K, V)]),
-    ContainsKey(i32, &'a K),
-    ContainsKeys(i32, &'a [K]),
-    GetAndPut(i32, &'a K, &'a V),
-    GetAndReplace(i32, &'a K, &'a V),
-    GetAndRemove(i32, &'a K),
-    PutIfAbsent(i32, &'a K, &'a V),
-    GetAndPutIfAbsent(i32, &'a K, &'a V),
-    Replace(i32, &'a K, &'a V),
-    ReplaceIfEquals(i32, &'a K, &'a V, &'a V),
-    Clear(i32),
-    ClearKey(i32, &'a K),
-    ClearKeys(i32, &'a [K]),
-    RemoveKey(i32, &'a K),
-    RemoveIfEquals(i32, &'a K, &'a V),
-    GetSize(i32, Vec<CachePeekMode>),
-    RemoveKeys(i32, &'a [K]),
-    RemoveAll(i32),
-    QueryScan(i32, i32), // cache ID, page size,
+    Get(CacheInfo, &'a K),
+    GetAll(CacheInfo, &'a [K]),
+    Put(CacheInfo, &'a K, &'a V),
+    PutAll(CacheInfo, &'a [(K, V)]),
+    ContainsKey(CacheInfo, &'a K),
+    ContainsKeys(CacheInfo, &'a [K]),
+    GetAndPut(CacheInfo, &'a K, &'a V),
+    GetAndReplace(CacheInfo, &'a K, &'a V),
+    GetAndRemove(CacheInfo, &'a K),
+    PutIfAbsent(CacheInfo, &'a K, &'a V),
+    GetAndPutIfAbsent(CacheInfo, &'a K, &'a V),
+    Replace(CacheInfo, &'a K, &'a V),
+    ReplaceIfEquals(CacheInfo, &'a K, &'a V, &'a V),
+    Clear(CacheInfo),
+    ClearKey(CacheInfo, &'a K),
+    ClearKeys(CacheInfo, &'a [K]),
+    RemoveKey(CacheInfo, &'a K),
+    RemoveIfEquals(CacheInfo, &'a K, &'a V),
+    GetSize(CacheInfo, Vec<CachePeekMode>),
+    RemoveKeys(CacheInfo, &'a [K]),
+    RemoveAll(CacheInfo),
+    QueryScan(CacheInfo, i32), // cache ID, page size,
     // OP_QUERY_SQL_FIELDS
     // (cache_id, schema, page_size, sql)
     // QuerySqlFields(i32, Option<&'a str>, i32, &'a str),
     // (cache_id, schema, page_size, sql, args)
-    QuerySqlFieldsArgs(i32, Option<&'a str>, i32, &'a str, &'a [IgniteValue]),
+    QuerySqlFieldsArgs(CacheInfo, Option<&'a str>, i32, &'a str, &'a [IgniteValue]),
     // Cursor control
-    CursorGetPage(i64, i32),
+    CursorGetPage(i64),
     CursorClose(i64),
 }
 
 impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
         match self {
-            CacheReq::Get(id, key)
-            | CacheReq::ContainsKey(id, key)
-            | CacheReq::GetAndRemove(id, key)
-            | CacheReq::ClearKey(id, key)
-            | CacheReq::RemoveKey(id, key) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::Get(info, key)
+            | CacheReq::ContainsKey(info, key)
+            | CacheReq::GetAndRemove(info, key)
+            | CacheReq::ClearKey(info, key)
+            | CacheReq::RemoveKey(info, key) => {
+                write_cache_info(writer, *info)?;
                 key.write(writer)?;
                 Ok(())
             }
-            CacheReq::GetAll(id, keys)
-            | CacheReq::ContainsKeys(id, keys)
-            | CacheReq::ClearKeys(id, keys)
-            | CacheReq::RemoveKeys(id, keys) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::GetAll(info, keys)
+            | CacheReq::ContainsKeys(info, keys)
+            | CacheReq::ClearKeys(info, keys)
+            | CacheReq::RemoveKeys(info, keys) => {
+                write_cache_info(writer, *info)?;
                 write_i32(writer, keys.len() as i32)?;
                 for k in *keys {
                     k.write(writer)?;
                 }
                 Ok(())
             }
-            CacheReq::Put(id, key, value)
-            | CacheReq::GetAndPut(id, key, value)
-            | CacheReq::GetAndReplace(id, key, value)
-            | CacheReq::PutIfAbsent(id, key, value)
-            | CacheReq::GetAndPutIfAbsent(id, key, value)
-            | CacheReq::Replace(id, key, value)
-            | CacheReq::RemoveIfEquals(id, key, value) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::Put(info, key, value)
+            | CacheReq::GetAndPut(info, key, value)
+            | CacheReq::GetAndReplace(info, key, value)
+            | CacheReq::PutIfAbsent(info, key, value)
+            | CacheReq::GetAndPutIfAbsent(info, key, value)
+            | CacheReq::Replace(info, key, value)
+            | CacheReq::RemoveIfEquals(info, key, value) => {
+                write_cache_info(writer, *info)?;
                 key.write(writer)?;
                 value.write(writer)?;
                 Ok(())
             }
-            CacheReq::PutAll(id, pairs) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::PutAll(info, pairs) => {
+                write_cache_info(writer, *info)?;
                 write_i32(writer, pairs.len() as i32)?;
                 for pair in *pairs {
                     pair.0.write(writer)?;
@@ -95,22 +159,19 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 }
                 Ok(())
             }
-            CacheReq::ReplaceIfEquals(id, key, old, new) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::ReplaceIfEquals(info, key, old, new) => {
+                write_cache_info(writer, *info)?;
                 key.write(writer)?;
                 old.write(writer)?;
                 new.write(writer)?;
                 Ok(())
             }
-            CacheReq::Clear(id) | CacheReq::RemoveAll(id) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::Clear(info) | CacheReq::RemoveAll(info) => {
+                write_cache_info(writer, *info)?;
                 Ok(())
             }
-            CacheReq::GetSize(id, modes) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, MAGIC_BYTE)?;
+            CacheReq::GetSize(info, modes) => {
+                write_cache_info(writer, *info)?;
                 write_i32(writer, modes.len() as i32)?;
                 for mode in modes {
                     write_u8(writer, mode.clone() as u8)?;
@@ -118,9 +179,8 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 Ok(())
             }
             // https://ignite.apache.org/docs/latest/binary-client-protocol/sql-and-scan-queries#op_query_scan
-            CacheReq::QueryScan(id, pg_sz) => {
-                write_i32(writer, *id)?;
-                write_u8(writer, 1u8)?; // 1 to keep the value in binary form
+            CacheReq::QueryScan(info, pg_sz) => {
+                write_cache_info(writer, info.with_keep_binary(true))?;
                 write_null(writer)?; // Not possible to pass filter object unless Java or .NET
                 write_i32(writer, *pg_sz)?;
                 write_i32(writer, -1)?; // negative to query entire cache
@@ -150,12 +210,9 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
             //     write_bool(writer, true)?;   // include field names
             //     Ok(())
             // }
-            CacheReq::QuerySqlFieldsArgs(id, schema, page_size, sql, args) => {
+            CacheReq::QuerySqlFieldsArgs(info, schema, page_size, sql, args) => {
                 // OP_QUERY_SQL_FIELDS per spec
-                //Write cache info
-                write_i32(writer, *id)?;
-                write_u8(writer, 1u8)?; // flags: KEEP_BINARY
-                                        // Write schema
+                write_cache_info(writer, info.with_keep_binary(true))?;
                 match schema {
                     Some(s) => crate::protocol::write_string_type_code(writer, s)?,
                     None => write_null(writer)?,
@@ -180,9 +237,8 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 write_bool(writer, true)?; // include field names
                 Ok(())
             }
-            CacheReq::CursorGetPage(cursor_id, page_size) => {
+            CacheReq::CursorGetPage(cursor_id) => {
                 write_i64(writer, *cursor_id)?;
-                write_i32(writer, *page_size)?;
                 Ok(())
             }
             CacheReq::CursorClose(cursor_id) => {
@@ -194,33 +250,33 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
 
     fn size(&self) -> usize {
         match self {
-            CacheReq::Get(_, key)
-            | CacheReq::ContainsKey(_, key)
-            | CacheReq::GetAndRemove(_, key)
-            | CacheReq::ClearKey(_, key)
-            | CacheReq::RemoveKey(_, key) => CACHE_ID_MAGIC_BYTE_SIZE + key.size(),
-            CacheReq::GetAll(_, keys)
-            | CacheReq::ContainsKeys(_, keys)
-            | CacheReq::ClearKeys(_, keys)
-            | CacheReq::RemoveKeys(_, keys) => {
-                let mut size = CACHE_ID_MAGIC_BYTE_SIZE;
+            CacheReq::Get(info, key)
+            | CacheReq::ContainsKey(info, key)
+            | CacheReq::GetAndRemove(info, key)
+            | CacheReq::ClearKey(info, key)
+            | CacheReq::RemoveKey(info, key) => cache_info_size(*info) + key.size(),
+            CacheReq::GetAll(info, keys)
+            | CacheReq::ContainsKeys(info, keys)
+            | CacheReq::ClearKeys(info, keys)
+            | CacheReq::RemoveKeys(info, keys) => {
+                let mut size = cache_info_size(*info);
                 size += 4; // len
                 for k in *keys {
                     size += k.size();
                 }
                 size
             }
-            CacheReq::Put(_, key, value)
-            | CacheReq::GetAndPut(_, key, value)
-            | CacheReq::GetAndReplace(_, key, value)
-            | CacheReq::PutIfAbsent(_, key, value)
-            | CacheReq::GetAndPutIfAbsent(_, key, value)
-            | CacheReq::Replace(_, key, value)
-            | CacheReq::RemoveIfEquals(_, key, value) => {
-                CACHE_ID_MAGIC_BYTE_SIZE + key.size() + value.size()
+            CacheReq::Put(info, key, value)
+            | CacheReq::GetAndPut(info, key, value)
+            | CacheReq::GetAndReplace(info, key, value)
+            | CacheReq::PutIfAbsent(info, key, value)
+            | CacheReq::GetAndPutIfAbsent(info, key, value)
+            | CacheReq::Replace(info, key, value)
+            | CacheReq::RemoveIfEquals(info, key, value) => {
+                cache_info_size(*info) + key.size() + value.size()
             }
-            CacheReq::PutAll(_, pairs) => {
-                let mut size = CACHE_ID_MAGIC_BYTE_SIZE;
+            CacheReq::PutAll(info, pairs) => {
+                let mut size = cache_info_size(*info);
                 size += 4; //len
                 for pair in *pairs {
                     size += pair.0.size();
@@ -228,20 +284,20 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 }
                 size
             }
-            CacheReq::ReplaceIfEquals(_, key, old, new) => {
-                CACHE_ID_MAGIC_BYTE_SIZE + key.size() + old.size() + new.size()
+            CacheReq::ReplaceIfEquals(info, key, old, new) => {
+                cache_info_size(*info) + key.size() + old.size() + new.size()
             }
-            CacheReq::Clear(_) | CacheReq::RemoveAll(_) => CACHE_ID_MAGIC_BYTE_SIZE,
-            CacheReq::GetSize(_, modes) => {
-                let mut size = CACHE_ID_MAGIC_BYTE_SIZE;
+            CacheReq::Clear(info) | CacheReq::RemoveAll(info) => cache_info_size(*info),
+            CacheReq::GetSize(info, modes) => {
+                let mut size = cache_info_size(*info);
                 size += 4; //len
                 for _ in modes {
                     size += 1;
                 }
                 size
             }
-            CacheReq::QueryScan(_, _) => {
-                CACHE_ID_MAGIC_BYTE_SIZE
+            CacheReq::QueryScan(info, _) => {
+                cache_info_size(info.with_keep_binary(true))
                     + size_of::<u8>() // Filter object: Null
                     + size_of::<i32>() // Cursor page size
                     + size_of::<i32>() // Partition count
@@ -263,9 +319,8 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
             //         + size_of::<i64>() // timeout
             //         + size_of::<u8>() // include field names
             // }
-            CacheReq::QuerySqlFieldsArgs(_, schema, _page_size, sql, args) => {
-                let mut sz = 4 // cache id
-                    + 1 // deprecated byte
+            CacheReq::QuerySqlFieldsArgs(info, schema, _page_size, sql, args) => {
+                let mut sz = cache_info_size(info.with_keep_binary(true))
                     + match schema {
                         Some(s) => 1 + size_of::<i32>() + s.len(),
                         None => 1,
@@ -282,7 +337,7 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                     + size_of::<i64>() // timeout
                     + size_of::<u8>() // include field names
             }
-            CacheReq::CursorGetPage(_, _) => size_of::<i64>() + size_of::<i32>(),
+            CacheReq::CursorGetPage(_) => size_of::<i64>(),
             CacheReq::CursorClose(_) => size_of::<i64>(),
         }
     }
@@ -316,33 +371,12 @@ impl<K: ReadableType, V: ReadableType> ReadableReq for CachePairsResp<K, V> {
     }
 }
 
-pub(crate) struct QueryScanResp<K: ReadableType, V: ReadableType> {
-    pub(crate) val: Vec<(Option<K>, Option<V>)>,
-}
-
-impl<K: ReadableType, V: ReadableType> ReadableReq for QueryScanResp<K, V> {
-    fn read(reader: &mut impl Read) -> IgniteResult<Self> {
-        let _cursor_id = read_i64(reader)?;
-        let count = read_i32(reader)?;
-        let mut pairs: Vec<(Option<K>, Option<V>)> = Vec::new();
-        for _ in 0..count {
-            let key = K::read(reader)?;
-            let val = V::read(reader)?;
-            pairs.push((key, val));
-        }
-        let _more = read_bool(reader)?; // TODO: get more results
-        Ok(QueryScanResp { val: pairs })
-    }
-}
-
-#[cfg(test)]
 pub(crate) struct CursorOpenResp<K: ReadableType, V: ReadableType> {
     pub(crate) cursor_id: i64,
     pub(crate) rows: Vec<(Option<K>, Option<V>)>,
     pub(crate) has_more: bool,
 }
 
-#[cfg(test)]
 impl<K: ReadableType, V: ReadableType> ReadableReq for CursorOpenResp<K, V> {
     fn read(reader: &mut impl Read) -> IgniteResult<Self> {
         let cursor_id = read_i64(reader)?;
@@ -362,13 +396,13 @@ impl<K: ReadableType, V: ReadableType> ReadableReq for CursorOpenResp<K, V> {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct CursorPageResp<K: ReadableType, V: ReadableType> {
     pub(crate) rows: Vec<(Option<K>, Option<V>)>,
     pub(crate) has_more: bool,
 }
 
 // SqlFields open response; we return the first column as Long per row.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SqlFieldsOpenRespLong {
     pub(crate) cursor_id: i64,
     pub(crate) rows: Vec<i64>,
@@ -406,6 +440,7 @@ impl ReadableReq for SqlFieldsOpenRespLong {
 }
 
 // SqlFields page response returning a single Long column per row
+#[allow(dead_code)]
 pub(crate) struct SqlFieldsPageRespLong {
     pub(crate) rows: Vec<i64>,
     pub(crate) has_more: bool,
@@ -427,7 +462,6 @@ impl ReadableReq for SqlFieldsPageRespLong {
     }
 }
 
-#[cfg(test)]
 impl<K: ReadableType, V: ReadableType> ReadableReq for CursorPageResp<K, V> {
     fn read(reader: &mut impl Read) -> IgniteResult<Self> {
         let count = read_i32(reader)?;
@@ -445,6 +479,7 @@ impl<K: ReadableType, V: ReadableType> ReadableReq for CursorPageResp<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{ExpiryDuration, ExpiryPolicy};
     use crate::protocol::TypeCode;
     use crate::protocol::{write_bool, write_i32, write_i64, write_string, write_u8};
     use std::io::Cursor;
@@ -453,7 +488,8 @@ mod tests {
     fn test_sql_fields_args_encoding_size_matches() {
         let sql = "SELECT _key.payload FROM \"my_cache\" WHERE _key.value = ?";
         let args = [IgniteValue::String("abc".to_string())];
-        let req: CacheReq<'_, i32, i32> = CacheReq::QuerySqlFieldsArgs(42, None, 1000, sql, &args);
+        let req: CacheReq<'_, i32, i32> =
+            CacheReq::QuerySqlFieldsArgs(CacheInfo::new(42), None, 1000, sql, &args);
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
         assert_eq!(req.size(), buf.len());
@@ -468,7 +504,8 @@ mod tests {
     fn test_sql_fields_noargs_encoding_size_matches() {
         let sql = "SELECT 1";
         let args: [IgniteValue; 0] = [];
-        let req: CacheReq<'_, i32, i32> = CacheReq::QuerySqlFieldsArgs(7, None, 1, sql, &args);
+        let req: CacheReq<'_, i32, i32> =
+            CacheReq::QuerySqlFieldsArgs(CacheInfo::new(7), None, 1, sql, &args);
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
         assert_eq!(req.size(), buf.len());
@@ -479,13 +516,12 @@ mod tests {
 
     #[test]
     fn test_cursor_get_page_encoding() {
-        let req: CacheReq<'_, i32, i32> = CacheReq::CursorGetPage(42, 1000);
+        let req: CacheReq<'_, i32, i32> = CacheReq::CursorGetPage(42);
         let mut actual = Vec::new();
         req.write(&mut actual).unwrap();
 
         let mut expected = Vec::new();
         write_i64(&mut expected, 42).unwrap();
-        write_i32(&mut expected, 1000).unwrap();
 
         assert_eq!(actual, expected);
         assert_eq!(req.size(), actual.len());
@@ -501,6 +537,32 @@ mod tests {
         write_i64(&mut expected, 0x1122334455667788).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(req.size(), actual.len());
+    }
+
+    #[test]
+    fn test_cache_info_encodes_expiry_before_tx_id() {
+        let info = CacheInfo::new(7)
+            .with_keep_binary(true)
+            .with_expiry_policy(Some(ExpiryPolicy::new(
+                ExpiryDuration::Millis(std::time::Duration::from_millis(10)),
+                ExpiryDuration::Unchanged,
+                ExpiryDuration::Zero,
+            )))
+            .with_tx_id(Some(42));
+
+        let mut actual = Vec::new();
+        write_cache_info(&mut actual, info).unwrap();
+
+        assert_eq!(&actual[0..4], 7i32.to_le_bytes().as_slice());
+        assert_eq!(
+            actual[4],
+            KEEP_BINARY_FLAG_MASK | EXPIRY_POLICY_FLAG_MASK | TRANSACTIONAL_FLAG_MASK
+        );
+        assert_eq!(&actual[5..13], 10i64.to_le_bytes().as_slice());
+        assert_eq!(&actual[13..21], (-2i64).to_le_bytes().as_slice());
+        assert_eq!(&actual[21..29], 0i64.to_le_bytes().as_slice());
+        assert_eq!(&actual[29..33], 42i32.to_le_bytes().as_slice());
+        assert_eq!(cache_info_size(info), actual.len());
     }
 
     #[test]
