@@ -2,7 +2,7 @@
 name = "ignite-rs_derive"
 version = "0.1.1"
 authors = ["Andrii Pohrebniak <a.pohrebniak@gethatch.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT"
 description = "Apache Ignite thin client"
 homepage = "https://github.com/apohrebniak/ignite-rs"

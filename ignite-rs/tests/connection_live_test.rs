@@ -85,23 +85,24 @@ async fn should_fail_on_invalid_big_handshake_message() {
 /// Java parity: org.apache.ignite.client.ConnectionTest#testHandshakeTooLargeServerDropsConnection
 #[tokio::test]
 async fn should_drop_connection_after_too_large_handshake_message() {
-    assert_server_drops_connection(&[1, 1, 1, 1]);
+    assert_server_drops_connection(&[1, 1, 1, 1]).await;
 }
 
 /// Java parity: org.apache.ignite.client.ConnectionTest#testNegativeMessageSizeDropsConnection
 #[tokio::test]
 async fn should_drop_connection_after_negative_message_size() {
-    assert_server_drops_connection(&[255, 255, 255, 255]);
+    assert_server_drops_connection(&[255, 255, 255, 255]).await;
 }
 
 /// Java parity: org.apache.ignite.client.ConnectionTest#testInvalidHandshakeHeaderDropsConnection
 #[tokio::test]
 async fn should_drop_connection_after_invalid_handshake_header() {
-    assert_server_drops_connection(&[10, 0, 0, 0, 42, 42, 42]);
+    assert_server_drops_connection(&[10, 0, 0, 0, 42, 42, 42]).await;
 }
 
-fn assert_server_drops_connection(payload: &[u8]) {
+async fn assert_server_drops_connection(payload: &[u8]) {
     let scope = ignite_scope(IgniteProfile::DefaultSingleNode);
+    scope.wait_for_ready().await.unwrap();
     let addr = scope
         .single_env()
         .expect("expected single-node Ignite scope")

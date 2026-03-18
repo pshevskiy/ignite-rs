@@ -41,11 +41,8 @@ async fn should_support_bulk_key_removals_via_slices() {
     cache.put_all(&[(1, 10), (2, 20), (3, 30)]).await.unwrap();
     cache.remove_keys(&[1, 3]).await.unwrap();
 
-    let mut rows = cache.get_all(&[1, 2, 3]).await.unwrap();
-    rows.sort_by_key(|(key, _)| key.unwrap_or_default());
-
-    assert_eq!(rows[0], (None, None));
-    assert_eq!(rows[1], (Some(2), Some(20)));
-    assert_eq!(rows[2], (None, None));
+    // CacheGetAll only returns entries that exist; removed keys are absent.
+    let rows = cache.get_all(&[1, 2, 3]).await.unwrap();
+    assert_eq!(rows, vec![(Some(2), Some(20))]);
     destroy_cache_if_exists(&client, &cache_name).await;
 }

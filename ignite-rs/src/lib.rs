@@ -44,6 +44,7 @@ pub mod protocol;
 pub mod query;
 pub mod replication;
 pub mod services;
+pub mod streamer;
 mod topology;
 mod transport;
 pub mod tx;
@@ -1064,6 +1065,16 @@ impl ClientGeneric {
         config: Option<&CollectionConfiguration>,
     ) -> IgniteResult<Option<data_structures::IgniteSet<K>>> {
         data_structures::IgniteSet::get_or_create(self.exec.clone(), name, config.cloned()).await
+    }
+
+    /// Create a data streamer for high-throughput bulk loading into a cache.
+    pub fn data_streamer<K: WritableType + ReadableType, V: WritableType + ReadableType>(
+        &self,
+        cache_name: &str,
+        config: streamer::DataStreamerConfig,
+    ) -> streamer::DataStreamer<K, V> {
+        let cache_id = crate::utils::string_to_java_hashcode(cache_name);
+        streamer::DataStreamer::new(self.exec.clone(), cache_id, config)
     }
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

@@ -38,7 +38,7 @@
                 <property name="port" value="10800"/>
                 <property name="portRange" value="0"/>
                 <property name="handshakeTimeout" value="5000"/>
-                <property name="idleTimeout" value="1000"/>
+                <property name="idleTimeout" value="30000"/>
                 <property name="thinClientConfiguration">
                     <bean class="org.apache.ignite.configuration.ThinClientConfiguration">
                         <property name="maxActiveComputeTasksPerConnection" value="0"/>

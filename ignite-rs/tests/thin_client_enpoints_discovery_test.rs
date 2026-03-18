@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{ignite_context, IgniteClusterEnv, IgniteContext, FixtureScope, IgniteProfile};
+use common::{ignite_context, FixtureScope, IgniteClusterEnv, IgniteContext, IgniteProfile};
 use ignite_rs::events::{ClientEvent, ConnectionEventKind, EventSubscriptions, RequestEventKind};
 use ignite_rs::{new_client, new_client_with_events, AddressResolver, Client, ClientConfig};
 use std::collections::HashSet;
@@ -29,12 +29,11 @@ async fn should_fail_over_to_discovered_node_after_seed_node_stops() {
     ctx.ensure_cache(DISCOVERY_CACHE_NAME).await.unwrap();
 
     debug_phase("creating discovery client");
-    let (client_res, mut events) =
-        new_client_with_events(discovery_client_config(
-            [addrs[0].as_str()],
-            discovery_resolved_addresses(&env),
-        ))
-        .await;
+    let (client_res, mut events) = new_client_with_events(discovery_client_config(
+        [addrs[0].as_str()],
+        discovery_resolved_addresses(&env),
+    ))
+    .await;
     let client = client_res.unwrap();
 
     debug_phase("waiting for initial 3 channels");
@@ -62,11 +61,21 @@ async fn should_fail_over_to_discovered_node_after_seed_node_stops() {
     wait_for_node_ready(&addrs[0]).await;
     wait_for_node_ready(&new_node_addr).await;
     debug_phase("waiting for seed reconnect");
-    wait_for_connection_event(&client, &mut events, &addrs[0], ConnectionEventKind::Connected)
-        .await;
+    wait_for_connection_event(
+        &client,
+        &mut events,
+        &addrs[0],
+        ConnectionEventKind::Connected,
+    )
+    .await;
     debug_phase("waiting for new node connect");
-    wait_for_connection_event(&client, &mut events, &new_node_addr, ConnectionEventKind::Connected)
-        .await;
+    wait_for_connection_event(
+        &client,
+        &mut events,
+        &new_node_addr,
+        ConnectionEventKind::Connected,
+    )
+    .await;
 }
 
 /// Java parity: org.apache.ignite.internal.client.thin.ThinClientEnpointsDiscoveryTest#testEndpointsDiscoveryDisabled
@@ -99,8 +108,12 @@ async fn should_ignore_discovered_nodes_when_partition_awareness_is_disabled() {
         let _ = client.get_cache_names().await.unwrap();
     }
 
-    collect_request_and_connection_addresses(&mut events, &mut seen_request_addresses, &mut connected_addresses)
-        .await;
+    collect_request_and_connection_addresses(
+        &mut events,
+        &mut seen_request_addresses,
+        &mut connected_addresses,
+    )
+    .await;
 
     assert_eq!(
         seen_request_addresses.len(),
@@ -167,8 +180,13 @@ async fn should_rediscover_seed_address_after_all_known_nodes_fail() {
 
     env.start_node(0);
     wait_for_node_ready(&addrs[0]).await;
-    wait_for_connection_event(&client, &mut events, &addrs[0], ConnectionEventKind::Connected)
-        .await;
+    wait_for_connection_event(
+        &client,
+        &mut events,
+        &addrs[0],
+        ConnectionEventKind::Connected,
+    )
+    .await;
     wait_for_cache_names_success(&client).await;
 
     env.start_node(1);
@@ -239,8 +257,7 @@ async fn wait_for_connected_count(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for {} connected live channels; connected {:?}; failed {:?}",
             expected_count,
-            connected
-            ,
+            connected,
             failed
         );
 
@@ -280,7 +297,9 @@ async fn wait_for_connection_event(
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for {:?} on {}; seen connection events {:?}",
-            kind, address, seen
+            kind,
+            address,
+            seen
         );
 
         let _ = trigger_topology_change(client).await;
@@ -351,7 +370,9 @@ async fn collect_request_and_connection_addresses(
             {
                 request_addresses.insert(event.address);
             }
-            Ok(Ok(ClientEvent::Connection(event))) if event.kind == ConnectionEventKind::Connected => {
+            Ok(Ok(ClientEvent::Connection(event)))
+                if event.kind == ConnectionEventKind::Connected =>
+            {
                 connected_addresses.insert(event.address);
             }
             Ok(Ok(_)) | Ok(Err(_)) => {}
@@ -406,7 +427,10 @@ fn discovery_client_config<'a>(
 }
 
 fn discovery_churn_context() -> std::sync::Arc<IgniteContext> {
-    ignite_context(IgniteProfile::ThreeNodeClusterChurn, FixtureScope::CargoSession)
+    ignite_context(
+        IgniteProfile::ThreeNodeClusterChurn,
+        FixtureScope::CargoSession,
+    )
 }
 
 fn discovery_churn_lock() -> &'static tokio::sync::Mutex<()> {

@@ -6,7 +6,10 @@ use common::{
     connect_with_cluster3_config, destroy_cache_if_exists, ignite_cluster3_env, unique_name,
     TestClient,
 };
-use ignite_rs::cache::{AtomicityMode, Cache, CacheConfiguration, CacheMode};
+use ignite_rs::binary::BinaryObject;
+use ignite_rs::cache::{
+    AtomicityMode, Cache, CacheConfiguration, CacheKeyConfiguration, CacheMode,
+};
 use ignite_rs::data_structures::{AtomicConfiguration, CollectionConfiguration};
 use ignite_rs::query::ScanQuery;
 use ignite_rs::ClientConfig;
@@ -246,6 +249,173 @@ async fn should_use_live_atomic_long_on_stable_cluster() {
         CacheMode::Replicated,
     )
     .await;
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.ThinClientPartitionAwarenessStableTopologyTest#testPartitionedCustomAffinityCache
+///
+/// Blocked for accurate parity: The Java test uses a **pre-configured
+/// server-side cache** (`PART_CUSTOM_AFFINITY_CACHE_NAME`) with a custom
+/// `AffinityFunction` implementation that the server recognizes.  The test
+/// then calls `testNotApplicableCache()` to verify PA does not route to
+/// specific nodes for that cache.  From a thin client we cannot register a
+/// custom `AffinityFunction`, so this test creates a regular partitioned
+/// cache instead.  A regular partitioned cache uses `RendezvousAffinityFunction`
+/// where PA **will** apply normally, so this does not test the intended
+/// "PA not applicable" behavior.  The test is retained as supplemental
+/// coverage for general partitioned cache operations on a stable cluster.
+#[tokio::test]
+async fn should_fall_back_for_custom_affinity_cache_on_stable_cluster() {
+    let cache_name = unique_name("stable_custom_affinity");
+    let client = stable_cluster_client().await;
+    destroy_cache_if_exists(&client, &cache_name).await;
+
+    // NOTE: This creates a regular partitioned cache, NOT one with a custom
+    // AffinityFunction.  See the doc comment above for the limitation.
+    let mut cfg = CacheConfiguration::new(&cache_name);
+    cfg.cache_mode = CacheMode::Partitioned;
+    let cache = create_cache_with_config_or_get(&client, &cfg).await;
+
+    exercise_not_applicable_cache(&cache).await;
+    cleanup_cache(&client, &cache_name).await;
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.ThinClientPartitionAwarenessStableTopologyTest#testPartitionedCacheComplexKey
+///
+/// The Java test calls `testApplicableCache(PART_CACHE_NAME, i -> new TestComplexKey(i, i))`
+/// which exercises all PA-routable operations per key.  We match that coverage here.
+#[tokio::test]
+async fn should_use_live_partitioned_cache_with_complex_binary_key() {
+    let cache_name = unique_name("stable_complex_key");
+    let client = stable_cluster_client().await;
+    destroy_cache_if_exists(&client, &cache_name).await;
+
+    let cache = client
+        .get_or_create_cache::<BinaryObject, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    for idx in 0..8 {
+        let key = || {
+            client
+                .binary()
+                .builder("ComplexKey")
+                .set_field("id", idx as i32)
+                .set_field("name", format!("key_{}", idx))
+                .build()
+        };
+
+        // Exercise all PA-routable operations (matching Java's testApplicableCache)
+        assert_eq!(cache.get_and_put(&key(), &idx).await.unwrap(), None);
+        assert_eq!(cache.get(&key()).await.unwrap(), Some(idx));
+        assert!(cache.contains_key(&key()).await.unwrap());
+        assert!(!cache.put_if_absent(&key(), &(idx + 100)).await.unwrap());
+        assert!(cache.replace(&key(), &(idx + 1)).await.unwrap());
+        assert_eq!(
+            cache.get_and_replace(&key(), &(idx + 2)).await.unwrap(),
+            Some(idx + 1)
+        );
+        assert_eq!(
+            cache
+                .get_and_put_if_absent(&key(), &(idx + 3))
+                .await
+                .unwrap(),
+            Some(idx + 2)
+        );
+        assert_eq!(cache.get_and_remove(&key()).await.unwrap(), Some(idx + 2));
+        assert!(cache.put_if_absent(&key(), &idx).await.unwrap());
+        cache.clear_key(&key()).await.unwrap();
+        assert!(!cache.contains_key(&key()).await.unwrap());
+    }
+
+    cleanup_cache(&client, &cache_name).await;
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.ThinClientPartitionAwarenessStableTopologyTest#testPartitionedCacheUnknownNode
+#[tokio::test]
+async fn should_succeed_when_key_maps_to_node_not_in_initial_config() {
+    let cache_name = unique_name("stable_unknown_node");
+    let env = ignite_cluster3_env();
+    env.wait_for_ready().await.unwrap();
+
+    // Connect to only the first address, so other nodes are "unknown" at connection time
+    let addresses = env.addresses();
+    let first_only = ClientConfig::new(&addresses[0]);
+    let client = connect_with_cluster3_config(first_only).await.unwrap();
+    destroy_cache_if_exists(&client, &cache_name).await;
+
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    // Put many keys — some will map to nodes not in the initial config.
+    // With PA enabled, the client should discover those nodes or fall back.
+    for idx in 0..100 {
+        cache.put(&idx, &idx).await.unwrap();
+        assert_eq!(cache.get(&idx).await.unwrap(), Some(idx));
+    }
+
+    cleanup_cache(&client, &cache_name).await;
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.ThinClientPartitionAwarenessStableTopologyTest#testPartitionedCacheAnnotatedAffinityKey
+///
+/// The Java test uses `@AffinityKeyMapped` on `TestAnnotatedAffinityKey`.
+/// The thin-client analogue is `CacheKeyConfiguration`, which is the correct
+/// way to declare an affinity key field from outside the JVM.
+#[tokio::test]
+async fn should_use_live_partitioned_cache_with_affinity_key_configuration() {
+    let cache_name = unique_name("stable_affinity_key");
+    let client = stable_cluster_client().await;
+    destroy_cache_if_exists(&client, &cache_name).await;
+
+    let mut cfg = CacheConfiguration::new(&cache_name);
+    cfg.cache_mode = CacheMode::Partitioned;
+    cfg.num_backup = 1;
+    cfg.cache_key_configurations = Some(vec![CacheKeyConfiguration::new(
+        "AffinityEmployee",
+        "orgId",
+    )]);
+    let cache = client
+        .create_cache_with_config::<BinaryObject, i32>(&cfg)
+        .await
+        .unwrap();
+
+    for idx in 0..8 {
+        let key = || {
+            client
+                .binary()
+                .builder("AffinityEmployee")
+                .set_field("id", idx as i32)
+                .set_field("orgId", (idx % 3) as i32)
+                .set_field("name", format!("emp_{}", idx))
+                .build()
+        };
+
+        // Exercise all PA-routable operations (matching Java's testApplicableCache)
+        assert_eq!(cache.get_and_put(&key(), &idx).await.unwrap(), None);
+        assert_eq!(cache.get(&key()).await.unwrap(), Some(idx));
+        assert!(cache.contains_key(&key()).await.unwrap());
+        assert!(!cache.put_if_absent(&key(), &(idx + 100)).await.unwrap());
+        assert!(cache.replace(&key(), &(idx + 1)).await.unwrap());
+        assert_eq!(
+            cache.get_and_replace(&key(), &(idx + 2)).await.unwrap(),
+            Some(idx + 1)
+        );
+        assert_eq!(
+            cache
+                .get_and_put_if_absent(&key(), &(idx + 3))
+                .await
+                .unwrap(),
+            Some(idx + 2)
+        );
+        assert_eq!(cache.get_and_remove(&key()).await.unwrap(), Some(idx + 2));
+        assert!(cache.put_if_absent(&key(), &idx).await.unwrap());
+        cache.clear_key(&key()).await.unwrap();
+        assert!(!cache.contains_key(&key()).await.unwrap());
+    }
+
+    cleanup_cache(&client, &cache_name).await;
 }
 
 async fn stable_cluster_client() -> TestClient {

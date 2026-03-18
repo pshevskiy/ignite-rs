@@ -33,7 +33,10 @@ async fn should_register_and_lookup_binary_type_name() {
     let type_name = unique_name("live_binary_type_name");
     let type_id = binary.type_id(&type_name);
 
-    assert!(binary.register_type_name(type_id, &type_name).await.unwrap());
+    assert!(binary
+        .register_type_name(type_id, &type_name)
+        .await
+        .unwrap());
     assert_eq!(binary.get_type_name(type_id).await.unwrap(), type_name);
 }
 

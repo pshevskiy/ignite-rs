@@ -637,9 +637,7 @@ mod tests {
 
         assert_eq!(
             bytes,
-            vec![
-                6, 0, 0, 0, b'c', b'a', b'c', b'h', b'e', b'A', 1,
-            ]
+            vec![6, 0, 0, 0, b'c', b'a', b'c', b'h', b'e', b'A', 1,]
         );
     }
 

@@ -96,7 +96,10 @@ async fn should_register_and_build_binary_enums() {
             .enum_ordinal(),
         Some(0)
     );
-    assert_eq!(binary.get_type(binary.type_id(&type_name)).await.unwrap(), Some(meta));
+    assert_eq!(
+        binary.get_type(binary.type_id(&type_name)).await.unwrap(),
+        Some(meta)
+    );
 }
 
 /// Related Apache Ignite nested binary-object coverage:

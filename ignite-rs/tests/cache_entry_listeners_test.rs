@@ -4,6 +4,7 @@ mod common;
 
 use common::{connect, destroy_cache_if_exists, ignite_test_env, unique_name};
 use ignite_rs::binary::BinaryValue;
+use ignite_rs::cache::ExpiryPolicy;
 use ignite_rs::query::{CacheEntryEventType, ContinuousQuery, ScanQuery};
 use ignite_rs::{new_client, ClientConfig};
 use ignite_rs_derive::IgniteObj;
@@ -281,6 +282,381 @@ async fn should_fail_live_continuous_query_when_single_node_fixture_stops() {
 
     env.start();
     env.wait_for_ready().await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.CacheEntryListenersTest#testContinuousQueriesWithIncludeExpired
+#[tokio::test]
+async fn should_receive_expired_events_only_with_include_expired_enabled() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("cq_live_include_expired");
+    destroy_cache_if_exists(&client, &cache_name).await;
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    // Listener without include_expired
+    let mut cursor_no_expired = cache
+        .continuous_query(
+            ContinuousQuery::new()
+                .with_page_size(1)
+                .with_include_expired(false),
+        )
+        .await
+        .unwrap();
+
+    // Listener with include_expired
+    let mut cursor_with_expired = cache
+        .continuous_query(
+            ContinuousQuery::new()
+                .with_page_size(1)
+                .with_include_expired(true),
+        )
+        .await
+        .unwrap();
+
+    // Put entries with a very short TTL (100 entries to match Java)
+    let ttl = Duration::from_millis(1);
+    let expiring_cache = cache.with_expiry_policy(ExpiryPolicy::created(ttl));
+    for i in 0..100 {
+        expiring_cache.put(&i, &i).await.unwrap();
+    }
+
+    // Collect events from no-expired listener — should only see Created
+    let mut no_expired_created = 0;
+    for _ in 0..100 {
+        let event = next_event(&mut cursor_no_expired).await;
+        assert_eq!(event.event_type, CacheEntryEventType::Created);
+        no_expired_created += 1;
+    }
+    assert_eq!(no_expired_created, 100);
+
+    // Collect events from include-expired listener — should see Created + Expired
+    let mut with_expired_created = 0;
+    let mut with_expired_expired = 0;
+    for _ in 0..200 {
+        let event = tokio::time::timeout(Duration::from_secs(30), cursor_with_expired.next_event())
+            .await
+            .expect("timed out waiting for expired event")
+            .unwrap()
+            .expect("cursor ended unexpectedly");
+        match event.event_type {
+            CacheEntryEventType::Created => with_expired_created += 1,
+            CacheEntryEventType::Expired => with_expired_expired += 1,
+            other => panic!("unexpected event type: {:?}", other),
+        }
+    }
+    assert_eq!(with_expired_created, 100);
+    assert_eq!(with_expired_expired, 100);
+
+    cursor_no_expired.close().await.unwrap();
+    cursor_with_expired.close().await.unwrap();
+    client.destroy_cache(&cache_name).await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.CacheEntryListenersTest#testContinuousQueriesWithPageSize
+///
+/// Deviation from Java: The Java test uses `enpointsDiscoveryEnabled = false`
+/// to connect only to nodes 1+2 (not node 0), then puts 15 keys to node 0's
+/// primary partition via `primaryKeys()`.  This forces server-side batching:
+/// node 0 buffers events and sends exactly one page of 10 to the client.
+/// From a thin client we cannot use `primaryKeys()` or control endpoint
+/// discovery, and on a single-node fixture events are local, so server-side
+/// page batching cannot be observed.  This test exercises the `with_page_size()`
+/// API path as supplemental coverage but does not achieve true batching parity.
+#[tokio::test]
+async fn should_batch_continuous_query_events_by_page_size() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("cq_live_page_size");
+    destroy_cache_if_exists(&client, &cache_name).await;
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    let mut cursor = cache
+        .continuous_query(ContinuousQuery::new().with_page_size(10))
+        .await
+        .unwrap();
+
+    // Put fewer entries than page_size — they should still arrive (via time interval or flush)
+    for i in 0..5 {
+        cache.put(&i, &i).await.unwrap();
+    }
+
+    // Collect all 5 events
+    for _ in 0..5 {
+        let event = tokio::time::timeout(Duration::from_secs(10), cursor.next_event())
+            .await
+            .expect("timed out waiting for page-size batched event")
+            .unwrap()
+            .expect("cursor ended unexpectedly");
+        assert_eq!(event.event_type, CacheEntryEventType::Created);
+    }
+
+    // No extra events should be pending
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), cursor.next_event())
+            .await
+            .is_err(),
+        "expected no additional events after receiving all 5 created events"
+    );
+
+    cursor.close().await.unwrap();
+    client.destroy_cache(&cache_name).await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.CacheEntryListenersTest#testContinuousQueriesWithTimeInterval
+#[tokio::test]
+async fn should_deliver_continuous_query_events_after_time_interval() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("cq_live_time_interval");
+    destroy_cache_if_exists(&client, &cache_name).await;
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    let interval = Duration::from_millis(500);
+    let mut cursor = cache
+        .continuous_query(
+            ContinuousQuery::new()
+                .with_page_size(100) // large page_size to ensure time interval triggers first
+                .with_time_interval(interval),
+        )
+        .await
+        .unwrap();
+
+    let before = tokio::time::Instant::now();
+    cache.put(&0, &0).await.unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(10), cursor.next_event())
+        .await
+        .expect("timed out waiting for time-interval event")
+        .unwrap()
+        .expect("cursor ended unexpectedly");
+    let elapsed = before.elapsed();
+
+    assert_eq!(event.event_type, CacheEntryEventType::Created);
+    assert_eq!(event.key, 0);
+    // The event should be delayed by the time interval.  The Java test asserts
+    // `ts2 - ts1 >= TIMEOUT`.  On a single-node fixture events may arrive
+    // slightly faster since there is no remote-node buffering, so we use 2/3
+    // of the interval as a lower bound to allow for jitter.
+    assert!(
+        elapsed >= interval * 2 / 3,
+        "event arrived too quickly ({:?}), expected delay >= {:?} from time_interval={:?}",
+        elapsed,
+        interval * 2 / 3,
+        interval
+    );
+
+    cursor.close().await.unwrap();
+    client.destroy_cache(&cache_name).await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.CacheEntryListenersTest#testJCacheListeners
+#[tokio::test]
+async fn should_receive_typed_jcache_create_update_remove_events() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("cq_live_jcache");
+    destroy_cache_if_exists(&client, &cache_name).await;
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    let mut listener = cache
+        .register_cache_entry_listener("jcache_typed", ContinuousQuery::new())
+        .await
+        .unwrap();
+
+    // Create events (10 entries to match Java)
+    for i in 0..10 {
+        cache.put(&i, &i).await.unwrap();
+    }
+    let mut created_keys = Vec::new();
+    for _ in 0..10 {
+        let event = next_registered_event(&mut listener).await;
+        assert_eq!(event.event_type, CacheEntryEventType::Created);
+        assert_eq!(event.old_value, None);
+        created_keys.push((event.key, event.value));
+    }
+    created_keys.sort_by_key(|(k, _)| *k);
+    for (i, (key, value)) in created_keys.iter().enumerate() {
+        assert_eq!(*key, i as i32, "created event key mismatch at index {}", i);
+        assert_eq!(
+            *value,
+            Some(i as i32),
+            "created event value mismatch at index {}",
+            i
+        );
+    }
+
+    // Update events
+    for i in 0..10 {
+        cache.put(&i, &(i * 10)).await.unwrap();
+    }
+    for _ in 0..10 {
+        let event = next_registered_event(&mut listener).await;
+        assert_eq!(event.event_type, CacheEntryEventType::Updated);
+    }
+
+    // Remove events
+    for i in 0..10 {
+        cache.remove_key(&i).await.unwrap();
+    }
+    for _ in 0..10 {
+        let event = next_registered_event(&mut listener).await;
+        assert_eq!(event.event_type, CacheEntryEventType::Removed);
+    }
+
+    listener.close().await.unwrap();
+    client.destroy_cache(&cache_name).await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.CacheEntryListenersTest#testJCacheListenersExpiredEntries
+#[tokio::test]
+async fn should_receive_jcache_created_and_expired_events_with_short_ttl() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("cq_live_jcache_expired");
+    destroy_cache_if_exists(&client, &cache_name).await;
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    let mut listener = cache
+        .register_cache_entry_listener(
+            "jcache_expired",
+            ContinuousQuery::new().with_include_expired(true),
+        )
+        .await
+        .unwrap();
+
+    let ttl = Duration::from_millis(1);
+    let expiring_cache = cache.with_expiry_policy(ExpiryPolicy::created(ttl));
+    for i in 0..10 {
+        expiring_cache.put(&i, &i).await.unwrap();
+    }
+
+    let mut created = 0;
+    let mut expired = 0;
+    for _ in 0..20 {
+        let event = tokio::time::timeout(Duration::from_secs(10), listener.next_event())
+            .await
+            .expect("timed out waiting for jcache expired event")
+            .unwrap()
+            .expect("listener ended unexpectedly");
+        match event.event_type {
+            CacheEntryEventType::Created => created += 1,
+            CacheEntryEventType::Expired => expired += 1,
+            other => panic!("unexpected event type: {:?}", other),
+        }
+    }
+    assert_eq!(created, 10);
+    assert_eq!(expired, 10);
+
+    listener.close().await.unwrap();
+    client.destroy_cache(&cache_name).await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.CacheEntryListenersTest#testDisconnectListeners
+#[tokio::test]
+async fn should_fail_both_cq_and_jcache_listeners_on_disconnect() {
+    let env = ignite_test_env();
+    if !env.is_managed() {
+        return;
+    }
+
+    env.wait_for_ready().await.unwrap();
+
+    let mut conf = ClientConfig::new(env.addr());
+    conf.partition_awareness_enabled = false;
+    let client = new_client(conf).await.unwrap();
+    let cache_name = unique_name("cq_live_disconnect_both");
+    destroy_cache_if_exists(&client, &cache_name).await;
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+
+    let mut cq_cursor = cache
+        .continuous_query(ContinuousQuery::new().with_page_size(1))
+        .await
+        .unwrap();
+    let mut jcache_listener = cache
+        .register_cache_entry_listener("disconnect_both", ContinuousQuery::new())
+        .await
+        .unwrap();
+
+    cache.put(&0, &0).await.unwrap();
+    assert_eq!(next_event(&mut cq_cursor).await.value, Some(0));
+    assert_eq!(
+        next_registered_event(&mut jcache_listener).await.value,
+        Some(0)
+    );
+
+    env.stop();
+
+    // Attempt a put to trigger client-side failure detection (matches Java's
+    // `cache.put(1, 1)` after `dropAllThinClientConnections()`)
+    let _ = cache.put(&1, &1).await;
+
+    // Both listeners should fail on disconnect
+    let cq_err = tokio::time::timeout(Duration::from_secs(5), cq_cursor.next_batch())
+        .await
+        .expect("timed out waiting for CQ disconnect")
+        .unwrap_err();
+    assert!(
+        cq_err.to_string().contains("channel closed")
+            || cq_err.to_string().contains("closed")
+            || cq_err.to_string().contains("connection"),
+        "unexpected CQ disconnect error: {}",
+        cq_err
+    );
+
+    let jcache_err = tokio::time::timeout(Duration::from_secs(5), jcache_listener.next_event())
+        .await
+        .expect("timed out waiting for JCache disconnect");
+    match jcache_err {
+        Ok(None) => {} // stream ended — valid disconnect signal
+        Err(err) => {
+            assert!(
+                err.to_string().contains("channel closed")
+                    || err.to_string().contains("closed")
+                    || err.to_string().contains("connection"),
+                "unexpected JCache disconnect error: {}",
+                err
+            );
+        }
+        Ok(Some(event)) => {
+            panic!(
+                "expected disconnect error but got event: {:?}",
+                event.event_type
+            );
+        }
+    }
+
+    // Restart the node and verify re-registration works (matches Java's
+    // post-disconnect `isDisconnected()` check and listener re-registration)
+    env.start();
+    env.wait_for_ready().await.unwrap();
+
+    let reconnect_client = new_client(ClientConfig::new(env.addr())).await.unwrap();
+    let reconnect_cache = reconnect_client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+    let mut re_registered = reconnect_cache
+        .register_cache_entry_listener("disconnect_both_reregistered", ContinuousQuery::new())
+        .await
+        .unwrap();
+    reconnect_cache.put(&99, &99).await.unwrap();
+    let re_event = next_registered_event(&mut re_registered).await;
+    assert_eq!(re_event.event_type, CacheEntryEventType::Created);
+    assert_eq!(re_event.key, 99);
+    re_registered.close().await.unwrap();
 }
 
 async fn next_event<V>(

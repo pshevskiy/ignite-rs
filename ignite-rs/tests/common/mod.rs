@@ -35,8 +35,7 @@ pub use fixtures::{connect_mtls, connect_tls, ignite_mtls_env, ignite_tls_env};
 #[allow(unused_imports)]
 pub(crate) use fixtures::{
     debug_context_registry_contains, debug_context_registry_key, debug_profile_descriptor,
-    debug_prune_context_registry, debug_prune_dead_owner_pids, debug_release_owner_pid,
-    debug_shared_state_roundtrip, DebugSharedState,
+    debug_prune_context_registry,
 };
 
 pub const SQL_SCHEMA: &str = "PUBLIC";

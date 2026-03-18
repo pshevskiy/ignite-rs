@@ -9,7 +9,10 @@ use ignite_rs::data_structures::CollectionConfiguration;
 #[tokio::test]
 async fn should_return_none_for_missing_set() {
     let client = connect().await.unwrap();
-    let set = client.set::<i32>(&unique_name("missing_set"), None).await.unwrap();
+    let set = client
+        .set::<i32>(&unique_name("missing_set"), None)
+        .await
+        .unwrap();
 
     assert!(set.is_none());
 }

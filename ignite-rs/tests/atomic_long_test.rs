@@ -63,7 +63,12 @@ async fn should_error_on_operations_after_atomic_long_is_removed() {
         .unwrap();
     atomic.close().await.unwrap();
 
-    assert!(atomic.get().await.unwrap_err().to_string().contains("does not exist"));
+    assert!(atomic
+        .get()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("does not exist"));
     assert!(atomic
         .increment_and_get()
         .await

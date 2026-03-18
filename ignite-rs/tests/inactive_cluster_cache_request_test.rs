@@ -27,6 +27,17 @@ async fn assert_inactive_cluster_error(partition_awareness_enabled: bool) {
     let scope = ignite_scope(IgniteProfile::DefaultSingleNode);
     scope.wait_for_ready().await.unwrap();
 
+    // PA cannot work with containerised single-node fixtures: the server
+    // advertises its internal container IP which is unreachable from the host.
+    if partition_awareness_enabled {
+        if let Some(env) = scope.single_env() {
+            if env.is_managed() {
+                eprintln!("skipping PA variant: managed container endpoints are unreachable");
+                return;
+            }
+        }
+    }
+
     let cache_name = unique_name("inactive_cluster");
     let mut cfg = scope.client_config().unwrap();
     cfg.partition_awareness_enabled = partition_awareness_enabled;
@@ -39,7 +50,11 @@ async fn assert_inactive_cluster_error(partition_awareness_enabled: bool) {
         .await
         .unwrap();
 
-    client.cluster().set_state(ClusterState::Inactive).await.unwrap();
+    client
+        .cluster()
+        .set_state(ClusterState::Inactive)
+        .await
+        .unwrap();
 
     let err = client
         .cache::<i32, i32>(&cache_name)
@@ -48,7 +63,11 @@ async fn assert_inactive_cluster_error(partition_awareness_enabled: bool) {
         .unwrap_err()
         .to_string();
 
-    client.cluster().set_state(ClusterState::Active).await.unwrap();
+    client
+        .cluster()
+        .set_state(ClusterState::Active)
+        .await
+        .unwrap();
     destroy_cache_if_exists(&client, &cache_name).await;
 
     let lower = err.to_ascii_lowercase();

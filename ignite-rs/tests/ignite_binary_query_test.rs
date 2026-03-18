@@ -41,7 +41,10 @@ async fn should_decode_binary_object_field_values_from_sql_query_results() {
             .collect::<Vec<_>>(),
         vec!["id", "name"]
     );
-    assert_eq!(actual.field("id"), Some(&ignite_rs::protocol::complex_obj::IgniteValue::Int(1)));
+    assert_eq!(
+        actual.field("id"),
+        Some(&ignite_rs::protocol::complex_obj::IgniteValue::Int(1))
+    );
     assert_eq!(
         actual.field("name"),
         Some(&ignite_rs::protocol::complex_obj::IgniteValue::String(

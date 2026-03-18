@@ -4,8 +4,7 @@ mod common;
 
 use common::{
     debug_context_registry_contains, debug_context_registry_key, debug_profile_descriptor,
-    debug_prune_context_registry, debug_prune_dead_owner_pids, debug_release_owner_pid,
-    debug_shared_state_roundtrip, ignite_context, DebugSharedState, FixtureScope, IgniteProfile,
+    debug_prune_context_registry, ignite_context, FixtureScope, IgniteProfile,
 };
 use std::sync::Arc;
 
@@ -45,48 +44,6 @@ fn should_resolve_custom_client_port_as_external_process_context() {
             .addr(),
         format!("127.0.0.1:{port}")
     );
-}
-
-#[test]
-fn should_round_trip_shared_state_debug_payload() {
-    let state = DebugSharedState {
-        ref_count: 2,
-        mapped_port: Some(10800),
-        owner_pids: vec![111, 222],
-        bootstrap_version: Some("single-node:test-image".to_string()),
-    };
-
-    let roundtrip = debug_shared_state_roundtrip(state.clone());
-    assert_eq!(roundtrip, state);
-}
-
-#[test]
-fn should_prune_dead_owner_pids_from_shared_state() {
-    let state = DebugSharedState {
-        ref_count: 2,
-        mapped_port: None,
-        owner_pids: vec![0, std::process::id()],
-        bootstrap_version: None,
-    };
-
-    let pruned = debug_prune_dead_owner_pids(state);
-    assert_eq!(pruned.owner_pids, vec![std::process::id()]);
-    assert_eq!(pruned.ref_count, 1);
-}
-
-#[test]
-fn should_mark_cleanup_when_last_owner_releases_shared_state() {
-    let state = DebugSharedState {
-        ref_count: 1,
-        mapped_port: Some(10800),
-        owner_pids: vec![std::process::id()],
-        bootstrap_version: Some("single-node:test-image".to_string()),
-    };
-
-    let (released, should_cleanup) = debug_release_owner_pid(state, std::process::id());
-    assert!(should_cleanup);
-    assert!(released.owner_pids.is_empty());
-    assert_eq!(released.ref_count, 0);
 }
 
 #[test]

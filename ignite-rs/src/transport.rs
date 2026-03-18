@@ -8,8 +8,8 @@ use crate::error::{ErrorKind, IgniteError, IgniteResult};
 use crate::events::{ConnectionEventKind, EventBus, LifecycleEventKind, RequestEventKind};
 use crate::protocol::Flag::{Failure, Success};
 use crate::protocol::{
-    read_i32, read_i64, read_string, read_u8, write_i16, write_i32, write_i64, write_string,
-    Flag, TypeCode,
+    read_i32, read_i64, read_string, read_u8, write_i16, write_i32, write_i64, write_string, Flag,
+    TypeCode,
 };
 use crate::topology::{DiscoveredNode, TopologyCache, TopologySnapshot, TopologyVersion};
 use crate::{ClientConfig, ReadableReq, RetryContext, RetryDecision, RetryPolicy, WriteableReq};
@@ -2007,7 +2007,8 @@ fn endpoint_port(address: &str) -> Option<u16> {
 }
 
 fn hex_prefix(bytes: &[u8], limit: usize) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .take(limit)
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
@@ -2034,8 +2035,7 @@ fn read_flexible_string(reader: &mut impl io::Read) -> IgniteResult<String> {
 
             let mut bytes = vec![0u8; str_len as usize];
             reader.read_exact(&mut bytes).map_err(IgniteError::from)?;
-            String::from_utf8(bytes)
-                .map_err(|err| IgniteError::from(err.to_string().as_str()))
+            String::from_utf8(bytes).map_err(|err| IgniteError::from(err.to_string().as_str()))
         }
     }
 }

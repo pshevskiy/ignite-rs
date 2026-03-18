@@ -24,6 +24,7 @@ use crate::query::continuous::{
     ContinuousQuery, ContinuousQueryCursor, ContinuousQueryRequest, ContinuousQueryResponse,
     RegisteredCacheEntryListener,
 };
+use crate::query::index::{IndexQuery, IndexQueryRequest};
 use crate::query::scan::{ScanQuery, ScanQueryRequest};
 use crate::query::sql::{
     SqlFieldsOpenResponse, SqlFieldsQuery, SqlFieldsQueryRequest, SqlQuery, SqlQueryRequest, SqlRow,
@@ -798,6 +799,38 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         ))
     }
 
+    async fn index_query_impl(&self, query: IndexQuery) -> IgniteResult<EntryCursor<K, V>> {
+        self.ensure_tx_cache_ops_allowed().await?;
+        let route = match query.partition() {
+            Some(partition) => self.route_for_partition(partition, false).await?,
+            None => self.tx_route().await?,
+        };
+        let (open, meta): (CursorOpenResp<K, V>, crate::transport::ResponseMeta) = self
+            .map_tx_err(
+                self.exec
+                    .send_and_read_with_meta(
+                        OpCode::QueryIndex,
+                        IndexQueryRequest {
+                            cache_info: self.cache_info(true)?,
+                            query: &query,
+                        },
+                        route.unwrap_or_default(),
+                    )
+                    .await,
+            )
+            .await?;
+
+        Ok(EntryCursor::new(
+            self.exec.clone(),
+            crate::transport::RequestRoute::pinned(meta.address),
+            open.cursor_id,
+            OpCode::QueryIndexCursorGetPage,
+            false,
+            open.rows,
+            open.has_more,
+        ))
+    }
+
     async fn continuous_query_impl(
         &self,
         query: ContinuousQuery,
@@ -1415,6 +1448,11 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
 
     pub async fn sql_query(&self, query: SqlQuery<K, V>) -> IgniteResult<EntryCursor<K, V>> {
         self.sql_query_impl(query).await
+    }
+
+    /// Execute an index query against cache indexes, returning a cursor of key-value entries.
+    pub async fn index_query(&self, query: IndexQuery) -> IgniteResult<EntryCursor<K, V>> {
+        self.index_query_impl(query).await
     }
 
     pub async fn sql_fields<Row: SqlRow>(

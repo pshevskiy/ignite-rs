@@ -2,7 +2,7 @@
 name = "ignite-rs"
 version = "0.1.1"
 authors = ["Andrii Pohrebniak <andrii.pohrebniak@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT"
 description = "Apache Ignite thin client"
 homepage = "https://github.com/apohrebniak/ignite-rs"
@@ -15,7 +15,7 @@ categories = ["database"]
 [dependencies]
 [dependencies.tokio]
 version = "1"
-features = ["net", "io-util", "sync", "time"]
+features = ["net", "io-util", "sync", "time", "rt", "macros"]
 
 [dependencies.tokio-rustls]
 version = "0.25"
