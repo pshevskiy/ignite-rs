@@ -2,232 +2,240 @@
 
 mod common;
 
-use common::{spawn_mock_thin_server, MockResponse, MockThinServerConfig, MockUuid};
-use ignite_rs::query::SqlValue;
-use ignite_rs::{new_client, ClientConfig, WritableType};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use common::connect_cluster3;
 
-const OP_CLUSTER_GROUP_GET_NODE_IDS: i16 = 5100;
-const OP_CLUSTER_GROUP_GET_NODE_INFO: i16 = 5101;
+/// Java parity: ClusterGroupTest#testClusterNodeFields
+#[tokio::test]
+async fn should_list_all_cluster_nodes() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
 
-#[derive(Clone)]
-struct NodeSpec {
-    id: MockUuid,
-    attr_name: &'static str,
-    attr_value: i32,
-    addresses: Vec<&'static str>,
-    host_names: Vec<&'static str>,
-    order: i64,
-    is_client: bool,
-    consistent_id: &'static str,
+    let nodes = cluster.nodes().await.unwrap();
+    assert!(
+        nodes.len() >= 3,
+        "expected at least 3 nodes, got {}",
+        nodes.len()
+    );
+
+    for node in &nodes {
+        assert!(!node.id.is_empty(), "node id should be non-empty");
+        assert!(
+            node.order > 0,
+            "node order should be > 0, got {}",
+            node.order
+        );
+        // is_local is true for the node handling the thin client connection;
+        // the server-side isLocal() reflects the processing node, not the client.
+    }
 }
 
-/// Migrated from Apache Ignite `ClusterGroupTest.testForServers`, `testForClients`, `testForAttribute`, and `testForHost`:
-/// Java source: org.apache.ignite.internal.client.thin.ClusterGroupTest
+/// Java parity: ClusterGroupTest#testForServersForClients
 #[tokio::test]
-async fn should_filter_servers_clients_attributes_and_hosts() {
-    let nodes = sample_nodes();
-    let server = spawn_mock_thin_server(MockThinServerConfig {
-        opcode_responses: Some(opcode_responses(vec![
-            (
-                OP_CLUSTER_GROUP_GET_NODE_IDS,
-                vec![
-                    MockResponse::success(encode_node_ids_response(true, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                ],
-            ),
-            (
-                OP_CLUSTER_GROUP_GET_NODE_INFO,
-                vec![MockResponse::success(encode_node_info_response(&nodes))],
-            ),
-        ])),
-        ..Default::default()
-    });
+async fn should_filter_servers() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
 
-    let mut conf = ClientConfig::new(server.addr());
-    conf.partition_awareness_enabled = false;
-    let client = new_client(conf).await.unwrap();
+    let servers = cluster.for_servers().nodes().await.unwrap();
+    assert_eq!(
+        servers.len(),
+        3,
+        "expected 3 server nodes, got {}",
+        servers.len()
+    );
+    for node in &servers {
+        assert!(
+            !node.is_client,
+            "server filter should not return client nodes"
+        );
+    }
+
+    let clients = cluster.for_clients().nodes().await.unwrap();
+    assert!(
+        clients.is_empty(),
+        "expected no client nodes, got {}",
+        clients.len()
+    );
+}
+
+/// Java parity: ClusterGroupTest#testNodeById
+#[tokio::test]
+async fn should_select_node_by_id() {
+    let client = connect_cluster3().await.unwrap();
     let cluster = client.cluster();
 
     let all = cluster.nodes().await.unwrap();
-    assert_eq!(all.len(), 3);
+    assert!(!all.is_empty(), "cluster should have nodes");
 
-    let servers = cluster.for_servers().node_ids().await.unwrap();
+    let target_id = all[0].id.clone();
+    let filtered = cluster.for_node_id(&target_id).nodes().await.unwrap();
     assert_eq!(
-        servers,
-        vec![nodes[0].id.as_string(), nodes[1].id.as_string()]
+        filtered.len(),
+        1,
+        "for_node_id should return exactly 1 node"
     );
-
-    let clients = cluster.for_clients().node_ids().await.unwrap();
-    assert_eq!(clients, vec![nodes[2].id.as_string()]);
-
-    let attr = cluster
-        .for_attribute("IDX_ATTR", Some(SqlValue::Int(0)))
-        .node_ids()
-        .await
-        .unwrap();
-    assert_eq!(attr, vec![nodes[0].id.as_string()]);
-
-    let host = cluster.for_host("client-host").node_ids().await.unwrap();
-    assert_eq!(host, vec![nodes[2].id.as_string()]);
+    assert_eq!(filtered[0].id, target_id);
 }
 
-/// Migrated from Apache Ignite `ClusterGroupTest.testForNodeIds`, `testForOldest`, `testForYoungest`, and `testForRandom`:
-/// Java source: org.apache.ignite.internal.client.thin.ClusterGroupTest
+/// Java parity: ClusterGroupTest#testForNodeIds
 #[tokio::test]
-async fn should_select_specific_oldest_youngest_and_random_nodes() {
-    let nodes = sample_nodes();
-    let server = spawn_mock_thin_server(MockThinServerConfig {
-        opcode_responses: Some(opcode_responses(vec![
-            (
-                OP_CLUSTER_GROUP_GET_NODE_IDS,
-                vec![
-                    MockResponse::success(encode_node_ids_response(true, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                    MockResponse::success(encode_node_ids_response(false, 1, &nodes)),
-                ],
-            ),
-            (
-                OP_CLUSTER_GROUP_GET_NODE_INFO,
-                vec![MockResponse::success(encode_node_info_response(&nodes))],
-            ),
-        ])),
-        ..Default::default()
-    });
-
-    let mut conf = ClientConfig::new(server.addr());
-    conf.partition_awareness_enabled = false;
-    let client = new_client(conf).await.unwrap();
+async fn should_select_nodes_by_ids() {
+    let client = connect_cluster3().await.unwrap();
     let cluster = client.cluster();
 
-    let explicit = cluster
-        .for_node_ids([nodes[1].id.as_string(), nodes[2].id.as_string()])
-        .node_ids()
+    let all = cluster.nodes().await.unwrap();
+    assert!(all.len() >= 2, "need at least 2 nodes for this test");
+
+    let id1 = all[0].id.clone();
+    let id2 = all[1].id.clone();
+    let filtered = cluster
+        .for_node_ids([id1.clone(), id2.clone()])
+        .nodes()
         .await
         .unwrap();
     assert_eq!(
-        explicit,
-        vec![nodes[1].id.as_string(), nodes[2].id.as_string()]
+        filtered.len(),
+        2,
+        "for_node_ids with 2 ids should return 2 nodes"
     );
 
-    let oldest = cluster.for_oldest().node_ids().await.unwrap();
-    assert_eq!(oldest, vec![nodes[0].id.as_string()]);
+    let filtered_ids: Vec<&str> = filtered.iter().map(|n| n.id.as_str()).collect();
+    assert!(filtered_ids.contains(&id1.as_str()));
+    assert!(filtered_ids.contains(&id2.as_str()));
+}
 
-    let youngest = cluster.for_youngest().node_ids().await.unwrap();
-    assert_eq!(youngest, vec![nodes[1].id.as_string()]);
+/// Java parity: ClusterGroupTest#testForOldest
+#[tokio::test]
+async fn should_select_oldest_node() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
+
+    let all = cluster.nodes().await.unwrap();
+    let min_order = all.iter().map(|n| n.order).min().unwrap();
+
+    let oldest = cluster.for_oldest().nodes().await.unwrap();
+    assert_eq!(oldest.len(), 1, "for_oldest should return exactly 1 node");
+    assert_eq!(
+        oldest[0].order, min_order,
+        "oldest node should have the minimum order"
+    );
+}
+
+/// Java parity: ClusterGroupTest#testForYoungest
+#[tokio::test]
+async fn should_select_youngest_node() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
+
+    let all = cluster.nodes().await.unwrap();
+    let max_order = all.iter().map(|n| n.order).max().unwrap();
+
+    let youngest = cluster.for_youngest().nodes().await.unwrap();
+    assert_eq!(
+        youngest.len(),
+        1,
+        "for_youngest should return exactly 1 node"
+    );
+    assert_eq!(
+        youngest[0].order, max_order,
+        "youngest node should have the maximum order"
+    );
+}
+
+/// Java parity: ClusterGroupTest#testForRandom
+#[tokio::test]
+async fn should_select_random_node() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
+
+    let all = cluster.nodes().await.unwrap();
+    let all_ids: Vec<&str> = all.iter().map(|n| n.id.as_str()).collect();
 
     let random = cluster.for_random().nodes().await.unwrap();
-    assert_eq!(random.len(), 1);
-    assert!(nodes.iter().any(|node| node.id.as_string() == random[0].id));
+    assert_eq!(random.len(), 1, "for_random should return exactly 1 node");
+    assert!(
+        all_ids.contains(&random[0].id.as_str()),
+        "random node id should be among known node ids"
+    );
 }
 
-fn sample_nodes() -> Vec<NodeSpec> {
-    vec![
-        NodeSpec {
-            id: MockUuid::new(1001, 1),
-            attr_name: "IDX_ATTR",
-            attr_value: 0,
-            addresses: vec!["127.0.0.1"],
-            host_names: vec!["server-a"],
-            order: 1,
-            is_client: false,
-            consistent_id: "srv-0",
-        },
-        NodeSpec {
-            id: MockUuid::new(1002, 2),
-            attr_name: "IDX_ATTR",
-            attr_value: 1,
-            addresses: vec!["127.0.0.2"],
-            host_names: vec!["server-b"],
-            order: 9,
-            is_client: false,
-            consistent_id: "srv-1",
-        },
-        NodeSpec {
-            id: MockUuid::new(1003, 3),
-            attr_name: "IDX_ATTR",
-            attr_value: 2,
-            addresses: vec!["127.0.0.3"],
-            host_names: vec!["client-host"],
-            order: 5,
-            is_client: true,
-            consistent_id: "cli-0",
-        },
-    ]
-}
+/// Java parity: ClusterGroupTest#testForHost
+#[tokio::test]
+async fn should_filter_by_host() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
 
-fn encode_node_ids_response(changed: bool, topology_version: i64, nodes: &[NodeSpec]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(changed as u8);
-    if changed {
-        payload.extend_from_slice(&topology_version.to_le_bytes());
-        payload.extend_from_slice(&(nodes.len() as i32).to_le_bytes());
-        for node in nodes {
-            payload.extend_from_slice(&node.id.most.to_le_bytes());
-            payload.extend_from_slice(&node.id.least.to_le_bytes());
-        }
-    }
-    payload
-}
+    let all = cluster.nodes().await.unwrap();
+    assert!(!all.is_empty(), "cluster should have nodes");
 
-fn encode_node_info_response(nodes: &[NodeSpec]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(nodes.len() as i32).to_le_bytes());
+    let hostname = all[0]
+        .host_names
+        .first()
+        .expect("node should have at least one hostname")
+        .clone();
 
-    for node in nodes {
-        payload.extend_from_slice(&node.id.most.to_le_bytes());
-        payload.extend_from_slice(&node.id.least.to_le_bytes());
-        payload.extend_from_slice(&1i32.to_le_bytes());
-        write_raw_string(&mut payload, node.attr_name);
-        encode_typed(&mut payload, &node.attr_value);
-        write_string_vec(&mut payload, &node.addresses);
-        write_string_vec(&mut payload, &node.host_names);
-        payload.extend_from_slice(&node.order.to_le_bytes());
-        payload.push(0u8);
-        payload.push(0u8);
-        payload.push(node.is_client as u8);
-        encode_typed(&mut payload, &node.consistent_id.to_string());
-        payload.push(2);
-        payload.push(15);
-        payload.push(0);
-        write_raw_string(&mut payload, "release");
-        payload.extend_from_slice(&1234i64.to_le_bytes());
-        payload.extend_from_slice(&3i32.to_le_bytes());
-        payload.extend_from_slice(&[1u8, 2u8, 3u8]);
-    }
-
-    payload
-}
-
-fn write_raw_string(payload: &mut Vec<u8>, value: &str) {
-    payload.extend_from_slice(&(value.len() as i32).to_le_bytes());
-    payload.extend_from_slice(value.as_bytes());
-}
-
-fn write_string_vec(payload: &mut Vec<u8>, values: &[&str]) {
-    payload.extend_from_slice(&(values.len() as i32).to_le_bytes());
-    for value in values {
-        write_raw_string(payload, value);
+    let filtered = cluster.for_host(&hostname).nodes().await.unwrap();
+    assert!(
+        !filtered.is_empty(),
+        "for_host should return at least 1 node for hostname '{}'",
+        hostname
+    );
+    for node in &filtered {
+        assert!(
+            node.host_names.contains(&hostname),
+            "filtered node should contain hostname '{}'",
+            hostname
+        );
     }
 }
 
-fn encode_typed<T: WritableType>(payload: &mut Vec<u8>, value: &T) {
-    value.write(payload).expect("failed to encode typed value");
+/// Java parity: ClusterGroupTest#testNodeIds
+#[tokio::test]
+async fn should_get_node_ids() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
+
+    let ids = cluster.group().node_ids().await.unwrap();
+    assert_eq!(ids.len(), 3, "expected 3 node ids, got {}", ids.len());
+    for id in &ids {
+        assert!(!id.is_empty(), "node id should be non-empty");
+    }
 }
 
-fn opcode_responses(
-    entries: Vec<(i16, Vec<MockResponse>)>,
-) -> Arc<Mutex<HashMap<i16, VecDeque<MockResponse>>>> {
-    Arc::new(Mutex::new(
-        entries
-            .into_iter()
-            .map(|(op, responses)| (op, VecDeque::from(responses)))
-            .collect(),
-    ))
+/// Java parity: ClusterGroupTest#testForFiltersCombinations
+#[tokio::test]
+async fn should_combine_filters() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
+
+    let servers = cluster.for_servers().nodes().await.unwrap();
+    let min_order = servers.iter().map(|n| n.order).min().unwrap();
+
+    let combined = cluster.for_servers().for_oldest().nodes().await.unwrap();
+    assert_eq!(
+        combined.len(),
+        1,
+        "for_servers().for_oldest() should return exactly 1 node"
+    );
+    assert!(
+        !combined[0].is_client,
+        "combined filter result should be a server"
+    );
+    assert_eq!(
+        combined[0].order, min_order,
+        "combined filter result should be the oldest server"
+    );
+}
+
+/// Java parity: ClusterGroupTest#testClusterNodeCaching
+#[tokio::test]
+async fn should_cache_cluster_nodes() {
+    let client = connect_cluster3().await.unwrap();
+    let cluster = client.cluster();
+
+    let first = cluster.nodes().await.unwrap();
+    let second = cluster.nodes().await.unwrap();
+    assert_eq!(
+        first, second,
+        "consecutive calls to nodes() should return the same result (cached)"
+    );
 }

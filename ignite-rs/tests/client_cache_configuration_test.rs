@@ -128,12 +128,11 @@ async fn should_round_trip_cache_configuration() {
     assert!(entity.query_fields()[0].has_not_null_constraint());
     assert_eq!(entity.query_fields()[1].name(), "orgId");
     assert_eq!(entity.field_aliases().len(), 2);
+    let mut sorted_aliases = entity.field_aliases().to_vec();
+    sorted_aliases.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(sorted_aliases[0], ("id".to_string(), "ID".to_string()));
     assert_eq!(
-        entity.field_aliases()[0],
-        ("id".to_string(), "ID".to_string())
-    );
-    assert_eq!(
-        entity.field_aliases()[1],
+        sorted_aliases[1],
         ("orgId".to_string(), "ORGID".to_string())
     );
     assert_eq!(entity.query_indexes().len(), 1);

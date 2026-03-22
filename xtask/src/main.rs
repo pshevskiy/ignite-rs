@@ -1,9 +1,11 @@
+mod provision;
+
 use anyhow::{bail, Context, Result};
 use bollard::container::{ListContainersOptions, RemoveContainerOptions};
 use bollard::network::ListNetworksOptions;
 use bollard::Docker;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +48,16 @@ fn run_test_matrix(bucket_filter: Option<Bucket>) -> Result<()> {
     } else {
         stages.extend(Bucket::ordered());
     }
+
+    // Global cleanup: remove ALL managed fixture containers from previous runs
+    // to prevent stale containers from blocking provisioning.
+    let all_profiles: BTreeSet<String> = KNOWN_PROFILES
+        .iter()
+        .filter(|p| **p != "none")
+        .map(|p| p.to_string())
+        .collect();
+    cleanup_profiles(&workspace_root, &all_profiles)
+        .context("failed initial global cleanup")?;
 
     run_cargo_check(&workspace_root)?;
 
@@ -174,32 +186,169 @@ fn run_bucket(workspace_root: &Path, matrix: &TestMatrix, bucket: Bucket) -> Res
         .iter()
         .filter_map(|suite| suite.live_profile())
         .collect::<BTreeSet<_>>();
-    let envs = bucket_env(bucket);
+    let base_envs = bucket_env(bucket);
 
     if !live_profiles.is_empty() {
         cleanup_profiles(workspace_root, &live_profiles)
             .with_context(|| format!("failed to clean fixtures before {}", bucket.as_str()))?;
     }
 
-    for suite in suites {
-        run_suite(workspace_root, bucket, suite, &envs).with_context(|| {
-            format!(
-                "bucket={} test={} profile={} features={:?} exact={}",
-                bucket.as_str(),
-                suite.test,
-                suite.profile,
-                suite.features,
-                suite.exact.as_deref().unwrap_or("<none>")
+    // Determine which profiles can be shared: a profile is eligible only if
+    // ALL suites using it in this bucket have scope = "cargo_session".
+    let shared_profiles = {
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        let mut excluded: BTreeSet<String> = BTreeSet::new();
+        for suite in &suites {
+            if let Some(profile) = suite.live_profile() {
+                if suite.is_shared_scope() {
+                    candidates.insert(profile);
+                } else {
+                    excluded.insert(profile);
+                }
+            }
+        }
+        candidates.retain(|p| !excluded.contains(p));
+        candidates
+    };
+
+    // Provision shared containers.
+    let runtime = tokio::runtime::Runtime::new().context("failed to start provisioning runtime")?;
+    let docker = connect_docker().context("failed to connect to Docker for provisioning")?;
+    let mut provisioned: std::collections::HashMap<String, provision::ProvisionedEnv> =
+        std::collections::HashMap::new();
+
+    if !shared_profiles.is_empty() {
+        println!(
+            "==> provisioning shared containers for bucket {} (profiles: {})",
+            bucket.as_str(),
+            shared_profiles
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for profile in &shared_profiles {
+            let env = runtime
+                .block_on(provision::provision_profile(
+                    &docker,
+                    profile,
+                    workspace_root,
+                ))
+                .with_context(|| {
+                    format!("failed to provision shared container for profile {profile}")
+                })?;
+            provisioned.insert(profile.clone(), env);
+        }
+    }
+
+    // Build per-profile env var overrides.
+    let profile_envs: std::collections::HashMap<String, Vec<(String, String)>> = provisioned
+        .iter()
+        .map(|(profile, env)| {
+            (
+                profile.clone(),
+                provision::provisioned_env_vars(env, workspace_root),
             )
-        })?;
+        })
+        .collect();
+
+    // Group suites by key to batch exact-match invocations.
+    let suite_result: Result<()> = (|| {
+        // Partition suites into groups that can be batched (same test binary,
+        // profile, scope, features, serial) and standalone entries.
+        let mut groups: BTreeMap<SuiteGroupKey, Vec<&SuiteEntry>> = BTreeMap::new();
+        let mut standalone: Vec<&SuiteEntry> = Vec::new();
+
+        for suite in &suites {
+            if suite.exact.is_some() {
+                let key = SuiteGroupKey::from(suite);
+                groups.entry(key).or_default().push(suite);
+            } else {
+                standalone.push(suite);
+            }
+        }
+
+        // Run batched exact-match groups.
+        for (_, group) in &groups {
+            let mut envs = base_envs.clone();
+            let representative = group[0];
+            if let Some(extra) = profile_envs.get(&representative.profile) {
+                envs.extend(extra.iter().cloned());
+            }
+
+            if group.len() >= 2 {
+                let exact_names: Vec<&str> =
+                    group.iter().filter_map(|s| s.exact.as_deref()).collect();
+                run_suite_group(workspace_root, bucket, representative, &exact_names, &envs)
+                    .with_context(|| {
+                        format!(
+                            "bucket={} test={} profile={} features={:?} (batched {} tests)",
+                            bucket.as_str(),
+                            representative.test,
+                            representative.profile,
+                            representative.features,
+                            exact_names.len(),
+                        )
+                    })?;
+            } else {
+                run_suite(workspace_root, bucket, representative, &envs).with_context(|| {
+                    format!(
+                        "bucket={} test={} profile={} features={:?} exact={}",
+                        bucket.as_str(),
+                        representative.test,
+                        representative.profile,
+                        representative.features,
+                        representative.exact.as_deref().unwrap_or("<none>")
+                    )
+                })?;
+            }
+        }
+
+        // Run standalone (non-exact) suites.
+        for suite in &standalone {
+            let mut envs = base_envs.clone();
+            if let Some(extra) = profile_envs.get(&suite.profile) {
+                envs.extend(extra.iter().cloned());
+            }
+            run_suite(workspace_root, bucket, suite, &envs).with_context(|| {
+                format!(
+                    "bucket={} test={} profile={} features={:?} exact={}",
+                    bucket.as_str(),
+                    suite.test,
+                    suite.profile,
+                    suite.features,
+                    suite.exact.as_deref().unwrap_or("<none>")
+                )
+            })?;
+        }
+        Ok(())
+    })();
+
+    // Always teardown provisioned containers (even on suite failure).
+    if !provisioned.is_empty() {
+        println!(
+            "==> tearing down shared containers for bucket {}",
+            bucket.as_str()
+        );
+        for (profile, env) in &provisioned {
+            if let Err(err) = runtime.block_on(provision::teardown(&docker, env)) {
+                eprintln!("warning: failed to teardown {profile}: {err}");
+            }
+        }
     }
 
-    if !live_profiles.is_empty() {
-        cleanup_profiles(workspace_root, &live_profiles)
-            .with_context(|| format!("failed to clean fixtures after {}", bucket.as_str()))?;
-    }
+    // Clean up both profile-specific and any stale fixture containers left
+    // by in-process test fixtures (e.g., single-node containers created by
+    // connect() inside cluster3_churn tests).
+    let all_profiles: BTreeSet<String> = KNOWN_PROFILES
+        .iter()
+        .filter(|p| **p != "none")
+        .map(|p| p.to_string())
+        .collect();
+    cleanup_profiles(workspace_root, &all_profiles)
+        .with_context(|| format!("failed to clean fixtures after {}", bucket.as_str()))?;
 
-    Ok(())
+    suite_result
 }
 
 fn run_suite(
@@ -242,6 +391,56 @@ fn run_suite(
         suite.test,
         suite.profile,
         suite.exact.as_deref().unwrap_or("<none>")
+    );
+
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command(workspace_root, &label, &arg_refs, envs)
+}
+
+fn run_suite_group(
+    workspace_root: &Path,
+    bucket: Bucket,
+    representative: &SuiteEntry,
+    exact_names: &[&str],
+    envs: &[(String, String)],
+) -> Result<()> {
+    let mut args = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "--manifest-path".to_string(),
+        WORKSPACE_MANIFEST.to_string(),
+        "--package".to_string(),
+        CLIENT_PACKAGE.to_string(),
+    ];
+    if !representative.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(representative.features.join(" "));
+    }
+    args.push("--test".to_string());
+    args.push(representative.test.clone());
+
+    // Build a regex filter: ^name1$|^name2$|...
+    let filter = exact_names
+        .iter()
+        .map(|name| format!("^{name}$"))
+        .collect::<Vec<_>>()
+        .join("|");
+    args.push(filter);
+
+    args.push("--".to_string());
+    if bucket.is_live() || representative.serial {
+        args.push("--test-threads=1".to_string());
+    }
+    if bucket.is_live() {
+        args.push("--nocapture".to_string());
+    }
+
+    let label = format!(
+        "bucket={} test={} profile={} (batched {} exact tests)",
+        bucket.as_str(),
+        representative.test,
+        representative.profile,
+        exact_names.len(),
     );
 
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -339,18 +538,17 @@ async fn cleanup_profile_resources(docker: &Docker, profile: &str) -> Result<()>
     for container in containers {
         let labels = container.labels.unwrap_or_default();
         let names = container.names.unwrap_or_default();
-        let matches_profile = labels
-            .get(FIXTURE_PROFILE_LABEL)
-            .map(|value| value == profile)
-            .unwrap_or(false)
-            || names.iter().any(|name| name.contains(profile));
-
-        if !labels
+        let is_managed = labels
             .get(FIXTURE_MANAGED_LABEL)
             .map(|value| value == "true")
-            .unwrap_or(false)
-            && !matches_profile
-        {
+            .unwrap_or(false);
+        let matches_label = labels
+            .get(FIXTURE_PROFILE_LABEL)
+            .map(|value| value == profile)
+            .unwrap_or(false);
+
+        // Only clean up containers that are both managed AND belong to this profile.
+        if !is_managed || !matches_label {
             continue;
         }
 
@@ -385,8 +583,7 @@ async fn cleanup_profile_resources(docker: &Docker, profile: &str) -> Result<()>
         let matches_profile = labels
             .get(FIXTURE_PROFILE_LABEL)
             .map(|value| value == profile)
-            .unwrap_or(false)
-            || name.contains(profile);
+            .unwrap_or(false);
 
         if !matches_profile {
             continue;
@@ -400,9 +597,30 @@ async fn cleanup_profile_resources(docker: &Docker, profile: &str) -> Result<()>
 }
 
 fn connect_docker() -> Result<Docker> {
-    if env::var_os("DOCKER_HOST").is_some() {
-        Ok(Docker::connect_with_http_defaults()?)
+    if let Ok(host) = env::var("DOCKER_HOST") {
+        if let Some(path) = host.strip_prefix("unix://") {
+            Ok(Docker::connect_with_unix(
+                path,
+                120,
+                bollard::API_DEFAULT_VERSION,
+            )?)
+        } else {
+            Ok(Docker::connect_with_http_defaults()?)
+        }
     } else {
+        // Try Colima socket first (macOS), then local/http defaults.
+        if let Some(home) = env::var_os("HOME") {
+            let colima = std::path::PathBuf::from(&home).join(".colima/default/docker.sock");
+            if colima.exists() {
+                if let Ok(d) = Docker::connect_with_unix(
+                    colima.to_str().unwrap(),
+                    120,
+                    bollard::API_DEFAULT_VERSION,
+                ) {
+                    return Ok(d);
+                }
+            }
+        }
         Docker::connect_with_local_defaults()
             .or_else(|_| Docker::connect_with_http_defaults())
             .context("no reachable local Docker-compatible socket")
@@ -480,6 +698,17 @@ struct TestMatrix {
     suite: Vec<SuiteEntry>,
 }
 
+const KNOWN_PROFILES: &[&str] = &[
+    "none",
+    "single-node",
+    "single-node-churn",
+    "single-node-auth",
+    "single-node-tls",
+    "single-node-mtls",
+    "cluster-3",
+    "cluster-3-churn",
+];
+
 impl TestMatrix {
     fn validate(&self) -> Result<()> {
         if self.suite.is_empty() {
@@ -488,6 +717,14 @@ impl TestMatrix {
 
         for suite in &self.suite {
             let _ = Bucket::parse(&suite.bucket)?;
+            if !KNOWN_PROFILES.contains(&suite.profile.as_str()) {
+                bail!(
+                    "unknown profile {:?} for test {:?} — known profiles: {:?}",
+                    suite.profile,
+                    suite.test,
+                    KNOWN_PROFILES
+                );
+            }
         }
 
         Ok(())
@@ -506,8 +743,7 @@ struct SuiteEntry {
     test: String,
     bucket: String,
     profile: String,
-    #[serde(rename = "scope")]
-    _scope: String,
+    scope: String,
     #[serde(default)]
     features: Vec<String>,
     #[serde(default)]
@@ -522,6 +758,31 @@ impl SuiteEntry {
             None
         } else {
             Some(self.profile.clone())
+        }
+    }
+
+    fn is_shared_scope(&self) -> bool {
+        self.scope == "cargo_session"
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct SuiteGroupKey {
+    test: String,
+    profile: String,
+    scope: String,
+    features: Vec<String>,
+    serial: bool,
+}
+
+impl SuiteGroupKey {
+    fn from(suite: &SuiteEntry) -> Self {
+        Self {
+            test: suite.test.clone(),
+            profile: suite.profile.clone(),
+            scope: suite.scope.clone(),
+            features: suite.features.clone(),
+            serial: suite.serial,
         }
     }
 }

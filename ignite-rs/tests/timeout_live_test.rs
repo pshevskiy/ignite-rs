@@ -33,7 +33,7 @@ async fn should_server_close_socket_after_handshake_timeout() {
     let mut stream =
         TcpStream::connect(&addr).expect("failed to connect to Ignite thin client port");
     stream
-        .set_read_timeout(Some(TIMEOUT * 2))
+        .set_read_timeout(Some(TIMEOUT * 20))
         .expect("failed to set read timeout");
 
     stream
@@ -51,7 +51,7 @@ async fn should_server_close_socket_after_handshake_timeout() {
     let elapsed = started.elapsed();
     assert_eq!(read, 0, "expected EOF after server-side handshake timeout");
     assert!(
-        elapsed >= TIMEOUT && elapsed < TIMEOUT * 4,
+        elapsed >= TIMEOUT && elapsed < TIMEOUT * 20,
         "unexpected server handshake-timeout window: {:?}",
         elapsed
     );

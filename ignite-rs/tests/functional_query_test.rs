@@ -444,7 +444,7 @@ async fn should_reject_empty_sql_fields_query() {
 
 /// Java parity: org.apache.ignite.client.FunctionalQueryTest#testQueryInitiatorId
 #[tokio::test]
-#[ignore = "managed apacheignite/ignite:2.15.0 fixture still reports the default thin-client descriptor for SYS.SQL_QUERIES; use a source-matched external Ignite fixture for live initiator-id parity"]
+#[ignore = "stock apacheignite/ignite Docker images do not advertise QRY_INITIATOR_ID; requires a custom Ignite build"]
 async fn should_round_trip_query_initiator_id_via_sys_sql_queries() {
     let ignite = connect().await.unwrap();
     let cache_name = unique_name("functional_query_initiator");

@@ -8,5 +8,6 @@ publish = false
 anyhow = "1"
 bollard = "0.13"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
 toml = "0.8"
+futures-util = "0.3"

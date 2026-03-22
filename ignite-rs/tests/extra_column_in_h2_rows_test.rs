@@ -47,7 +47,8 @@ async fn should_ignore_extra_h2_columns_when_decoding_visible_sql_fields() {
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), 2);
-    assert!(matches!(rows[0][0], SqlValue::ComplexObject(_)));
+    // _key is a single BIGINT primary key, returned as a Long primitive
+    assert!(matches!(rows[0][0], SqlValue::Long(_)));
     assert!(matches!(rows[0][1], SqlValue::ComplexObject(_)));
     assert!(empty_rows.is_empty());
 }

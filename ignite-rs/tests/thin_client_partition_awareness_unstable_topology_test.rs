@@ -6,7 +6,7 @@ use common::{
     connect_with_cluster3_churn_config, destroy_cache_if_exists, ignite_cluster3_churn_env,
     unique_name,
 };
-use ignite_rs::cache::CacheConfiguration;
+use ignite_rs::cache::{CacheConfiguration, WriteSynchronizationMode};
 use ignite_rs::{new_client, ClientConfig};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -36,6 +36,7 @@ async fn should_continue_live_partition_aware_operations_after_node_join() {
 
     let mut cache_cfg = CacheConfiguration::new(&cache_name);
     cache_cfg.num_backup = 1;
+    cache_cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = match client
         .create_cache_with_config::<i32, i32>(&cache_cfg)
         .await
@@ -86,6 +87,7 @@ async fn should_continue_live_partition_aware_operations_after_node_left() {
 
     let mut cache_cfg = CacheConfiguration::new(&cache_name);
     cache_cfg.num_backup = 1;
+    cache_cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = match client
         .create_cache_with_config::<i32, i32>(&cache_cfg)
         .await
@@ -139,6 +141,7 @@ async fn should_keep_live_cache_usable_after_connection_loss() {
 
     let mut cache_cfg = CacheConfiguration::new(&cache_name);
     cache_cfg.num_backup = 1;
+    cache_cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = match client
         .create_cache_with_config::<i32, i32>(&cache_cfg)
         .await
@@ -283,6 +286,7 @@ async fn assert_live_partition_awareness_after_cluster_restart(restarted_cluster
 
     let mut cache_cfg = CacheConfiguration::new(&cache_name);
     cache_cfg.num_backup = 1;
+    cache_cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = match client
         .create_cache_with_config::<i32, i32>(&cache_cfg)
         .await

@@ -46,3 +46,55 @@ async fn should_support_bulk_key_removals_via_slices() {
     assert_eq!(rows, vec![(Some(2), Some(20))]);
     destroy_cache_if_exists(&client, &cache_name).await;
 }
+
+/// Java parity: org.apache.ignite.client.ClientOrderedCollectionWarnTest#testGetAll
+#[tokio::test]
+async fn should_support_bulk_get_all_via_slices() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("bulk_get_all_cache");
+    destroy_cache_if_exists(&client, &cache_name).await;
+
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+    cache.put_all(&[(1, 10), (2, 20), (3, 30)]).await.unwrap();
+
+    let mut rows = cache.get_all(&[1, 2, 3]).await.unwrap();
+    rows.sort_by_key(|(key, _)| key.unwrap_or_default());
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some(1), Some(10)),
+            (Some(2), Some(20)),
+            (Some(3), Some(30)),
+        ]
+    );
+    destroy_cache_if_exists(&client, &cache_name).await;
+}
+
+/// Java parity: org.apache.ignite.client.ClientOrderedCollectionWarnTest#testContainsKeys
+#[tokio::test]
+async fn should_support_bulk_contains_keys_via_slices() {
+    let client = connect().await.unwrap();
+    let cache_name = unique_name("bulk_contains_keys_cache");
+    destroy_cache_if_exists(&client, &cache_name).await;
+
+    let cache = client
+        .get_or_create_cache::<i32, i32>(&cache_name)
+        .await
+        .unwrap();
+    cache.put_all(&[(1, 10), (2, 20)]).await.unwrap();
+
+    assert!(
+        cache.contains_keys(&[1, 2]).await.unwrap(),
+        "all present keys should return true"
+    );
+    assert!(
+        !cache.contains_keys(&[1, 2, 3]).await.unwrap(),
+        "missing key 3 should cause contains_keys to return false"
+    );
+
+    destroy_cache_if_exists(&client, &cache_name).await;
+}

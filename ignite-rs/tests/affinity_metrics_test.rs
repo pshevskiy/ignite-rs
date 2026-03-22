@@ -58,10 +58,18 @@ async fn should_route_partitioned_scan_query_to_partition_owner() {
             ..MockThinServerConfig::default()
         },
     );
+    let discovered_partitions = Arc::new(Mutex::new(VecDeque::from([MockResponse::success(
+        encode_cache_partitions_response(
+            MockTopologyVersion { major: 1, minor: 0 },
+            cache_id,
+            &[(seed_node, &[0]), (discovered_node, &[1])],
+        ),
+    )])));
     let discovered = spawn_mock_thin_server_on_addr(
         &discovered_addr,
         MockThinServerConfig {
             node_id: discovered_node,
+            cache_partitions_responses: Some(discovered_partitions),
             query_scan_responses: Some(Arc::new(Mutex::new(VecDeque::from([
                 MockResponse::success(empty_cursor_open_payload()),
             ])))),

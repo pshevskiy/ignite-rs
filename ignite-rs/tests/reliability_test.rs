@@ -603,6 +603,16 @@ async fn create_or_get_failover_cache(
     );
 }
 
+// Blocked Java methods:
+// - testServerCriticalError: requires server-side `ignite.events().localListen()` API to trigger
+//   a critical error from within the server. Not achievable from thin client.
+// - testServiceMethodInvocationAfterFailover: requires server-side service deployment via the
+//   embedded Ignite API. Blocked on custom Docker image (Phase 3).
+// - testServiceProxyFailover: requires server-side service deployment via the embedded Ignite API.
+//   Blocked on custom Docker image (Phase 3).
+// - testRetryPolicyConvertOpAllOperationsSupported: pure Java internal enum test that iterates
+//   over ClientOperation enum values. No thin-client equivalent in ignite-rs.
+
 async fn churn_cluster_while<F, Fut>(env: Arc<common::IgniteClusterEnv>, body: F)
 where
     F: FnOnce() -> Fut,

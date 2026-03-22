@@ -1767,6 +1767,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bollard",
+ "futures-util",
  "serde",
  "tokio",
  "toml",

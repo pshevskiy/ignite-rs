@@ -1349,7 +1349,28 @@ impl ChannelManager {
             addresses.extend(self.topology.endpoints_for_node(&node_id).await);
         }
 
-        self.available_channels_by_addresses(addresses).await
+        self.dc_channels_by_addresses(addresses).await
+    }
+
+    /// Returns available channels for the given addresses without injecting the
+    /// active channel.  This is used for DC-aware routing where only channels
+    /// belonging to the current data-center should be considered.
+    async fn dc_channels_by_addresses(&self, addresses: Vec<String>) -> Vec<Arc<Channel>> {
+        let channels = self.channels.read().await;
+        let mut available = Vec::new();
+        let mut seen = HashSet::new();
+
+        for address in addresses {
+            let Some(channel) = channels.get(&address) else {
+                continue;
+            };
+            if !channel.is_available() || !seen.insert(address) {
+                continue;
+            }
+            available.push(channel.clone());
+        }
+
+        available
     }
 
     async fn available_channels_by_addresses(&self, addresses: Vec<String>) -> Vec<Arc<Channel>> {
@@ -1582,47 +1603,52 @@ impl ChannelManager {
             return Ok(());
         }
 
-        let _guard = self.discovery_refresh_guard.lock().await;
-        let start_topology_version = self
-            .topology
-            .topology_version()
-            .await
-            .map(|version| version.major)
-            .unwrap_or(-1);
+        {
+            let _guard = self.discovery_refresh_guard.lock().await;
+            let start_topology_version = self
+                .topology
+                .topology_version()
+                .await
+                .map(|version| version.major)
+                .unwrap_or(-1);
 
-        let raw = self
-            .send_internal_and_read_on_channel::<RawPayload>(
-                channel.clone(),
-                OpCode::ClusterGroupGetNodeEndpoints,
-                NodeEndpointsReq {
-                    start_topology_version,
-                    end_topology_version: -1,
-                },
-            )
-            .await?;
-        let response = NodeEndpointsResp::read(&mut Cursor::new(&raw.body)).map_err(|err| {
-            IgniteError::from(
-                format!(
-                    "failed to decode discovered endpoints response ({} bytes, prefix {}): {}",
-                    raw.body.len(),
-                    hex_prefix(&raw.body, 32),
-                    err
+            let raw = self
+                .send_internal_and_read_on_channel::<RawPayload>(
+                    channel.clone(),
+                    OpCode::ClusterGroupGetNodeEndpoints,
+                    NodeEndpointsReq {
+                        start_topology_version,
+                        end_topology_version: -1,
+                    },
                 )
-                .as_str(),
-            )
-        })?;
+                .await?;
+            let response = NodeEndpointsResp::read(&mut Cursor::new(&raw.body)).map_err(|err| {
+                IgniteError::from(
+                    format!(
+                        "failed to decode discovered endpoints response ({} bytes, prefix {}): {}",
+                        raw.body.len(),
+                        hex_prefix(&raw.body, 32),
+                        err
+                    )
+                    .as_str(),
+                )
+            })?;
 
-        let added_nodes = self.normalize_discovered_nodes(response.added_nodes)?;
+            let added_nodes = self.normalize_discovered_nodes(response.added_nodes)?;
 
-        self.topology
-            .apply_discovery_update(
-                TopologyVersion::new(response.topology_version, 0),
-                added_nodes,
-                &response.removed_node_ids,
-            )
-            .await;
-        self.prune_removed_node_channels(&response.removed_node_ids)
-            .await;
+            self.topology
+                .apply_discovery_update(
+                    TopologyVersion::new(response.topology_version, 0),
+                    added_nodes,
+                    &response.removed_node_ids,
+                )
+                .await;
+            self.prune_removed_node_channels(&response.removed_node_ids)
+                .await;
+        }
+        // prime_discovered_channels is called after releasing the guard to avoid
+        // re-entrant deadlock: connecting to a discovered node triggers
+        // on_channel_connected → refresh_topology_from_channel which needs the same guard.
         self.prime_discovered_channels(channel.address()).await;
 
         Ok(())

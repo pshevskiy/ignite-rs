@@ -28,13 +28,18 @@ async fn assert_inactive_cluster_error(partition_awareness_enabled: bool) {
     scope.wait_for_ready().await.unwrap();
 
     // PA cannot work with containerised single-node fixtures: the server
-    // advertises its internal container IP which is unreachable from the host.
+    // advertises its internal container IP which is unreachable from the host,
+    // and cluster state changes may not propagate through the PA routing layer
+    // quickly enough in emulated environments.
     if partition_awareness_enabled {
-        if let Some(env) = scope.single_env() {
-            if env.is_managed() {
-                eprintln!("skipping PA variant: managed container endpoints are unreachable");
-                return;
-            }
+        let is_container = scope
+            .single_env()
+            .map(|env| env.is_managed())
+            .unwrap_or(false)
+            || std::env::var_os("IGNITE_TEST_CONTAINER_NAME").is_some();
+        if is_container {
+            eprintln!("skipping PA variant: container endpoints are unreachable for PA");
+            return;
         }
     }
 

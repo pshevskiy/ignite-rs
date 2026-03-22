@@ -118,3 +118,70 @@ async fn should_propagate_atomic_long_configuration() {
     assert_eq!(atomic.add_and_get(1).await.unwrap(), 6);
     atomic.close().await.unwrap();
 }
+
+/// Java parity: org.apache.ignite.internal.client.thin.AtomicLongTest#testIncrementDecrementAdd
+#[tokio::test]
+async fn should_increment_decrement_and_add() {
+    let client = connect().await.unwrap();
+    let atomic = client
+        .atomic_long(&unique_name("counter_inc_dec_add"), 0, true)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(atomic.increment_and_get().await.unwrap(), 1);
+    assert_eq!(atomic.increment_and_get().await.unwrap(), 2);
+    assert_eq!(atomic.get_and_increment().await.unwrap(), 2);
+    assert_eq!(atomic.get().await.unwrap(), 3);
+
+    assert_eq!(atomic.decrement_and_get().await.unwrap(), 2);
+    assert_eq!(atomic.decrement_and_get().await.unwrap(), 1);
+    assert_eq!(atomic.get_and_decrement().await.unwrap(), 1);
+    assert_eq!(atomic.get().await.unwrap(), 0);
+
+    assert_eq!(atomic.add_and_get(5).await.unwrap(), 5);
+    assert_eq!(atomic.get_and_add(3).await.unwrap(), 5);
+    assert_eq!(atomic.get().await.unwrap(), 8);
+
+    atomic.close().await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.AtomicLongTest#testGetAndSet
+#[tokio::test]
+async fn should_get_and_set() {
+    let client = connect().await.unwrap();
+    let atomic = client
+        .atomic_long(&unique_name("counter_get_and_set"), 10, true)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(atomic.get_and_set(20).await.unwrap(), 10);
+    assert_eq!(atomic.get().await.unwrap(), 20);
+    assert_eq!(atomic.get_and_set(30).await.unwrap(), 20);
+    assert_eq!(atomic.get().await.unwrap(), 30);
+
+    atomic.close().await.unwrap();
+}
+
+/// Java parity: org.apache.ignite.internal.client.thin.AtomicLongTest#testCompareAndSet
+#[tokio::test]
+async fn should_compare_and_set_success_and_failure() {
+    let client = connect().await.unwrap();
+    let atomic = client
+        .atomic_long(&unique_name("counter_cas"), 5, true)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(atomic.compare_and_set(5, 10).await.unwrap());
+    assert_eq!(atomic.get().await.unwrap(), 10);
+
+    assert!(!atomic.compare_and_set(5, 20).await.unwrap());
+    assert_eq!(atomic.get().await.unwrap(), 10);
+
+    assert_eq!(atomic.compare_and_set_and_get(10, 99).await.unwrap(), 99);
+    assert_eq!(atomic.compare_and_set_and_get(0, 100).await.unwrap(), 99);
+
+    atomic.close().await.unwrap();
+}

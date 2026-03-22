@@ -226,6 +226,10 @@ mod tests {
         register_type, type_by_id, type_name, RegisteredBinaryField, RegisteredBinarySchema,
         RegisteredBinaryType,
     };
+    use std::sync::Mutex;
+
+    /// Guard to serialize tests that share the global binary registry.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_registry() {
         super::registry()
@@ -237,6 +241,7 @@ mod tests {
 
     #[test]
     fn should_return_cached_type_name_after_registration() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_registry();
 
         register_type(RegisteredBinaryType {
@@ -254,6 +259,7 @@ mod tests {
 
     #[test]
     fn should_merge_registered_metadata_without_losing_cached_type_name() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_registry();
 
         register_type(RegisteredBinaryType {

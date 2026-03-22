@@ -53,7 +53,7 @@ async fn should_bootstrap_rainbow_sql_fixture_idempotently() {
 }
 
 #[tokio::test]
-#[ignore = "diagnostic probe: the managed apacheignite/ignite:2.15.0 fixture does not advertise QRY_INITIATOR_ID; run manually when validating an external source-matched Ignite build"]
+#[ignore = "stock apacheignite/ignite Docker images do not advertise QRY_INITIATOR_ID; requires a custom Ignite build"]
 async fn should_advertise_query_initiator_features_in_live_handshake() {
     let env = ignite_test_env();
     env.wait_for_ready().await.unwrap();

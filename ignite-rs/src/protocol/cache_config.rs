@@ -13,7 +13,7 @@ use crate::error::IgniteResult;
 use crate::protocol::cache_config::ConfigPropertyCode::*;
 use crate::protocol::{
     read_bool, read_i32, read_i64, read_object, read_u8, write_bool, write_i16, write_i32,
-    write_i64, write_string_type_code, write_u8,
+    write_i64, write_null, write_string_type_code, write_u8,
 };
 use crate::ReadableType;
 use std::io;
@@ -291,14 +291,23 @@ fn read_query_entities(reader: &mut impl Read) -> IgniteResult<Vec<QueryEntity>>
     Ok(result)
 }
 
+/// Write a string as type-coded string, or NULL if empty.
+fn write_optional_string(writer: &mut dyn Write, value: &str) -> io::Result<()> {
+    if value.is_empty() {
+        write_null(writer)
+    } else {
+        write_string_type_code(writer, value)
+    }
+}
+
 fn write_query_entities(writer: &mut dyn Write, entities: &[QueryEntity]) -> io::Result<()> {
     write_i32(writer, entities.len() as i32)?;
     for entity in entities.iter() {
         write_string_type_code(writer, entity.key_type.as_str())?;
         write_string_type_code(writer, entity.value_type.as_str())?;
-        write_string_type_code(writer, entity.table.as_str())?;
-        write_string_type_code(writer, entity.key_field.as_str())?;
-        write_string_type_code(writer, entity.value_field.as_str())?;
+        write_optional_string(writer, entity.table.as_str())?;
+        write_optional_string(writer, entity.key_field.as_str())?;
+        write_optional_string(writer, entity.value_field.as_str())?;
         write_query_fields(writer, &entity.query_fields)?;
         write_field_aliases(writer, &entity.field_aliases)?;
         write_query_indexes(writer, &entity.query_indexes)?;
@@ -337,6 +346,9 @@ fn write_query_fields(writer: &mut dyn Write, fields: &[QueryField]) -> io::Resu
         write_string_type_code(writer, field.type_name.as_str())?;
         write_bool(writer, field.key_field)?;
         write_bool(writer, field.not_null_constraint)?;
+        write_null(writer)?; // default value
+        write_i32(writer, field.precision)?;
+        write_i32(writer, field.scale)?;
     }
     Ok(())
 }

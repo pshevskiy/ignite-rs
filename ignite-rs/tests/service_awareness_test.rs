@@ -3,11 +3,11 @@
 mod common;
 
 use common::{
-    encode_typed_payload, spawn_mock_thin_server, spawn_mock_thin_server_on_addr,
-    unused_local_addr, MockDiscoveryNode, MockDiscoveryResponse, MockResponse,
-    MockThinServerConfig, MockUuid,
+    encode_node_info_payload, encode_typed_payload, spawn_mock_thin_server,
+    spawn_mock_thin_server_on_addr, unused_local_addr, MockDiscoveryNode, MockDiscoveryResponse,
+    MockNodeInfo, MockResponse, MockThinServerConfig, MockUuid,
 };
-use ignite_rs::{new_client, ClientConfig, WritableType};
+use ignite_rs::{new_client, ClientConfig};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -54,10 +54,9 @@ async fn should_route_service_invocation_to_service_topology_node() {
                 ),
                 (
                     OP_CLUSTER_GROUP_GET_NODE_INFO,
-                    vec![MockResponse::success(encode_node_info_response(&[
-                        seed_node,
-                        target_node,
-                    ]))],
+                    vec![MockResponse::success(encode_node_info_payload(
+                        &simple_node_infos(&[seed_node, target_node]),
+                    ))],
                 ),
                 (
                     OP_SERVICE_GET_TOPOLOGY,
@@ -74,12 +73,33 @@ async fn should_route_service_invocation_to_service_topology_node() {
         &target_addr,
         MockThinServerConfig {
             node_id: target_node,
-            opcode_responses: Some(opcode_responses(vec![(
-                OP_SERVICE_INVOKE,
-                vec![MockResponse::success(encode_typed_payload(
-                    &"from-target".to_string(),
-                ))],
-            )])),
+            opcode_responses: Some(opcode_responses(vec![
+                (
+                    OP_CLUSTER_GROUP_GET_NODE_IDS,
+                    vec![MockResponse::success(encode_node_ids_response(&[
+                        seed_node,
+                        target_node,
+                    ]))],
+                ),
+                (
+                    OP_CLUSTER_GROUP_GET_NODE_INFO,
+                    vec![MockResponse::success(encode_node_info_payload(
+                        &simple_node_infos(&[seed_node, target_node]),
+                    ))],
+                ),
+                (
+                    OP_SERVICE_GET_TOPOLOGY,
+                    vec![MockResponse::success(encode_service_topology(&[
+                        target_node,
+                    ]))],
+                ),
+                (
+                    OP_SERVICE_INVOKE,
+                    vec![MockResponse::success(encode_typed_payload(
+                        &"from-target".to_string(),
+                    ))],
+                ),
+            ])),
             ..Default::default()
         },
     );
@@ -113,9 +133,9 @@ async fn should_fall_back_to_default_channel_when_service_topology_is_empty() {
             ),
             (
                 OP_CLUSTER_GROUP_GET_NODE_INFO,
-                vec![MockResponse::success(encode_node_info_response(&[
-                    seed_node,
-                ]))],
+                vec![MockResponse::success(encode_node_info_payload(
+                    &simple_node_infos(&[seed_node]),
+                ))],
             ),
             (
                 OP_SERVICE_GET_TOPOLOGY,
@@ -155,30 +175,14 @@ fn encode_node_ids_response(nodes: &[MockUuid]) -> Vec<u8> {
     payload
 }
 
-fn encode_node_info_response(nodes: &[MockUuid]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(nodes.len() as i32).to_le_bytes());
-    for node in nodes {
-        payload.extend_from_slice(&node.most.to_le_bytes());
-        payload.extend_from_slice(&node.least.to_le_bytes());
-        payload.extend_from_slice(&0i32.to_le_bytes());
-        payload.extend_from_slice(&1i32.to_le_bytes());
-        write_raw_string(&mut payload, "127.0.0.1");
-        payload.extend_from_slice(&1i32.to_le_bytes());
-        write_raw_string(&mut payload, "host-a");
-        payload.extend_from_slice(&1i64.to_le_bytes());
-        payload.push(0);
-        payload.push(0);
-        payload.push(0);
-        encode_typed_string(&mut payload, &node.as_string());
-        payload.push(2);
-        payload.push(15);
-        payload.push(0);
-        write_raw_string(&mut payload, "release");
-        payload.extend_from_slice(&123i64.to_le_bytes());
-        payload.extend_from_slice(&0i32.to_le_bytes());
-    }
-    payload
+fn simple_node_infos(nodes: &[MockUuid]) -> Vec<MockNodeInfo> {
+    nodes
+        .iter()
+        .map(|uuid| MockNodeInfo {
+            consistent_id: uuid.as_string(),
+            ..MockNodeInfo::simple(*uuid)
+        })
+        .collect()
 }
 
 fn encode_service_topology(nodes: &[MockUuid]) -> Vec<u8> {
@@ -189,15 +193,6 @@ fn encode_service_topology(nodes: &[MockUuid]) -> Vec<u8> {
         payload.extend_from_slice(&node.least.to_le_bytes());
     }
     payload
-}
-
-fn encode_typed_string(payload: &mut Vec<u8>, value: &str) {
-    value.to_string().write(payload).unwrap();
-}
-
-fn write_raw_string(payload: &mut Vec<u8>, value: &str) {
-    payload.extend_from_slice(&(value.len() as i32).to_le_bytes());
-    payload.extend_from_slice(value.as_bytes());
 }
 
 fn opcode_responses(

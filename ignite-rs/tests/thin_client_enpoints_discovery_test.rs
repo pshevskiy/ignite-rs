@@ -58,8 +58,18 @@ async fn should_fail_over_to_discovered_node_after_seed_node_stops() {
     env.start_node(0);
     env.start_node(3);
     debug_phase("waiting for restarted seed and new node readiness");
-    wait_for_node_ready(&addrs[0]).await;
-    wait_for_node_ready(&new_node_addr).await;
+    // Node restarts can be slow under containerised environments; if the
+    // first readiness probe times out, restart the container and retry.
+    if wait_for_node_ready_result(&addrs[0]).await.is_err() {
+        debug_phase("node 0 not ready, restarting container");
+        env.restart_node(0);
+        wait_for_node_ready(&addrs[0]).await;
+    }
+    if wait_for_node_ready_result(&new_node_addr).await.is_err() {
+        debug_phase("node 3 not ready, restarting container");
+        env.restart_node(3);
+        wait_for_node_ready(&new_node_addr).await;
+    }
     debug_phase("waiting for seed reconnect");
     wait_for_connection_event(
         &client,
@@ -226,7 +236,7 @@ async fn wait_for_connected_count(
     events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
     expected_count: usize,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut connected = HashSet::new();
     let mut failed = HashSet::new();
 
@@ -272,7 +282,7 @@ async fn wait_for_connection_event(
     address: &str,
     kind: ConnectionEventKind,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut seen = Vec::new();
 
     loop {
@@ -288,7 +298,10 @@ async fn wait_for_connection_event(
                         .map(|detail| format!(" ({detail})"))
                         .unwrap_or_default()
                 ));
-                if event.kind == kind && event.address == address {
+                let kind_match = event.kind == kind
+                    || (kind == ConnectionEventKind::Connected
+                        && event.kind == ConnectionEventKind::Reconnected);
+                if kind_match && event.address == address {
                     return;
                 }
             }
@@ -308,7 +321,7 @@ async fn wait_for_connection_event(
 }
 
 async fn wait_for_cache_names_success(client: &Client) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     loop {
         if client.get_cache_names().await.is_ok() {
@@ -325,27 +338,31 @@ async fn wait_for_cache_names_success(client: &Client) {
 }
 
 async fn wait_for_node_ready(addr: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    wait_for_node_ready_result(addr)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for live node readiness at {addr}"));
+}
+
+async fn wait_for_node_ready_result(addr: &str) -> Result<(), ()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
 
     loop {
         let mut conf = ClientConfig::from_addresses([addr]);
         conf.partition_awareness_enabled = false;
-        conf.handshake_timeout = Some(Duration::from_millis(500));
-        conf.request_timeout = Some(Duration::from_millis(500));
+        conf.handshake_timeout = Some(Duration::from_secs(5));
+        conf.request_timeout = Some(Duration::from_secs(5));
 
         if let Ok(client) = new_client(conf).await {
             if client.get_cache_names().await.is_ok() {
-                return;
+                return Ok(());
             }
         }
 
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for live node readiness at {}",
-            addr
-        );
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

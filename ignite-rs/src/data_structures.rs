@@ -204,7 +204,15 @@ impl AtomicLong {
                 self.route().await?,
             )
             .await?;
-        Ok(response.value)
+        // The server returns the witness (pre-CAS) value. Convert to the
+        // resulting value: on success (witness == expected) the new value was
+        // written; on failure the atomic is unchanged so witness IS the result.
+        let witness = response.value;
+        if witness == expected {
+            Ok(value)
+        } else {
+            Ok(witness)
+        }
     }
 
     pub async fn removed(&self) -> IgniteResult<bool> {

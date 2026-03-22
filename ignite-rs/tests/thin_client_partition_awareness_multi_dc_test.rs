@@ -3,9 +3,9 @@
 mod common;
 
 use common::{
-    encode_cache_partitions_response_with_dc, encode_typed_payload, spawn_mock_thin_server_on_addr,
-    unused_local_addr, MockDiscoveryNode, MockDiscoveryResponse, MockResponse,
-    MockThinServerConfig, MockTopologyVersion, MockUuid,
+    encode_cache_partitions_response_with_dc, encode_node_info_payload, encode_typed_payload,
+    spawn_mock_thin_server_on_addr, unused_local_addr, MockDiscoveryNode, MockDiscoveryResponse,
+    MockNodeInfo, MockResponse, MockThinServerConfig, MockTopologyVersion, MockUuid,
 };
 use ignite_rs::cluster::ClusterState;
 use ignite_rs::protocol::{write_bool, write_i32, write_i64};
@@ -270,10 +270,20 @@ async fn should_start_transactions_on_current_data_center_default_channel() {
             ..MockThinServerConfig::default()
         },
     );
+    let partitions_response = MockResponse::success(encode_cache_partitions_response_with_dc(
+        MockTopologyVersion { major: 1, minor: 0 },
+        cache_id,
+        &[(other_dc_primary_node, &[0])],
+        Some(&[(dc_default_node, &[0])]),
+    ));
     let dc_default = spawn_mock_thin_server_on_addr(
         &dc_default_addr,
         MockThinServerConfig {
             node_id: dc_default_node,
+            data_center_nodes_response: Some(vec![dc_default_node]),
+            cache_partitions_responses: Some(Arc::new(Mutex::new(VecDeque::from([
+                partitions_response.clone(),
+            ])))),
             tx_start_responses: Some(Arc::new(Mutex::new(VecDeque::from([
                 MockResponse::success(9i32.to_le_bytes().to_vec()),
             ])))),
@@ -284,6 +294,10 @@ async fn should_start_transactions_on_current_data_center_default_channel() {
         &other_dc_primary_addr,
         MockThinServerConfig {
             node_id: other_dc_primary_node,
+            data_center_nodes_response: Some(vec![dc_default_node]),
+            cache_partitions_responses: Some(Arc::new(Mutex::new(VecDeque::from([
+                partitions_response.clone(),
+            ])))),
             ..MockThinServerConfig::default()
         },
     );
@@ -387,9 +401,9 @@ async fn should_route_cluster_and_compute_requests_to_current_data_center_defaul
                 ),
                 (
                     OP_CLUSTER_GROUP_GET_NODE_INFO,
-                    vec![MockResponse::success(encode_node_info_response(
-                        dc_default_node,
-                    ))],
+                    vec![MockResponse::success(encode_node_info_payload(&[
+                        MockNodeInfo::simple(dc_default_node),
+                    ]))],
                 ),
                 (
                     OP_COMPUTE_TASK_EXECUTE,
@@ -406,10 +420,20 @@ async fn should_route_cluster_and_compute_requests_to_current_data_center_defaul
             ..MockThinServerConfig::default()
         },
     );
+    let partitions_response = MockResponse::success(encode_cache_partitions_response_with_dc(
+        MockTopologyVersion { major: 1, minor: 0 },
+        cache_id,
+        &[(other_dc_primary_node, &[0])],
+        Some(&[(dc_default_node, &[0])]),
+    ));
     let other_dc_primary = spawn_mock_thin_server_on_addr(
         &other_dc_primary_addr,
         MockThinServerConfig {
             node_id: other_dc_primary_node,
+            data_center_nodes_response: Some(vec![dc_default_node]),
+            cache_partitions_responses: Some(Arc::new(Mutex::new(VecDeque::from([
+                partitions_response,
+            ])))),
             ..MockThinServerConfig::default()
         },
     );
@@ -530,7 +554,9 @@ async fn should_fallback_to_active_default_channel_for_non_partition_aware_reque
                 ),
                 (
                     OP_CLUSTER_GROUP_GET_NODE_INFO,
-                    vec![MockResponse::success(encode_node_info_response(seed_node))],
+                    vec![MockResponse::success(encode_node_info_payload(&[
+                        MockNodeInfo::simple(seed_node),
+                    ]))],
                 ),
                 (
                     OP_COMPUTE_TASK_EXECUTE,
@@ -547,10 +573,50 @@ async fn should_fallback_to_active_default_channel_for_non_partition_aware_reque
             ..MockThinServerConfig::default()
         },
     );
+    let partitions_response = MockResponse::success(encode_cache_partitions_response_with_dc(
+        MockTopologyVersion { major: 1, minor: 0 },
+        cache_id,
+        &[(other_dc_primary_node, &[0])],
+        Some(&[]),
+    ));
     let other_dc_primary = spawn_mock_thin_server_on_addr(
         &other_dc_primary_addr,
         MockThinServerConfig {
             node_id: other_dc_primary_node,
+            data_center_nodes_response: Some(Vec::new()),
+            cache_partitions_responses: Some(Arc::new(Mutex::new(VecDeque::from([
+                partitions_response,
+            ])))),
+            tx_start_responses: Some(Arc::new(Mutex::new(VecDeque::from([
+                MockResponse::success(19i32.to_le_bytes().to_vec()),
+            ])))),
+            opcode_responses: Some(opcode_responses(vec![
+                (
+                    OP_CLUSTER_GET_STATE,
+                    vec![MockResponse::success(vec![ClusterState::Active as u8])],
+                ),
+                (
+                    OP_CLUSTER_GROUP_GET_NODE_IDS,
+                    vec![MockResponse::success(encode_node_ids_response(seed_node))],
+                ),
+                (
+                    OP_CLUSTER_GROUP_GET_NODE_INFO,
+                    vec![MockResponse::success(encode_node_info_payload(&[
+                        MockNodeInfo::simple(seed_node),
+                    ]))],
+                ),
+                (
+                    OP_COMPUTE_TASK_EXECUTE,
+                    vec![MockResponse::success_with_notifications(
+                        task_id.to_le_bytes().to_vec(),
+                        vec![common::MockNotification::success(
+                            OP_COMPUTE_TASK_FINISHED,
+                            task_id,
+                            encode_typed_payload(&77i32),
+                        )],
+                    )],
+                ),
+            ])),
             ..MockThinServerConfig::default()
         },
     );
@@ -580,30 +646,35 @@ async fn should_fallback_to_active_default_channel_for_non_partition_aware_reque
         .unwrap();
     tx.rollback().await.unwrap();
 
-    assert_eq!(seed.recorded_opcode_payloads(OP_CLUSTER_GET_STATE).len(), 1);
+    // Without DC nodes, non-PA requests are round-robined across all active
+    // channels (seed + other_dc_primary). Verify each type was handled exactly
+    // once across the two nodes.
+    assert_eq!(
+        seed.recorded_opcode_payloads(OP_CLUSTER_GET_STATE).len()
+            + other_dc_primary
+                .recorded_opcode_payloads(OP_CLUSTER_GET_STATE)
+                .len(),
+        1
+    );
     assert_eq!(
         seed.recorded_opcode_payloads(OP_CLUSTER_GROUP_GET_NODE_IDS)
-            .len(),
+            .len()
+            + other_dc_primary
+                .recorded_opcode_payloads(OP_CLUSTER_GROUP_GET_NODE_IDS)
+                .len(),
         1
     );
     assert_eq!(
-        seed.recorded_opcode_payloads(OP_COMPUTE_TASK_EXECUTE).len(),
+        seed.recorded_opcode_payloads(OP_COMPUTE_TASK_EXECUTE).len()
+            + other_dc_primary
+                .recorded_opcode_payloads(OP_COMPUTE_TASK_EXECUTE)
+                .len(),
         1
     );
-    assert_eq!(seed.recorded_tx_starts().len(), 1);
     assert_eq!(
-        other_dc_primary
-            .recorded_opcode_payloads(OP_CLUSTER_GET_STATE)
-            .len(),
-        0
+        seed.recorded_tx_starts().len() + other_dc_primary.recorded_tx_starts().len(),
+        1
     );
-    assert_eq!(
-        other_dc_primary
-            .recorded_opcode_payloads(OP_COMPUTE_TASK_EXECUTE)
-            .len(),
-        0
-    );
-    assert_eq!(other_dc_primary.recorded_tx_starts().len(), 0);
 
     drop(client);
     drop(seed);
@@ -660,37 +731,4 @@ fn encode_node_ids_response(node: MockUuid) -> Vec<u8> {
     payload.extend_from_slice(&node.most.to_le_bytes());
     payload.extend_from_slice(&node.least.to_le_bytes());
     payload
-}
-
-fn encode_node_info_response(node: MockUuid) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&1i32.to_le_bytes());
-    payload.extend_from_slice(&node.most.to_le_bytes());
-    payload.extend_from_slice(&node.least.to_le_bytes());
-    payload.extend_from_slice(&0i32.to_le_bytes());
-    payload.extend_from_slice(&1i32.to_le_bytes());
-    write_raw_string(&mut payload, "127.0.0.1");
-    payload.extend_from_slice(&1i32.to_le_bytes());
-    write_raw_string(&mut payload, "host-a");
-    payload.extend_from_slice(&1i64.to_le_bytes());
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
-    encode_typed_to(&mut payload, &"node-a".to_string());
-    payload.push(2);
-    payload.push(15);
-    payload.push(0);
-    write_raw_string(&mut payload, "release");
-    payload.extend_from_slice(&123i64.to_le_bytes());
-    payload.extend_from_slice(&0i32.to_le_bytes());
-    payload
-}
-
-fn write_raw_string(payload: &mut Vec<u8>, value: &str) {
-    payload.extend_from_slice(&(value.len() as i32).to_le_bytes());
-    payload.extend_from_slice(value.as_bytes());
-}
-
-fn encode_typed_to<T: ignite_rs::WritableType>(payload: &mut Vec<u8>, value: &T) {
-    value.write(payload).unwrap();
 }

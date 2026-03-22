@@ -296,6 +296,10 @@ impl ClusterGroup {
     }
 
     pub async fn node_ids(&self) -> IgniteResult<Vec<String>> {
+        if self.selectors.is_empty() {
+            // Fast path: no selectors, so we only need UUIDs from the topology.
+            return self.core.request_node_ids().await;
+        }
         Ok(self
             .nodes()
             .await?
@@ -659,6 +663,13 @@ impl ReadableReq for ClusterState {
 }
 
 fn read_cluster_node(reader: &mut impl Read) -> IgniteResult<ClusterNode> {
+    // The server writes the UUID via writeUuid() which prefixes a type code byte.
+    let uuid_type = read_u8(reader).map_err(IgniteError::from)?;
+    if uuid_type != crate::protocol::TypeCode::Uuid as u8 {
+        return Err(IgniteError::from(
+            "expected UUID type code for cluster node id",
+        ));
+    }
     let id = crate::connection_async::read_uuid_string(reader)?;
     let attr_count = read_i32(reader).map_err(IgniteError::from)?;
     if attr_count < 0 {
@@ -667,41 +678,112 @@ fn read_cluster_node(reader: &mut impl Read) -> IgniteResult<ClusterNode> {
 
     let mut attributes = HashMap::with_capacity(attr_count as usize);
     for _ in 0..attr_count {
-        let name = read_string(reader).map_err(IgniteError::from)?;
+        // The server writes attribute names via writeString() which includes
+        // a type code prefix (TypeCode::String = 9).
+        let name = read_typed_string(reader)?;
         let value = read_sql_value(reader)?;
         attributes.insert(name, value);
     }
 
+    let addresses = read_typed_string_collection(reader)?;
+    let host_names = read_typed_string_collection(reader)?;
+    let order = read_i64(reader).map_err(IgniteError::from)?;
+    let is_local = read_bool(reader).map_err(IgniteError::from)?;
+    let is_daemon = read_bool(reader).map_err(IgniteError::from)?;
+    let is_client = read_bool(reader).map_err(IgniteError::from)?;
+    let consistent_id = read_sql_value(reader)?;
     Ok(ClusterNode {
         id,
         attributes,
-        addresses: read_string_collection(reader)?,
-        host_names: read_string_collection(reader)?,
-        order: read_i64(reader).map_err(IgniteError::from)?,
-        is_local: read_bool(reader).map_err(IgniteError::from)?,
-        is_daemon: read_bool(reader).map_err(IgniteError::from)?,
-        is_client: read_bool(reader).map_err(IgniteError::from)?,
-        consistent_id: read_sql_value(reader)?,
-        version: ClusterNodeVersion {
-            major: read_u8(reader).map_err(IgniteError::from)?,
-            minor: read_u8(reader).map_err(IgniteError::from)?,
-            maintenance: read_u8(reader).map_err(IgniteError::from)?,
-            stage: read_string(reader).map_err(IgniteError::from)?,
-            revision_timestamp: read_i64(reader).map_err(IgniteError::from)?,
-            revision_hash: read_byte_array(reader)?,
-        },
+        addresses,
+        host_names,
+        order,
+        is_local,
+        is_daemon,
+        is_client,
+        consistent_id,
+        version: read_node_version(reader)?,
     })
 }
 
-fn read_string_collection(reader: &mut impl Read) -> IgniteResult<Vec<String>> {
+/// Reads a node version written by `PlatformUtils.writeNodeVersion()`.
+/// The Java server writes version fields using typed binary protocol methods.
+fn read_node_version(reader: &mut impl Read) -> IgniteResult<ClusterNodeVersion> {
+    let major = read_u8(reader).map_err(IgniteError::from)?;
+    let minor = read_u8(reader).map_err(IgniteError::from)?;
+    let maintenance = read_u8(reader).map_err(IgniteError::from)?;
+    let stage = read_typed_string(reader)?;
+    let revision_timestamp = read_i64(reader).map_err(IgniteError::from)?;
+    // revision_hash: Java writeByteArray includes a type code prefix.
+    let revision_hash = {
+        let type_code = read_u8(reader).map_err(IgniteError::from)?;
+        if type_code == crate::protocol::TypeCode::Null as u8 {
+            Vec::new()
+        } else {
+            let count = read_i32(reader).map_err(IgniteError::from)?;
+            if count < 0 {
+                Vec::new()
+            } else {
+                let mut buf = vec![0u8; count as usize];
+                reader.read_exact(&mut buf).map_err(IgniteError::from)?;
+                buf
+            }
+        }
+    };
+    Ok(ClusterNodeVersion {
+        major,
+        minor,
+        maintenance,
+        stage,
+        revision_timestamp,
+        revision_hash,
+    })
+}
+
+/// Reads a typed string (type code prefix + length-prefixed string).
+fn read_typed_string(reader: &mut impl Read) -> IgniteResult<String> {
+    let type_code =
+        crate::protocol::TypeCode::try_from(read_u8(reader).map_err(IgniteError::from)?)
+            .map_err(IgniteError::from)?;
+    match type_code {
+        crate::protocol::TypeCode::String => read_string(reader).map_err(IgniteError::from),
+        crate::protocol::TypeCode::Null => Ok(String::new()),
+        _ => Err(IgniteError::from(
+            format!(
+                "expected String type code in cluster node attribute, got {:?}",
+                type_code
+            )
+            .as_str(),
+        )),
+    }
+}
+
+/// Reads a typed string collection written by Java's `writeCollection()`.
+/// Wire format: type_code(1) + count(4) + collection_type(1) + elements.
+fn read_typed_string_collection(reader: &mut impl Read) -> IgniteResult<Vec<String>> {
+    let type_code =
+        crate::protocol::TypeCode::try_from(read_u8(reader).map_err(IgniteError::from)?)
+            .map_err(IgniteError::from)?;
+    match type_code {
+        crate::protocol::TypeCode::Null => return Ok(Vec::new()),
+        crate::protocol::TypeCode::Collection => {}
+        _ => {
+            return Err(IgniteError::from(
+                format!("expected Collection type code, got {:?}", type_code).as_str(),
+            ))
+        }
+    }
+
     let count = read_i32(reader).map_err(IgniteError::from)?;
     if count < 0 {
         return Err(IgniteError::from("negative string collection count"));
     }
+    // Skip collection type indicator byte.
+    let _col_type = read_u8(reader).map_err(IgniteError::from)?;
 
     let mut values = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        values.push(read_string(reader).map_err(IgniteError::from)?);
+        values.push(read_typed_string(reader)?);
     }
     Ok(values)
 }

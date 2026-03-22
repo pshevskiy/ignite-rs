@@ -60,6 +60,8 @@ pub enum TypeCode {
     BinaryEnum = 38,
     Null = 101,
     ComplexObj = 103,
+    /// Java optimized marshaller object (JDK-serialized, opaque to the thin client).
+    OptimizedMarshaller = 254,
 }
 
 impl TryFrom<u8> for TypeCode {
@@ -104,6 +106,7 @@ impl TryFrom<u8> for TypeCode {
             27 => Ok(TypeCode::WrappedData),
             103 => Ok(TypeCode::ComplexObj),
             101 => Ok(TypeCode::Null),
+            254 => Ok(TypeCode::OptimizedMarshaller),
             _ => Err(IgniteError::from(
                 format!("Cannot read TypeCode {}", value).as_str(),
             )),

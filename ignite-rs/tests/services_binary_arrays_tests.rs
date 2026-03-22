@@ -2,7 +2,10 @@
 
 mod common;
 
-use common::{spawn_mock_thin_server, MockResponse, MockThinServerConfig, MockUuid};
+use common::{
+    encode_node_info_payload, spawn_mock_thin_server, MockNodeInfo, MockResponse,
+    MockThinServerConfig, MockUuid,
+};
 use ignite_rs::protocol::complex_obj::IgniteValue;
 use ignite_rs::{new_client, ClientConfig, WritableType};
 use std::collections::{HashMap, VecDeque};
@@ -26,7 +29,9 @@ async fn should_invoke_service_with_binary_array_arguments_and_results() {
             ),
             (
                 OP_CLUSTER_GROUP_GET_NODE_INFO,
-                vec![MockResponse::success(encode_node_info_response(node))],
+                vec![MockResponse::success(encode_node_info_payload(&[
+                    MockNodeInfo::simple(node),
+                ]))],
             ),
             (
                 OP_SERVICE_GET_TOPOLOGY,
@@ -71,32 +76,6 @@ fn encode_node_ids_response(node: MockUuid) -> Vec<u8> {
     payload
 }
 
-fn encode_node_info_response(node: MockUuid) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&1i32.to_le_bytes());
-    payload.extend_from_slice(&node.most.to_le_bytes());
-    payload.extend_from_slice(&node.least.to_le_bytes());
-    payload.extend_from_slice(&0i32.to_le_bytes());
-    payload.extend_from_slice(&1i32.to_le_bytes());
-    write_raw_string(&mut payload, "127.0.0.1");
-    payload.extend_from_slice(&1i32.to_le_bytes());
-    write_raw_string(&mut payload, "host-a");
-    payload.extend_from_slice(&1i64.to_le_bytes());
-    payload.push(0);
-    payload.push(0);
-    payload.push(0);
-    payload.push(9);
-    payload.extend_from_slice(&6i32.to_le_bytes());
-    payload.extend_from_slice(b"node-a");
-    payload.push(2);
-    payload.push(15);
-    payload.push(0);
-    write_raw_string(&mut payload, "release");
-    payload.extend_from_slice(&123i64.to_le_bytes());
-    payload.extend_from_slice(&0i32.to_le_bytes());
-    payload
-}
-
 fn encode_service_topology(nodes: &[MockUuid]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(nodes.len() as i32).to_le_bytes());
@@ -116,11 +95,6 @@ fn opcode_responses(
             .map(|(op, responses)| (op, VecDeque::from(responses)))
             .collect(),
     ))
-}
-
-fn write_raw_string(payload: &mut Vec<u8>, value: &str) {
-    payload.extend_from_slice(&(value.len() as i32).to_le_bytes());
-    payload.extend_from_slice(value.as_bytes());
 }
 
 fn encode_typed<T: WritableType>(value: &T) -> Vec<u8> {

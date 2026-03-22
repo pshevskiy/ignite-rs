@@ -10,8 +10,14 @@ use std::sync::Arc;
 
 #[test]
 fn should_reuse_process_scoped_context_within_test_process() {
-    let ctx1 = ignite_context(IgniteProfile::SingleNodeChurn, FixtureScope::Process);
-    let ctx2 = ignite_context(IgniteProfile::SingleNodeChurn, FixtureScope::Process);
+    let ctx1 = ignite_context(
+        IgniteProfile::CustomClientPort(39081),
+        FixtureScope::Process,
+    );
+    let ctx2 = ignite_context(
+        IgniteProfile::CustomClientPort(39081),
+        FixtureScope::Process,
+    );
 
     assert!(
         Arc::ptr_eq(&ctx1, &ctx2),
@@ -22,8 +28,14 @@ fn should_reuse_process_scoped_context_within_test_process() {
 
 #[test]
 fn should_reuse_cargo_session_context_within_test_process() {
-    let ctx1 = ignite_context(IgniteProfile::DefaultSingleNode, FixtureScope::CargoSession);
-    let ctx2 = ignite_context(IgniteProfile::DefaultSingleNode, FixtureScope::CargoSession);
+    let ctx1 = ignite_context(
+        IgniteProfile::CustomClientPort(39082),
+        FixtureScope::CargoSession,
+    );
+    let ctx2 = ignite_context(
+        IgniteProfile::CustomClientPort(39082),
+        FixtureScope::CargoSession,
+    );
 
     assert!(
         Arc::ptr_eq(&ctx1, &ctx2),

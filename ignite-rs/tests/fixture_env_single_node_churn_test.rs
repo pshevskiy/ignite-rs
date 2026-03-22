@@ -6,7 +6,6 @@ use common::{connect, ignite_single_node_churn_env};
 use std::time::Duration;
 
 #[tokio::test]
-#[ignore = "managed single-node churn container lifecycle is still being stabilized; parity now uses a delayed listener over the live single-node fixture instead"]
 async fn should_stop_and_restart_single_node_churn_fixture() {
     let env = ignite_single_node_churn_env();
     env.wait_for_ready().await.unwrap();

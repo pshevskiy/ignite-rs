@@ -9,6 +9,7 @@ use common::{
 use ignite_rs::binary::BinaryObject;
 use ignite_rs::cache::{
     AtomicityMode, Cache, CacheConfiguration, CacheKeyConfiguration, CacheMode,
+    WriteSynchronizationMode,
 };
 use ignite_rs::data_structures::{AtomicConfiguration, CollectionConfiguration};
 use ignite_rs::query::ScanQuery;
@@ -23,6 +24,7 @@ async fn should_use_live_replicated_cache_on_stable_cluster() {
 
     let mut cfg = CacheConfiguration::new(&cache_name);
     cfg.cache_mode = CacheMode::Replicated;
+    cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = create_cache_with_config_or_get(&client, &cfg).await;
 
     exercise_not_applicable_cache(&cache).await;
@@ -69,6 +71,7 @@ async fn should_use_live_partitioned_cache_with_one_backup() {
 
     let mut cfg = CacheConfiguration::new(&cache_name);
     cfg.num_backup = 1;
+    cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = create_cache_with_config_or_get(&client, &cfg).await;
     exercise_applicable_cache(&cache).await;
 
@@ -84,6 +87,7 @@ async fn should_use_live_partitioned_cache_with_three_backups() {
 
     let mut cfg = CacheConfiguration::new(&cache_name);
     cfg.num_backup = 3;
+    cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     let cache = create_cache_with_config_or_get(&client, &cfg).await;
     exercise_applicable_cache(&cache).await;
 
@@ -372,6 +376,7 @@ async fn should_use_live_partitioned_cache_with_affinity_key_configuration() {
     let mut cfg = CacheConfiguration::new(&cache_name);
     cfg.cache_mode = CacheMode::Partitioned;
     cfg.num_backup = 1;
+    cfg.write_synchronization_mode = WriteSynchronizationMode::FullSync;
     cfg.cache_key_configurations = Some(vec![CacheKeyConfiguration::new(
         "AffinityEmployee",
         "orgId",

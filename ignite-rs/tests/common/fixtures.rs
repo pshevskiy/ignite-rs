@@ -33,15 +33,15 @@ use tokio::runtime::{Builder as TokioRuntimeBuilder, Handle as TokioHandle};
 // ---------------------------------------------------------------------------
 
 const DEFAULT_IGNITE_IMAGE: &str = "apacheignite/ignite";
-const DEFAULT_IGNITE_TAG: &str = "2.15.0";
+const DEFAULT_IGNITE_TAG: &str = "2.17.0-arm64";
 const DOCKER_API_TIMEOUT: Duration = Duration::from_secs(30);
-const SINGLE_NODE_READY_TIMEOUT: Duration = Duration::from_secs(120);
-const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(240);
+const SINGLE_NODE_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(480);
 const CHURN_RESET_READY_TIMEOUT: Duration = Duration::from_secs(20);
-const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(300);
-const LOG_READY_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_START_RETRIES: usize = 40;
+const LOG_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_START_RETRIES: usize = 120;
 const DEFAULT_START_DELAY_MS: u64 = 500;
 const BASE_CLUSTER_NODE_COUNT: usize = 3;
 const DISCOVERY_CLUSTER_NODE_COUNT: usize = 4;
@@ -279,12 +279,18 @@ impl IgniteTestEnv {
     }
 
     pub fn stop(&self) {
-        let m = self.managed.as_ref().expect("control requires managed fixture");
+        let m = self
+            .managed
+            .as_ref()
+            .expect("control requires managed fixture");
         stop_container(&m.name);
     }
 
     pub fn start(&self) {
-        let m = self.managed.as_ref().expect("control requires managed fixture");
+        let m = self
+            .managed
+            .as_ref()
+            .expect("control requires managed fixture");
         start_container(&m.name);
         let addr = format!("{}:{}", docker_host_addr(), m.port);
         block_on_fixture(wait_for_tcp_ready(&addr, LOG_READY_TIMEOUT));
@@ -328,8 +334,23 @@ impl IgniteClusterEnv {
         }
     }
 
+    fn borrowed(addrs: Vec<String>, prefix: String, network_name: String, profile: &str) -> Self {
+        let managed = ManagedCluster {
+            profile: profile.to_string(),
+            name_prefix: prefix,
+            network_name,
+            owned: false,
+        };
+        Self {
+            addrs,
+            managed: Some(managed),
+        }
+    }
+
     pub fn addr(&self) -> &str {
-        self.addrs.first().expect("expected at least one cluster address")
+        self.addrs
+            .first()
+            .expect("expected at least one cluster address")
     }
 
     pub fn addresses(&self) -> &[String] {
@@ -351,27 +372,45 @@ impl IgniteClusterEnv {
     }
 
     pub fn stop_node(&self, index: usize) {
-        self.managed.as_ref().expect("control requires managed fixture").stop_node(index);
+        self.managed
+            .as_ref()
+            .expect("control requires managed fixture")
+            .stop_node(index);
     }
 
     pub fn start_node(&self, index: usize) {
-        self.managed.as_ref().expect("control requires managed fixture").start_node(index);
+        self.managed
+            .as_ref()
+            .expect("control requires managed fixture")
+            .start_node(index);
     }
 
     pub fn restart_node(&self, index: usize) {
-        self.managed.as_ref().expect("control requires managed fixture").restart_node(index);
+        self.managed
+            .as_ref()
+            .expect("control requires managed fixture")
+            .restart_node(index);
     }
 
     pub fn stop_all(&self) {
-        self.managed.as_ref().expect("control requires managed fixture").stop_all();
+        self.managed
+            .as_ref()
+            .expect("control requires managed fixture")
+            .stop_all();
     }
 
     pub fn start_all(&self) {
-        self.managed.as_ref().expect("control requires managed fixture").start_all();
+        self.managed
+            .as_ref()
+            .expect("control requires managed fixture")
+            .start_all();
     }
 
     pub fn restart_all(&self) {
-        self.managed.as_ref().expect("control requires managed fixture").restart_all();
+        self.managed
+            .as_ref()
+            .expect("control requires managed fixture")
+            .restart_all();
     }
 
     fn stop_extra_nodes(&self) {
@@ -387,7 +426,10 @@ impl IgniteClusterEnv {
     }
 
     async fn restart_base_nodes_sequentially(&self) -> IgniteResult<()> {
-        let m = self.managed.as_ref().expect("control requires managed fixture");
+        let m = self
+            .managed
+            .as_ref()
+            .expect("control requires managed fixture");
         m.stop_all();
         m.start_node(0);
         wait_for_cluster_ready_with_timeout(&[m.node_address(0)], CLUSTER_READY_TIMEOUT).await?;
@@ -474,6 +516,7 @@ struct ManagedCluster {
     profile: String,
     name_prefix: String,
     network_name: String,
+    owned: bool,
 }
 
 impl ManagedCluster {
@@ -483,20 +526,39 @@ impl ManagedCluster {
 
     fn addresses(&self) -> Vec<String> {
         (0..base_cluster_node_count(&self.profile))
-            .map(|i| format!("{}:{}", docker_host_addr(), cluster_node_client_port(&self.profile, i)))
+            .map(|i| {
+                format!(
+                    "{}:{}",
+                    docker_host_addr(),
+                    cluster_node_client_port(&self.profile, i)
+                )
+            })
             .collect()
     }
 
     fn running_addresses(&self) -> Vec<String> {
         (0..managed_cluster_node_count(&self.profile))
             .filter(|i| container_is_running(&self.container_name(*i)))
-            .map(|i| format!("{}:{}", docker_host_addr(), cluster_node_client_port(&self.profile, i)))
+            .map(|i| {
+                format!(
+                    "{}:{}",
+                    docker_host_addr(),
+                    cluster_node_client_port(&self.profile, i)
+                )
+            })
             .collect()
     }
 
     fn node_address(&self, index: usize) -> String {
-        assert!(index < managed_cluster_node_count(&self.profile), "node index out of bounds");
-        format!("{}:{}", docker_host_addr(), cluster_node_client_port(&self.profile, index))
+        assert!(
+            index < managed_cluster_node_count(&self.profile),
+            "node index out of bounds"
+        );
+        format!(
+            "{}:{}",
+            docker_host_addr(),
+            cluster_node_client_port(&self.profile, index)
+        )
     }
 
     fn stop_node(&self, index: usize) {
@@ -557,7 +619,17 @@ impl ManagedCluster {
 
 impl Drop for ManagedCluster {
     fn drop(&mut self) {
-        fixture_debug(&format!("ManagedCluster::drop: removing cluster {}", self.name_prefix));
+        if !self.owned {
+            fixture_debug(&format!(
+                "ManagedCluster::drop: skipping borrowed cluster {}",
+                self.name_prefix
+            ));
+            return;
+        }
+        fixture_debug(&format!(
+            "ManagedCluster::drop: removing cluster {}",
+            self.name_prefix
+        ));
         for i in 0..managed_cluster_node_count(&self.profile) {
             remove_container(&self.container_name(i));
         }
@@ -597,9 +669,16 @@ impl IgniteContext {
     pub fn client_config(&self) -> IgniteResult<ClientConfig> {
         match &self.kind {
             IgniteContextKind::Single(env) => env.client_config(),
-            IgniteContextKind::Cluster(env) => Ok(ClientConfig::from_addresses(
-                env.addresses().iter().cloned(),
-            )),
+            IgniteContextKind::Cluster(env) => {
+                let mut conf = ClientConfig::from_addresses(
+                    env.addresses().iter().cloned(),
+                );
+                // Containerised clusters advertise internal IPs that are
+                // unreachable from the host.  PA tests that need partition
+                // awareness override the config explicitly.
+                conf.partition_awareness_enabled = false;
+                Ok(conf)
+            }
         }
     }
 
@@ -673,7 +752,10 @@ impl IgniteContext {
                 if self.profile == IgniteProfile::ThreeNodeClusterChurn && env.is_managed() {
                     env.stop_extra_nodes();
                     env.ensure_base_nodes_running();
-                    match env.wait_for_ready_with_timeout(CHURN_RESET_READY_TIMEOUT).await {
+                    match env
+                        .wait_for_ready_with_timeout(CHURN_RESET_READY_TIMEOUT)
+                        .await
+                    {
                         Ok(()) => return Ok(()),
                         Err(_) => {
                             env.restart_base_nodes_sequentially().await?;
@@ -687,19 +769,27 @@ impl IgniteContext {
     }
 
     pub fn stop_node(&self, index: usize) {
-        self.cluster_env().expect("cluster-only operation").stop_node(index);
+        self.cluster_env()
+            .expect("cluster-only operation")
+            .stop_node(index);
     }
 
     pub fn start_node(&self, index: usize) {
-        self.cluster_env().expect("cluster-only operation").start_node(index);
+        self.cluster_env()
+            .expect("cluster-only operation")
+            .start_node(index);
     }
 
     pub fn restart_node(&self, index: usize) {
-        self.cluster_env().expect("cluster-only operation").restart_node(index);
+        self.cluster_env()
+            .expect("cluster-only operation")
+            .restart_node(index);
     }
 
     pub fn restart_all(&self) {
-        self.cluster_env().expect("cluster-only operation").restart_all();
+        self.cluster_env()
+            .expect("cluster-only operation")
+            .restart_all();
     }
 }
 
@@ -764,9 +854,29 @@ impl Deref for TestClient {
 
 fn docker_client() -> &'static Docker {
     DOCKER.get_or_init(|| {
-        // Try socket first (works with both Docker and Podman via compatible socket),
-        // fall back to HTTP.
-        Docker::connect_with_socket_defaults()
+        if let Ok(host) = std::env::var("DOCKER_HOST") {
+            if let Some(path) = host.strip_prefix("unix://") {
+                return Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
+                    .expect("failed to connect to Docker/Podman via DOCKER_HOST unix socket");
+            }
+            // tcp:// or http:// — bollard reads DOCKER_HOST automatically.
+            return Docker::connect_with_http_defaults()
+                .expect("failed to connect to Docker/Podman via DOCKER_HOST");
+        }
+        // No DOCKER_HOST: try Colima socket (macOS), then local/http defaults.
+        if let Some(home) = std::env::var_os("HOME") {
+            let colima = std::path::PathBuf::from(&home).join(".colima/default/docker.sock");
+            if colima.exists() {
+                if let Ok(d) = Docker::connect_with_unix(
+                    colima.to_str().unwrap(),
+                    120,
+                    bollard::API_DEFAULT_VERSION,
+                ) {
+                    return d;
+                }
+            }
+        }
+        Docker::connect_with_local_defaults()
             .or_else(|_| Docker::connect_with_http_defaults())
             .expect("failed to connect to Docker/Podman")
     })
@@ -788,9 +898,7 @@ where
     F::Output: Send,
 {
     match TokioHandle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(future))
         }
         Ok(_) => thread::scope(|scope| {
@@ -821,10 +929,7 @@ fn container_is_running(name: &str) -> bool {
         )
         .await
         {
-            Ok(Ok(info)) => info
-                .state
-                .and_then(|s| s.running)
-                .unwrap_or(false),
+            Ok(Ok(info)) => info.state.and_then(|s| s.running).unwrap_or(false),
             _ => false,
         }
     })
@@ -872,7 +977,11 @@ fn remove_container(name: &str) {
             DOCKER_API_TIMEOUT,
             docker_client().remove_container(
                 name,
-                Some(RemoveContainerOptions { force: true, v: true, ..Default::default() }),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
             ),
         )
         .await;
@@ -882,8 +991,8 @@ fn remove_container(name: &str) {
 fn remove_network(name: &str) {
     fixture_debug(&format!("remove_network: {name}"));
     block_on_fixture(async move {
-        let _ = tokio::time::timeout(DOCKER_API_TIMEOUT, docker_client().remove_network(name))
-            .await;
+        let _ =
+            tokio::time::timeout(DOCKER_API_TIMEOUT, docker_client().remove_network(name)).await;
     });
 }
 
@@ -938,7 +1047,9 @@ async fn ensure_image_available() {
                 result.unwrap_or_else(|err| panic!("failed to pull image: {err}"));
             }
             Ok(None) => break,
-            Err(_) => panic!("timed out pulling image {image}:{tag} (no progress for {chunk_timeout:?})"),
+            Err(_) => {
+                panic!("timed out pulling image {image}:{tag} (no progress for {chunk_timeout:?})")
+            }
         }
     }
 }
@@ -1028,14 +1139,20 @@ async fn create_docker_container(
     let _ = docker_client()
         .remove_container(
             &container_name,
-            Some(RemoveContainerOptions { force: true, v: true, ..Default::default() }),
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
         )
         .await;
 
     match tokio::time::timeout(
         DOCKER_API_TIMEOUT,
         docker_client().create_container(
-            Some(CreateContainerOptions { name: container_name.clone() }),
+            Some(CreateContainerOptions {
+                name: container_name.clone(),
+            }),
             config.clone(),
         ),
     )
@@ -1048,7 +1165,9 @@ async fn create_docker_container(
                 tokio::time::timeout(
                     DOCKER_API_TIMEOUT,
                     docker_client().create_container(
-                        Some(CreateContainerOptions { name: container_name.clone() }),
+                        Some(CreateContainerOptions {
+                            name: container_name.clone(),
+                        }),
                         config,
                     ),
                 )
@@ -1064,7 +1183,8 @@ async fn create_docker_container(
 
     tokio::time::timeout(
         DOCKER_API_TIMEOUT,
-        docker_client().start_container::<String>(&container_name, None::<StartContainerOptions<String>>),
+        docker_client()
+            .start_container::<String>(&container_name, None::<StartContainerOptions<String>>),
     )
     .await
     .unwrap_or_else(|_| panic!("timed out starting container {container_name}"))
@@ -1084,12 +1204,7 @@ async fn wait_for_container_log(name: &str, message: &str, timeout: Duration) {
 /// (non-follow) and check for the readiness marker.
 ///
 /// `since` is a Unix timestamp; pass 0 to read from the beginning.
-async fn wait_for_container_log_since(
-    name: &str,
-    message: &str,
-    timeout: Duration,
-    since: i64,
-) {
+async fn wait_for_container_log_since(name: &str, message: &str, timeout: Duration, since: i64) {
     let deadline = tokio::time::Instant::now() + timeout;
     let poll_interval = Duration::from_secs(2);
 
@@ -1117,9 +1232,7 @@ async fn wait_for_container_log_since(
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for '{message}' in {name} logs after {timeout:?}"
-            );
+            panic!("timed out waiting for '{message}' in {name} logs after {timeout:?}");
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -1127,10 +1240,13 @@ async fn wait_for_container_log_since(
 
 async fn get_mapped_port(name: &str) -> u16 {
     let port_spec = format!("{IGNITE_PORT}/tcp");
-    let inspect = tokio::time::timeout(DOCKER_API_TIMEOUT, docker_client().inspect_container(name, None))
-        .await
-        .unwrap_or_else(|_| panic!("timed out inspecting container {name}"))
-        .unwrap_or_else(|err| panic!("failed to inspect container {name}: {err}"));
+    let inspect = tokio::time::timeout(
+        DOCKER_API_TIMEOUT,
+        docker_client().inspect_container(name, None),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("timed out inspecting container {name}"))
+    .unwrap_or_else(|err| panic!("failed to inspect container {name}: {err}"));
 
     inspect
         .network_settings
@@ -1169,7 +1285,8 @@ fn cluster_static_ip_from_subnet(subnet: &str, index: usize) -> Option<String> {
 
 /// Remove fixture containers from other processes (different PIDs) to prevent
 /// resource exhaustion when xtask runs many test binaries sequentially.
-async fn cleanup_stale_fixture_containers(current_name: &str) {
+/// Returns `true` if at least one container was removed.
+async fn cleanup_stale_fixture_containers(current_name: &str) -> bool {
     let filters: HashMap<String, Vec<String>> = HashMap::from([(
         "label".to_string(),
         vec![format!("{FIXTURE_MANAGED_LABEL}=true")],
@@ -1185,8 +1302,9 @@ async fn cleanup_stale_fixture_containers(current_name: &str) {
     .await
     {
         Ok(Ok(list)) => list,
-        _ => return, // best-effort; don't fail the test if listing fails
+        _ => return false, // best-effort; don't fail the test if listing fails
     };
+    let mut removed_any = false;
     for c in containers {
         let names = c.names.unwrap_or_default();
         let name = match names.first() {
@@ -1196,14 +1314,28 @@ async fn cleanup_stale_fixture_containers(current_name: &str) {
         if name == current_name {
             continue; // will be handled by create_docker_container's force-remove
         }
-        fixture_debug(&format!("cleanup_stale_fixture_containers: removing {name}"));
+        // Only clean up containers with the same fixture-name prefix (same
+        // profile + "ignite-rs-fixture-" format).  This avoids removing
+        // xtask-provisioned containers for other profiles.
+        if !name.starts_with("ignite-rs-fixture-") {
+            continue;
+        }
+        fixture_debug(&format!(
+            "cleanup_stale_fixture_containers: removing {name}"
+        ));
         let _ = docker_client()
             .remove_container(
                 name,
-                Some(RemoveContainerOptions { force: true, v: true, ..Default::default() }),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
             )
             .await;
+        removed_any = true;
     }
+    removed_any
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,11 +1348,17 @@ async fn create_single_node(profile: &str) -> ManagedContainer {
         sanitize_identifier(profile),
         std::process::id()
     );
-    fixture_debug(&format!("create_single_node: profile={profile} name={name}"));
+    fixture_debug(&format!(
+        "create_single_node: profile={profile} name={name}"
+    ));
 
     // Remove stale fixture containers from prior test-binary processes to
     // prevent resource exhaustion (each Ignite JVM uses 512 MB heap).
-    cleanup_stale_fixture_containers(&name).await;
+    // The brief pause after cleanup gives the Podman VM time to reclaim
+    // memory before the new JVM starts.
+    if cleanup_stale_fixture_containers(&name).await {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 
     let config_path = fixture_config_path(profile, 0);
     let container_config_path = single_node_container_config_path();
@@ -1236,7 +1374,11 @@ async fn create_single_node(profile: &str) -> ManagedContainer {
     fixture_debug(&format!(
         "create_single_node: ready — addr={addr} container={name}",
     ));
-    ManagedContainer { name, profile: profile.to_string(), port }
+    ManagedContainer {
+        name,
+        profile: profile.to_string(),
+        port,
+    }
 }
 
 async fn create_cluster(profile: &str) -> ManagedCluster {
@@ -1246,7 +1388,9 @@ async fn create_cluster(profile: &str) -> ManagedCluster {
         std::process::id()
     );
     let network_name = format!("{name_prefix}-net");
-    fixture_debug(&format!("create_cluster: profile={profile} prefix={name_prefix}"));
+    fixture_debug(&format!(
+        "create_cluster: profile={profile} prefix={name_prefix}"
+    ));
 
     ensure_network(&network_name).await;
 
@@ -1321,6 +1465,7 @@ async fn create_cluster(profile: &str) -> ManagedCluster {
         profile: profile.to_string(),
         name_prefix,
         network_name,
+        owned: true,
     }
 }
 
@@ -1329,7 +1474,8 @@ async fn ensure_profile_container_ready_async(name: &str, profile: &str) {
         // Auth containers need cluster activation after start.
         let mut last_err = None;
         for _ in 0..start_retries() {
-            let conf = ready_probe_client_config(&format!("{}:{}", docker_host_addr(), IGNITE_PORT));
+            let conf =
+                ready_probe_client_config(&format!("{}:{}", docker_host_addr(), IGNITE_PORT));
             match new_client(conf).await {
                 Ok(client) => match client.cluster().set_state(ClusterState::Active).await {
                     Ok(_) => return,
@@ -1365,7 +1511,10 @@ fn build_runnable_image(
     container_config_path: &str,
 ) -> RunnableImage<GenericImage> {
     let mut image = GenericImage::new(test_image_name(), test_image_tag())
-        .with_volume(config_path.display().to_string(), container_config_path.to_string())
+        .with_volume(
+            config_path.display().to_string(),
+            container_config_path.to_string(),
+        )
         .with_env_var("CONFIG_URI", container_config_path)
         .with_env_var("JVM_OPTS", profile_jvm_opts(profile));
 
@@ -1386,7 +1535,10 @@ fn build_runnable_image(
     }
 
     if matches!(profile, CLUSTER_3_PROFILE | CLUSTER_3_CHURN_PROFILE) {
-        if let Some(index) = container_name.rsplit_once("-node-").and_then(|(_, s)| s.parse::<usize>().ok()) {
+        if let Some(index) = container_name
+            .rsplit_once("-node-")
+            .and_then(|(_, s)| s.parse::<usize>().ok())
+        {
             let port = cluster_node_client_port(profile, index);
             runnable = runnable.with_mapped_port((port, port));
         }
@@ -1477,20 +1629,38 @@ fn auth_defaults_for_profile(profile: &str) -> (Option<String>, Option<String>) 
 
 fn tls_defaults_for_profile(
     profile: &str,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     #[cfg(feature = "ssl")]
     match profile {
         SINGLE_NODE_TLS_PROFILE => (
             Some(DEFAULT_TLS_SERVER_NAME.to_string()),
-            Some(ssl_fixture_assets_dir().join("ca.pem").display().to_string()),
+            Some(
+                ssl_fixture_assets_dir()
+                    .join("ca.pem")
+                    .display()
+                    .to_string(),
+            ),
             None,
             None,
         ),
         SINGLE_NODE_MTLS_PROFILE => {
-            let client_pem = ssl_fixture_assets_dir().join("client_full.pem").display().to_string();
+            let client_pem = ssl_fixture_assets_dir()
+                .join("client_full.pem")
+                .display()
+                .to_string();
             (
                 Some(DEFAULT_TLS_SERVER_NAME.to_string()),
-                Some(ssl_fixture_assets_dir().join("ca.pem").display().to_string()),
+                Some(
+                    ssl_fixture_assets_dir()
+                        .join("ca.pem")
+                        .display()
+                        .to_string(),
+                ),
                 Some(client_pem.clone()),
                 Some(client_pem),
             )
@@ -1582,7 +1752,10 @@ fn profile_identity(profile: IgniteProfile) -> String {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| format!("managed:{}", std::process::id())),
-        IgniteProfile::ThreeNodeClusterChurn => format!("managed:{}", std::process::id()),
+        IgniteProfile::ThreeNodeClusterChurn => env::var("IGNITE_3NODE_CHURN_ADDRS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| format!("managed:{}", std::process::id())),
         IgniteProfile::AuthSingleNode => env::var("IGNITE_AUTH_ADDR")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -1608,7 +1781,11 @@ fn build_ignite_context(profile: IgniteProfile, scope: FixtureScope) -> IgniteCo
         ProfileKind::Single => IgniteContextKind::Single(resolve_single_env(profile, scope)),
         ProfileKind::Cluster => IgniteContextKind::Cluster(resolve_cluster_env(profile, scope)),
     };
-    IgniteContext { profile: d.profile, scope, kind }
+    IgniteContext {
+        profile: d.profile,
+        scope,
+        kind,
+    }
 }
 
 /// Returns `Some(value)` only if the env var is set and non-empty.
@@ -1625,13 +1802,17 @@ fn resolve_single_env(profile: IgniteProfile, scope: FixtureScope) -> Arc<Ignite
                 resolve_single_managed_env(&SHARED_ENV, SINGLE_NODE_PROFILE, scope)
             }
         }
-        IgniteProfile::SingleNodeChurn => {
-            resolve_single_managed_env(&SHARED_SINGLE_NODE_CHURN_ENV, SINGLE_NODE_CHURN_PROFILE, scope)
-        }
+        IgniteProfile::SingleNodeChurn => resolve_single_managed_env(
+            &SHARED_SINGLE_NODE_CHURN_ENV,
+            SINGLE_NODE_CHURN_PROFILE,
+            scope,
+        ),
         IgniteProfile::AuthSingleNode => {
             if let Some(addr) = env_non_empty("IGNITE_AUTH_ADDR") {
-                let username = env_non_empty("IGNITE_AUTH_USERNAME").unwrap_or_else(|| DEFAULT_AUTH_USERNAME.to_string());
-                let password = env_non_empty("IGNITE_AUTH_PASSWORD").unwrap_or_else(|| DEFAULT_AUTH_PASSWORD.to_string());
+                let username = env_non_empty("IGNITE_AUTH_USERNAME")
+                    .unwrap_or_else(|| DEFAULT_AUTH_USERNAME.to_string());
+                let password = env_non_empty("IGNITE_AUTH_PASSWORD")
+                    .unwrap_or_else(|| DEFAULT_AUTH_PASSWORD.to_string());
                 Arc::new(IgniteTestEnv::external_auth(addr, username, password))
             } else {
                 resolve_single_managed_env(&SHARED_AUTH_ENV, SINGLE_NODE_AUTH_PROFILE, scope)
@@ -1643,9 +1824,17 @@ fn resolve_single_env(profile: IgniteProfile, scope: FixtureScope) -> Arc<Ignite
         #[cfg(feature = "ssl")]
         IgniteProfile::TlsSingleNode => {
             if let Some(addr) = env_non_empty("IGNITE_TLS_ADDR") {
-                let server_name = env_non_empty("IGNITE_TLS_SERVER_NAME").unwrap_or_else(|| DEFAULT_TLS_SERVER_NAME.to_string());
-                let ca_pem = env_non_empty("IGNITE_TLS_CA_PEM").expect("IGNITE_TLS_CA_PEM required when IGNITE_TLS_ADDR is set");
-                Arc::new(IgniteTestEnv::external_tls(addr, server_name, ca_pem, None, None))
+                let server_name = env_non_empty("IGNITE_TLS_SERVER_NAME")
+                    .unwrap_or_else(|| DEFAULT_TLS_SERVER_NAME.to_string());
+                let ca_pem = env_non_empty("IGNITE_TLS_CA_PEM")
+                    .expect("IGNITE_TLS_CA_PEM required when IGNITE_TLS_ADDR is set");
+                Arc::new(IgniteTestEnv::external_tls(
+                    addr,
+                    server_name,
+                    ca_pem,
+                    None,
+                    None,
+                ))
             } else {
                 resolve_single_managed_env(&SHARED_TLS_ENV, SINGLE_NODE_TLS_PROFILE, scope)
             }
@@ -1653,11 +1842,21 @@ fn resolve_single_env(profile: IgniteProfile, scope: FixtureScope) -> Arc<Ignite
         #[cfg(feature = "ssl")]
         IgniteProfile::MtlsSingleNode => {
             if let Some(addr) = env_non_empty("IGNITE_TLS_ADDR") {
-                let server_name = env_non_empty("IGNITE_TLS_SERVER_NAME").unwrap_or_else(|| DEFAULT_TLS_SERVER_NAME.to_string());
-                let ca_pem = env_non_empty("IGNITE_TLS_CA_PEM").expect("IGNITE_TLS_CA_PEM required when IGNITE_TLS_ADDR is set");
-                let client_cert_pem = env_non_empty("IGNITE_TLS_CLIENT_CERT_PEM").expect("IGNITE_TLS_CLIENT_CERT_PEM required");
-                let client_key_pem = env_non_empty("IGNITE_TLS_CLIENT_KEY_PEM").expect("IGNITE_TLS_CLIENT_KEY_PEM required");
-                Arc::new(IgniteTestEnv::external_tls(addr, server_name, ca_pem, Some(client_cert_pem), Some(client_key_pem)))
+                let server_name = env_non_empty("IGNITE_TLS_SERVER_NAME")
+                    .unwrap_or_else(|| DEFAULT_TLS_SERVER_NAME.to_string());
+                let ca_pem = env_non_empty("IGNITE_TLS_CA_PEM")
+                    .expect("IGNITE_TLS_CA_PEM required when IGNITE_TLS_ADDR is set");
+                let client_cert_pem = env_non_empty("IGNITE_TLS_CLIENT_CERT_PEM")
+                    .expect("IGNITE_TLS_CLIENT_CERT_PEM required");
+                let client_key_pem = env_non_empty("IGNITE_TLS_CLIENT_KEY_PEM")
+                    .expect("IGNITE_TLS_CLIENT_KEY_PEM required");
+                Arc::new(IgniteTestEnv::external_tls(
+                    addr,
+                    server_name,
+                    ca_pem,
+                    Some(client_cert_pem),
+                    Some(client_key_pem),
+                ))
             } else {
                 resolve_single_managed_env(&SHARED_MTLS_ENV, SINGLE_NODE_MTLS_PROFILE, scope)
             }
@@ -1682,14 +1881,31 @@ fn resolve_single_managed_env(
 }
 
 fn resolve_cluster_env(profile: IgniteProfile, scope: FixtureScope) -> Arc<IgniteClusterEnv> {
-    if let Some(addrs) = env_non_empty("IGNITE_3NODE_ADDRS") {
-        return Arc::new(IgniteClusterEnv::external(parse_address_list(&addrs)));
-    }
     match profile {
         IgniteProfile::ThreeNodeCluster => {
+            if let Some(addrs) = env_non_empty("IGNITE_3NODE_ADDRS") {
+                return Arc::new(IgniteClusterEnv::external(parse_address_list(&addrs)));
+            }
             resolve_cluster_managed_env(&SHARED_CLUSTER_3_ENV, CLUSTER_3_PROFILE, scope)
         }
         IgniteProfile::ThreeNodeClusterChurn => {
+            if let (Some(addrs), Some(prefix)) = (
+                env_non_empty("IGNITE_3NODE_CHURN_ADDRS"),
+                env_non_empty("IGNITE_3NODE_CHURN_PREFIX"),
+            ) {
+                let addr_list = parse_address_list(&addrs);
+                let network_name = format!("{prefix}-net");
+                return SHARED_CLUSTER_3_CHURN_ENV
+                    .get_or_init(|| {
+                        Arc::new(IgniteClusterEnv::borrowed(
+                            addr_list,
+                            prefix,
+                            network_name,
+                            CLUSTER_3_CHURN_PROFILE,
+                        ))
+                    })
+                    .clone();
+            }
             resolve_cluster_managed_env(&SHARED_CLUSTER_3_CHURN_ENV, CLUSTER_3_CHURN_PROFILE, scope)
         }
         _ => unreachable!("single-node profiles must resolve through resolve_single_env"),
@@ -1773,59 +1989,84 @@ pub fn ignite_context(profile: IgniteProfile, scope: FixtureScope) -> Arc<Ignite
 }
 
 pub fn ignite_test_env() -> Arc<IgniteTestEnv> {
-    ignite_context(IgniteProfile::DefaultSingleNode, default_fixture_scope(IgniteProfile::DefaultSingleNode))
-        .single_env()
-        .expect("default single-node resolved as cluster")
-        .clone()
+    ignite_context(
+        IgniteProfile::DefaultSingleNode,
+        default_fixture_scope(IgniteProfile::DefaultSingleNode),
+    )
+    .single_env()
+    .expect("default single-node resolved as cluster")
+    .clone()
 }
 
 pub fn ignite_single_node_churn_env() -> Arc<IgniteTestEnv> {
-    ignite_context(IgniteProfile::SingleNodeChurn, default_fixture_scope(IgniteProfile::SingleNodeChurn))
-        .single_env()
-        .expect("churn resolved as cluster")
-        .clone()
+    ignite_context(
+        IgniteProfile::SingleNodeChurn,
+        default_fixture_scope(IgniteProfile::SingleNodeChurn),
+    )
+    .single_env()
+    .expect("churn resolved as cluster")
+    .clone()
 }
 
 pub fn ignite_auth_env() -> Arc<IgniteTestEnv> {
-    ignite_context(IgniteProfile::AuthSingleNode, default_fixture_scope(IgniteProfile::AuthSingleNode))
-        .single_env()
-        .expect("auth resolved as cluster")
-        .clone()
+    ignite_context(
+        IgniteProfile::AuthSingleNode,
+        default_fixture_scope(IgniteProfile::AuthSingleNode),
+    )
+    .single_env()
+    .expect("auth resolved as cluster")
+    .clone()
 }
 
 #[cfg(feature = "ssl")]
 pub fn ignite_tls_env() -> Arc<IgniteTestEnv> {
-    ignite_context(IgniteProfile::TlsSingleNode, default_fixture_scope(IgniteProfile::TlsSingleNode))
-        .single_env()
-        .expect("tls resolved as cluster")
-        .clone()
+    ignite_context(
+        IgniteProfile::TlsSingleNode,
+        default_fixture_scope(IgniteProfile::TlsSingleNode),
+    )
+    .single_env()
+    .expect("tls resolved as cluster")
+    .clone()
 }
 
 #[cfg(feature = "ssl")]
 pub fn ignite_mtls_env() -> Arc<IgniteTestEnv> {
-    ignite_context(IgniteProfile::MtlsSingleNode, default_fixture_scope(IgniteProfile::MtlsSingleNode))
-        .single_env()
-        .expect("mtls resolved as cluster")
-        .clone()
+    ignite_context(
+        IgniteProfile::MtlsSingleNode,
+        default_fixture_scope(IgniteProfile::MtlsSingleNode),
+    )
+    .single_env()
+    .expect("mtls resolved as cluster")
+    .clone()
 }
 
 pub fn ignite_cluster3_env() -> Arc<IgniteClusterEnv> {
-    ignite_context(IgniteProfile::ThreeNodeCluster, default_fixture_scope(IgniteProfile::ThreeNodeCluster))
-        .cluster_env()
-        .expect("cluster resolved as single-node")
-        .clone()
+    ignite_context(
+        IgniteProfile::ThreeNodeCluster,
+        default_fixture_scope(IgniteProfile::ThreeNodeCluster),
+    )
+    .cluster_env()
+    .expect("cluster resolved as single-node")
+    .clone()
 }
 
 pub fn ignite_cluster3_churn_env() -> Arc<IgniteClusterEnv> {
-    ignite_context(IgniteProfile::ThreeNodeClusterChurn, default_fixture_scope(IgniteProfile::ThreeNodeClusterChurn))
-        .cluster_env()
-        .expect("churn cluster resolved as single-node")
-        .clone()
+    ignite_context(
+        IgniteProfile::ThreeNodeClusterChurn,
+        default_fixture_scope(IgniteProfile::ThreeNodeClusterChurn),
+    )
+    .cluster_env()
+    .expect("churn cluster resolved as single-node")
+    .clone()
 }
 
 pub fn delayed_handshake_env(delay: Duration) -> io::Result<DelayedHandshakeEnv> {
     if let Ok(addr) = env::var("IGNITE_DELAYED_HANDSHAKE_ADDR") {
-        return Ok(DelayedHandshakeEnv { addr, _base_env: None, join: None });
+        return Ok(DelayedHandshakeEnv {
+            addr,
+            _base_env: None,
+            join: None,
+        });
     }
 
     let env = ignite_test_env();
@@ -1833,10 +2074,18 @@ pub fn delayed_handshake_env(delay: Duration) -> io::Result<DelayedHandshakeEnv>
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?.to_string();
     let join = thread::spawn(move || {
-        let Ok((mut client_stream, _)) = listener.accept() else { return };
-        let Ok(mut server_stream) = TcpStream::connect(&target_addr) else { return };
-        let Ok(mut client_reader) = client_stream.try_clone() else { return };
-        let Ok(mut server_writer) = server_stream.try_clone() else { return };
+        let Ok((mut client_stream, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(mut server_stream) = TcpStream::connect(&target_addr) else {
+            return;
+        };
+        let Ok(mut client_reader) = client_stream.try_clone() else {
+            return;
+        };
+        let Ok(mut server_writer) = server_stream.try_clone() else {
+            return;
+        };
 
         let upstream = thread::spawn(move || {
             let _ = io::copy(&mut client_reader, &mut server_writer);
@@ -1849,7 +2098,11 @@ pub fn delayed_handshake_env(delay: Duration) -> io::Result<DelayedHandshakeEnv>
         let _ = upstream.join();
     });
 
-    Ok(DelayedHandshakeEnv { addr, _base_env: Some(env), join: Some(join) })
+    Ok(DelayedHandshakeEnv {
+        addr,
+        _base_env: Some(env),
+        join: Some(join),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,7 +2110,9 @@ pub fn delayed_handshake_env(delay: Duration) -> io::Result<DelayedHandshakeEnv>
 // ---------------------------------------------------------------------------
 
 pub async fn connect() -> IgniteResult<TestClient> {
-    ignite_scope(IgniteProfile::DefaultSingleNode).connect().await
+    ignite_scope(IgniteProfile::DefaultSingleNode)
+        .connect()
+        .await
 }
 
 pub async fn connect_profile(profile: IgniteProfile) -> IgniteResult<TestClient> {
@@ -1884,7 +2139,9 @@ pub async fn connect_mtls() -> IgniteResult<TestClient> {
 }
 
 pub async fn connect_cluster3() -> IgniteResult<TestClient> {
-    ignite_scope(IgniteProfile::ThreeNodeCluster).connect().await
+    ignite_scope(IgniteProfile::ThreeNodeCluster)
+        .connect()
+        .await
 }
 
 pub async fn connect_with_cluster3_config(conf: ClientConfig) -> IgniteResult<TestClient> {
@@ -1893,7 +2150,9 @@ pub async fn connect_with_cluster3_config(conf: ClientConfig) -> IgniteResult<Te
 }
 
 pub async fn connect_cluster3_churn() -> IgniteResult<TestClient> {
-    ignite_scope(IgniteProfile::ThreeNodeClusterChurn).connect().await
+    ignite_scope(IgniteProfile::ThreeNodeClusterChurn)
+        .connect()
+        .await
 }
 
 pub async fn connect_with_cluster3_churn_config(conf: ClientConfig) -> IgniteResult<TestClient> {
@@ -1909,7 +2168,10 @@ async fn connect_with_config_and_env(
     for _ in 0..start_retries() {
         match new_client(conf.clone()).await {
             Ok(client) => {
-                return Ok(TestClient { _env: TestEnvHandle::Single(env), inner: client });
+                return Ok(TestClient {
+                    _env: TestEnvHandle::Single(env),
+                    inner: client,
+                });
             }
             Err(err) => {
                 last_err = Some(err);
@@ -1928,7 +2190,10 @@ async fn connect_with_config_and_cluster_env(
     for _ in 0..start_retries() {
         match new_client(conf.clone()).await {
             Ok(client) => {
-                return Ok(TestClient { _env: TestEnvHandle::Cluster(env), inner: client });
+                return Ok(TestClient {
+                    _env: TestEnvHandle::Cluster(env),
+                    inner: client,
+                });
             }
             Err(err) => {
                 last_err = Some(err);
@@ -1974,7 +2239,9 @@ async fn wait_for_client_ready(conf: ClientConfig) -> IgniteResult<()> {
         io::ErrorKind::TimedOut,
         format!(
             "Ignite node at {} not ready after {:.1}s (last error: {})",
-            addr_display, elapsed.as_secs_f64(), last_err
+            addr_display,
+            elapsed.as_secs_f64(),
+            last_err
         ),
     )
     .into())
@@ -2043,17 +2310,27 @@ fn ready_probe_from_config(conf: &ClientConfig) -> ClientConfig {
 /// TCP-based readiness check: connect, handshake, and issue a lightweight
 /// request.  This avoids the unreliable Podman log-streaming API entirely.
 async fn wait_for_tcp_ready(addr: &str, timeout: Duration) {
+    wait_for_tcp_ready_result(addr, timeout)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+async fn wait_for_tcp_ready_result(addr: &str, timeout: Duration) -> IgniteResult<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let conf = ready_probe_client_config(addr);
     loop {
         if let Ok(client) = new_client(conf.clone()).await {
             if client.get_cache_names().await.is_ok() {
                 drop(client);
-                return;
+                return Ok(());
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for TCP readiness at {addr} after {timeout:?}");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for TCP readiness at {addr} after {timeout:?}"),
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -2134,7 +2411,16 @@ fn test_image_tag() -> String {
 }
 
 fn sanitize_identifier(input: &str) -> String {
-    input.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn fixture_config_path(profile: &str, _index: usize) -> PathBuf {
@@ -2241,7 +2527,12 @@ fn build_fixture_client_config(
     #[cfg(not(feature = "ssl"))]
     let _ = (tls_server_name, ca_pem, client_cert_pem, client_key_pem);
 
-    Ok(ClientConfig::new(addr))
+    let mut conf = ClientConfig::new(addr);
+    // Ensure fixture clients always have timeouts so that a misbehaving
+    // container cannot hang the test process indefinitely.
+    conf.handshake_timeout = Some(Duration::from_secs(10));
+    conf.request_timeout = Some(Duration::from_secs(30));
+    Ok(conf)
 }
 
 pub async fn ensure_rainbow_table(client: &Client) -> IgniteResult<()> {
@@ -2253,7 +2544,10 @@ pub async fn ensure_rainbow_table(client: &Client) -> IgniteResult<()> {
         };
         if let Err(err) = res {
             let msg = err.to_string();
-            if !msg.contains("Table already exists") && !msg.contains("Duplicate key") {
+            if !msg.contains("Table already exists")
+                && !msg.contains("Duplicate key")
+                && !msg.contains("already in cache")
+            {
                 return Err(err);
             }
         }

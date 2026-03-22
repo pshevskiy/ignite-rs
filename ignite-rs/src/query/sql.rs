@@ -939,6 +939,16 @@ pub(crate) fn read_sql_value_unwrapped(
             ComplexObject::read_unwrapped(TypeCode::ComplexObj, reader)?
                 .ok_or_else(|| IgniteError::from("Expected complex object value"))?,
         )),
+        TypeCode::OptimizedMarshaller => {
+            // JDK-serialized Java object — opaque to the thin client.
+            // Format: length(4) + data(length).
+            let len = read_i32(reader).map_err(IgniteError::from)?;
+            if len > 0 {
+                let mut buf = vec![0u8; len as usize];
+                reader.read_exact(&mut buf).map_err(IgniteError::from)?;
+            }
+            Ok(SqlValue::Null)
+        }
         unsupported => Err(IgniteError::new(format!(
             "Unsupported SQL field type code: {:?}",
             unsupported

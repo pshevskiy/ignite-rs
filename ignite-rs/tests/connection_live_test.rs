@@ -31,13 +31,13 @@ async fn should_connect_with_mixed_valid_and_invalid_node_addresses() {
     let dead_addr1 = unused_local_addr();
     let dead_addr2 = unused_local_addr();
 
-    let client = new_client(ClientConfig::from_addresses([
+    let mut conf = ClientConfig::from_addresses([
         dead_addr1.as_str(),
         dead_addr2.as_str(),
         valid_addr.as_str(),
-    ]))
-    .await
-    .unwrap();
+    ]);
+    conf.handshake_timeout = Some(Duration::from_secs(5));
+    let client = new_client(conf).await.unwrap();
 
     let _ = client.get_cache_names().await.unwrap();
 }

@@ -317,6 +317,116 @@ pub async fn recv_event(
         .expect("client event channel closed unexpectedly")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Encodes a single cluster node's info in the typed binary protocol format
+/// that matches the Java server's `ClientClusterGroupGetNodesDetailsResponse`.
+pub struct MockNodeInfo {
+    pub uuid: MockUuid,
+    pub attributes: Vec<(String, Vec<u8>)>,
+    pub addresses: Vec<String>,
+    pub host_names: Vec<String>,
+    pub order: i64,
+    pub is_local: bool,
+    pub is_daemon: bool,
+    pub is_client: bool,
+    pub consistent_id: String,
+}
+
+impl MockNodeInfo {
+    pub fn simple(uuid: MockUuid) -> Self {
+        Self {
+            uuid,
+            attributes: Vec::new(),
+            addresses: vec!["127.0.0.1".to_string()],
+            host_names: vec!["host-a".to_string()],
+            order: 1,
+            is_local: false,
+            is_daemon: false,
+            is_client: false,
+            consistent_id: "node-a".to_string(),
+        }
+    }
+
+    pub fn with_typed_attribute<T: WritableType>(mut self, name: &str, value: &T) -> Self {
+        let mut buf = Vec::new();
+        value
+            .write(&mut buf)
+            .expect("failed to encode attribute value");
+        self.attributes.push((name.to_string(), buf));
+        self
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut p = Vec::new();
+        // UUID: type_code(UUID=10) + most(8) + least(8)
+        p.push(TypeCode::Uuid as u8);
+        p.extend_from_slice(&self.uuid.most.to_le_bytes());
+        p.extend_from_slice(&self.uuid.least.to_le_bytes());
+        // Attributes
+        p.extend_from_slice(&(self.attributes.len() as i32).to_le_bytes());
+        for (name, value_bytes) in &self.attributes {
+            // Attribute name: typed string (type_code + length + bytes)
+            p.push(TypeCode::String as u8);
+            let name_bytes = name.as_bytes();
+            p.extend_from_slice(&(name_bytes.len() as i32).to_le_bytes());
+            p.extend_from_slice(name_bytes);
+            // Attribute value: already typed (includes type code)
+            p.extend_from_slice(value_bytes);
+        }
+        // Addresses: typed string collection
+        encode_typed_string_collection(&mut p, &self.addresses);
+        // Host names: typed string collection
+        encode_typed_string_collection(&mut p, &self.host_names);
+        // Order
+        p.extend_from_slice(&self.order.to_le_bytes());
+        // is_local, is_daemon, is_client
+        p.push(self.is_local as u8);
+        p.push(self.is_daemon as u8);
+        p.push(self.is_client as u8);
+        // consistent_id: typed string
+        p.push(TypeCode::String as u8);
+        let id_bytes = self.consistent_id.as_bytes();
+        p.extend_from_slice(&(id_bytes.len() as i32).to_le_bytes());
+        p.extend_from_slice(id_bytes);
+        // Version: major=2, minor=15, maintenance=0
+        p.push(2);
+        p.push(15);
+        p.push(0);
+        // stage: typed string "release"
+        p.push(TypeCode::String as u8);
+        p.extend_from_slice(&7i32.to_le_bytes());
+        p.extend_from_slice(b"release");
+        // revision_timestamp
+        p.extend_from_slice(&123i64.to_le_bytes());
+        // revision_hash: typed byte array (ArrByte=12) with 0 elements
+        p.push(TypeCode::ArrByte as u8);
+        p.extend_from_slice(&0i32.to_le_bytes());
+        p
+    }
+}
+
+fn encode_typed_string_collection(p: &mut Vec<u8>, values: &[String]) {
+    p.push(TypeCode::Collection as u8);
+    p.extend_from_slice(&(values.len() as i32).to_le_bytes());
+    p.push(0u8); // collection type indicator
+    for s in values {
+        p.push(TypeCode::String as u8);
+        let bytes = s.as_bytes();
+        p.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
+        p.extend_from_slice(bytes);
+    }
+}
+
+/// Encodes a list of MockNodeInfo as a complete ClusterGroupGetNodeInfo response.
+pub fn encode_node_info_payload(nodes: &[MockNodeInfo]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(nodes.len() as i32).to_le_bytes());
+    for node in nodes {
+        payload.extend(node.encode());
+    }
+    payload
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MockUuid {
     pub most: i64,
@@ -1308,6 +1418,7 @@ fn write_discovery_response(
         payload.extend_from_slice(&(node.addresses.len() as i32).to_le_bytes());
 
         for address in &node.addresses {
+            payload.push(9u8); // TypeCode::String
             payload.extend_from_slice(&(address.len() as i32).to_le_bytes());
             payload.extend_from_slice(address.as_bytes());
         }
@@ -1371,20 +1482,31 @@ fn parse_cache_request(op_code: i16, payload: &[u8]) -> Option<RecordedCacheRequ
 }
 
 fn parse_tx_start_request(payload: &[u8]) -> Option<RecordedTxStartRequest> {
-    if payload.len() < 14 {
+    if payload.len() < 11 {
         return None;
     }
 
     let concurrency = payload[0];
     let isolation = payload[1];
     let timeout_ms = i64::from_le_bytes(payload.get(2..10)?.try_into().ok()?);
-    let label_len = i32::from_le_bytes(payload.get(10..14)?.try_into().ok()?);
-    let label = if label_len < 0 {
+
+    // The label is written with write_string_type_code (TypeCode::String prefix) or write_null
+    let type_code = payload[10];
+    let label = if type_code == 101 {
+        // TypeCode::Null — no label
         None
+    } else if type_code == 9 {
+        // TypeCode::String — read i32 length + bytes
+        let label_len = i32::from_le_bytes(payload.get(11..15)?.try_into().ok()?);
+        if label_len < 0 {
+            None
+        } else {
+            let start = 15usize;
+            let end = start + label_len as usize;
+            Some(String::from_utf8(payload.get(start..end)?.to_vec()).ok()?)
+        }
     } else {
-        let start = 14usize;
-        let end = start + label_len as usize;
-        Some(String::from_utf8(payload.get(start..end)?.to_vec()).ok()?)
+        None
     };
 
     Some(RecordedTxStartRequest {
