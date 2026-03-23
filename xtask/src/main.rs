@@ -24,7 +24,7 @@ fn main() -> Result<()> {
             run_test_matrix(bucket)
         }
         Some(other) => bail!("unknown xtask command: {other}"),
-        None => bail!("usage: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix [--bucket <name>]"),
+        None => bail!("usage: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix [--bucket <name>]"),
     }
 }
 
@@ -49,15 +49,17 @@ fn run_test_matrix(bucket_filter: Option<Bucket>) -> Result<()> {
         stages.extend(Bucket::ordered());
     }
 
-    // Global cleanup: remove ALL managed fixture containers from previous runs
-    // to prevent stale containers from blocking provisioning.
-    let all_profiles: BTreeSet<String> = KNOWN_PROFILES
-        .iter()
-        .filter(|p| **p != "none")
-        .map(|p| p.to_string())
-        .collect();
-    cleanup_profiles(&workspace_root, &all_profiles)
-        .context("failed initial global cleanup")?;
+    if stages.iter().any(|bucket| bucket.is_live()) {
+        // Global cleanup: remove ALL managed fixture containers from previous runs
+        // to prevent stale containers from blocking provisioning.
+        let all_profiles: BTreeSet<String> = KNOWN_PROFILES
+            .iter()
+            .filter(|p| **p != "none")
+            .map(|p| p.to_string())
+            .collect();
+        cleanup_profiles(&workspace_root, &all_profiles)
+            .context("failed initial global cleanup")?;
+    }
 
     run_cargo_check(&workspace_root)?;
 
@@ -337,16 +339,18 @@ fn run_bucket(workspace_root: &Path, matrix: &TestMatrix, bucket: Bucket) -> Res
         }
     }
 
-    // Clean up both profile-specific and any stale fixture containers left
-    // by in-process test fixtures (e.g., single-node containers created by
-    // connect() inside cluster3_churn tests).
-    let all_profiles: BTreeSet<String> = KNOWN_PROFILES
-        .iter()
-        .filter(|p| **p != "none")
-        .map(|p| p.to_string())
-        .collect();
-    cleanup_profiles(workspace_root, &all_profiles)
-        .with_context(|| format!("failed to clean fixtures after {}", bucket.as_str()))?;
+    if bucket.is_live() {
+        // Clean up both profile-specific and any stale fixture containers left
+        // by in-process test fixtures (e.g., single-node containers created by
+        // connect() inside cluster3_churn tests).
+        let all_profiles: BTreeSet<String> = KNOWN_PROFILES
+            .iter()
+            .filter(|p| **p != "none")
+            .map(|p| p.to_string())
+            .collect();
+        cleanup_profiles(workspace_root, &all_profiles)
+            .with_context(|| format!("failed to clean fixtures after {}", bucket.as_str()))?;
+    }
 
     suite_result
 }

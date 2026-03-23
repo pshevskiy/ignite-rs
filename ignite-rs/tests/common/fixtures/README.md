@@ -11,8 +11,8 @@ Recommended scope defaults:
 - `FixtureScope::Process` for churn profiles and tests that intentionally stop or restart nodes
 
 One-command matrix runner:
-- Run the full deterministic test matrix from the workspace root with `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix`
-- Run one bucket only with `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`
+- Run the full deterministic test matrix from the workspace root with `cargo run --manifest-path Cargo.toml -p xtask -- test-matrix`
+- Run one bucket only with `cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`
 
 Cleanup behavior:
 - managed `CargoSession` fixtures use owner-PID leases and the last live owner removes shared containers, networks, and generated cluster config

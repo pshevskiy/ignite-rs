@@ -9,33 +9,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Run pure bucket
         env:
           CARGO_TERM_COLOR: always
-        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket pure
+        run: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket pure
 
   single-node:
     name: Single Node
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Run single-node bucket
         env:
@@ -43,21 +41,20 @@ jobs:
           IGNITE_TEST_TAG: 2.15.0
           IGNITE_TEST_START_RETRIES: 60
           IGNITE_TEST_START_DELAY_MS: 1000
-        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket single_node
+        run: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket single_node
 
   cluster3:
     name: Cluster3
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Run cluster3 bucket
         env:
@@ -65,21 +62,20 @@ jobs:
           IGNITE_TEST_TAG: 2.15.0
           IGNITE_TEST_START_RETRIES: 60
           IGNITE_TEST_START_DELAY_MS: 1000
-        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket cluster3
+        run: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket cluster3
 
   cluster3-churn:
     name: Cluster3 Churn
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Run cluster3 churn bucket
         env:
@@ -87,21 +83,20 @@ jobs:
           IGNITE_TEST_TAG: 2.15.0
           IGNITE_TEST_START_RETRIES: 60
           IGNITE_TEST_START_DELAY_MS: 1000
-        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket cluster3_churn
+        run: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket cluster3_churn
 
   auth:
     name: Auth
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Run auth bucket
         env:
@@ -109,21 +104,20 @@ jobs:
           IGNITE_TEST_TAG: 2.15.0
           IGNITE_TEST_START_RETRIES: 60
           IGNITE_TEST_START_DELAY_MS: 1000
-        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket auth
+        run: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket auth
 
   ssl:
     name: SSL
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Run ssl bucket
         env:
@@ -131,4 +125,4 @@ jobs:
           IGNITE_TEST_TAG: 2.15.0
           IGNITE_TEST_START_RETRIES: 60
           IGNITE_TEST_START_DELAY_MS: 1000
-        run: cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket ssl
+        run: cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket ssl

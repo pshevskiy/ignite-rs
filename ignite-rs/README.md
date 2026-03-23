@@ -52,8 +52,8 @@ For mutual TLS, use `client_config_from_ca_and_client_pem(...)`.
 
 ## Tests
 
-- Canonical full-matrix runner: `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix`
-- One bucket only: `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`
+- Canonical full-matrix runner: `cargo run --manifest-path Cargo.toml -p xtask -- test-matrix`
+- One bucket only: `cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`
 - Targeted debugging remains available through direct `cargo test ...` commands.
 - TLS integration files: `ignite-rs/ignite-rs/tests/ssl_parameters_test.rs` and `ignite-rs/ignite-rs/tests/security_test.rs`
 - Live fixture profiles and overrides:

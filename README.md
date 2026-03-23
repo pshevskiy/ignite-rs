@@ -72,8 +72,8 @@ async fn main() -> ignite_rs::error::IgniteResult<()> {
 
 ## Tests
 
-- Run the full deterministic test matrix with `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix`.
-- Run one matrix bucket with `cargo run --manifest-path ignite-rs/Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`.
+- Run the full deterministic test matrix with `cargo run --manifest-path Cargo.toml -p xtask -- test-matrix`.
+- Run one matrix bucket with `cargo run --manifest-path Cargo.toml -p xtask -- test-matrix --bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>`.
 - `cargo test --manifest-path ignite-rs/Cargo.toml` remains useful for targeted debugging, but `xtask test-matrix` is the canonical runner for local full-suite and CI execution.
 - Reuse existing environments with:
   - `IGNITE_ADDR` for plain single-node
