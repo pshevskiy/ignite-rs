@@ -68,6 +68,39 @@ pub(crate) fn type_name(type_id: i32) -> Option<String> {
     type_by_id(type_id).map(|meta| meta.type_name)
 }
 
+/// Look up schema using footer field_ids to determine correct field ordering.
+pub(crate) fn schema_for_ordered(
+    type_id: i32,
+    _schema_id: i32,
+    footer_field_ids: &[i32],
+) -> Option<Arc<ComplexObjectSchema>> {
+    if footer_field_ids.is_empty() {
+        return None;
+    }
+    let meta = type_by_id(type_id)?;
+    let mut fields_by_id = std::collections::HashMap::new();
+    for field in &meta.fields {
+        fields_by_id.insert(
+            field.field_id,
+            IgniteField {
+                name: field.name.clone(),
+                r#type: ignite_type_from_type_id(field.type_id),
+            },
+        );
+    }
+    let fields: Vec<_> = footer_field_ids
+        .iter()
+        .filter_map(|fid| fields_by_id.get(fid).cloned())
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ComplexObjectSchema {
+        type_name: meta.type_name,
+        fields,
+    }))
+}
+
 pub(crate) fn schema_for(type_id: i32, schema_id: i32) -> Option<Arc<ComplexObjectSchema>> {
     let meta = type_by_id(type_id)?;
     let mut fields_by_id = BTreeMap::new();
@@ -151,6 +184,8 @@ pub(crate) fn ignite_type_id(ty: &IgniteType) -> i32 {
         IgniteType::Decimal(_, _) => TypeCode::Decimal as i32,
         IgniteType::Enum => TypeCode::Enum as i32,
         IgniteType::Null => TypeCode::Null as i32,
+        IgniteType::Map => TypeCode::Map as i32,
+        IgniteType::Collection => TypeCode::Collection as i32,
     }
 }
 
@@ -174,6 +209,8 @@ fn ignite_type_from_type_id(type_id: i32) -> IgniteType {
         x if x == TypeCode::Time as i32 => IgniteType::Time,
         x if x == TypeCode::Decimal as i32 => IgniteType::Decimal(0, 0),
         x if x == TypeCode::Enum as i32 || x == TypeCode::BinaryEnum as i32 => IgniteType::Enum,
+        x if x == TypeCode::Map as i32 => IgniteType::Map,
+        x if x == TypeCode::Collection as i32 => IgniteType::Collection,
         _ => IgniteType::Null,
     }
 }

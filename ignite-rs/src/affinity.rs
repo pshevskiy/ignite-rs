@@ -6,11 +6,11 @@ use crate::protocol::{
 use crate::topology::TopologyVersion;
 use crate::utils::string_to_java_hashcode;
 use crate::{ReadableReq, WriteableReq};
-use std::collections::HashMap;
+use arc_swap::ArcSwap;
+use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::io::{self, Cursor, Read, Write};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 const MAX_AFFINITY_NODE_COUNT: i32 = 4096;
 const MAX_AFFINITY_PARTITIONS_PER_NODE: i32 = 65_536;
@@ -50,20 +50,43 @@ impl WriteableReq for CachePartitionsRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CacheAffinityMap {
-    primary_partition_to_node: Arc<[Option<String>]>,
-    dc_partition_to_node: Arc<[Option<String>]>,
+    primary_partition_to_node: Arc<[Option<Arc<str>>]>,
+    dc_partition_to_node: Arc<[Option<Arc<str>>]>,
     key_field_mapping_present: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
 struct AffinityState {
     topology_version: Option<TopologyVersion>,
     caches: HashMap<i32, CacheAffinityMap>,
+    single_node: bool,
 }
 
-#[derive(Default)]
+impl Default for AffinityState {
+    fn default() -> Self {
+        Self {
+            topology_version: None,
+            caches: HashMap::new(),
+            single_node: false,
+        }
+    }
+}
+
 pub(crate) struct AffinityCache {
-    state: RwLock<AffinityState>,
+    /// Lock-free affinity state — atomic pointer swap on write, load on read.
+    /// Equivalent to Java's volatile + ConcurrentHashMap for read performance.
+    state: ArcSwap<AffinityState>,
+    /// Lock-free cache of single_node flag — avoids even the ArcSwap load per request.
+    single_node_cached: std::sync::atomic::AtomicBool,
+}
+
+impl Default for AffinityCache {
+    fn default() -> Self {
+        Self {
+            state: ArcSwap::from_pointee(AffinityState::default()),
+            single_node_cached: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl AffinityCache {
@@ -72,18 +95,42 @@ impl AffinityCache {
     }
 
     pub(crate) async fn invalidate(&self) {
-        let mut state = self.state.write().await;
-        state.topology_version = None;
-        state.caches.clear();
+        let mut new_state: AffinityState = (**self.state.load()).clone();
+        new_state.topology_version = None;
+        new_state.caches.clear();
+        new_state.single_node = false;
+        self.single_node_cached
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.state.store(Arc::new(new_state));
     }
 
     pub(crate) async fn invalidate_cache(&self, cache_id: i32) {
-        self.state.write().await.caches.remove(&cache_id);
+        let mut new_state: AffinityState = (**self.state.load()).clone();
+        new_state.caches.remove(&cache_id);
+        let all_nodes: HashSet<&str> = new_state
+            .caches
+            .values()
+            .flat_map(|c| {
+                c.primary_partition_to_node
+                    .iter()
+                    .chain(c.dc_partition_to_node.iter())
+            })
+            .filter_map(|n| n.as_deref())
+            .collect();
+        new_state.single_node = all_nodes.len() <= 1 && !new_state.caches.is_empty();
+        self.single_node_cached
+            .store(new_state.single_node, std::sync::atomic::Ordering::Relaxed);
+        self.state.store(Arc::new(new_state));
     }
 
     pub(crate) async fn needs_refresh(&self, cache_id: i32) -> bool {
-        let state = self.state.read().await;
+        let state = self.state.load();
         state.topology_version.is_none() || !state.caches.contains_key(&cache_id)
+    }
+
+    pub(crate) fn is_single_node(&self) -> bool {
+        self.single_node_cached
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) async fn apply(
@@ -91,9 +138,23 @@ impl AffinityCache {
         topology_version: TopologyVersion,
         caches: HashMap<i32, CacheAffinityMap>,
     ) {
-        let mut state = self.state.write().await;
-        state.topology_version = Some(topology_version);
-        state.caches.extend(caches);
+        let mut new_state: AffinityState = (**self.state.load()).clone();
+        new_state.topology_version = Some(topology_version);
+        new_state.caches.extend(caches);
+        let all_nodes: HashSet<&str> = new_state
+            .caches
+            .values()
+            .flat_map(|c| {
+                c.primary_partition_to_node
+                    .iter()
+                    .chain(c.dc_partition_to_node.iter())
+            })
+            .filter_map(|n| n.as_deref())
+            .collect();
+        new_state.single_node = all_nodes.len() <= 1;
+        self.single_node_cached
+            .store(new_state.single_node, std::sync::atomic::Ordering::Relaxed);
+        self.state.store(Arc::new(new_state));
     }
 
     pub(crate) async fn node_for_partition(
@@ -101,14 +162,13 @@ impl AffinityCache {
         cache_id: i32,
         partition: i32,
         primary: bool,
-    ) -> Option<String> {
+    ) -> Option<Arc<str>> {
         if partition < 0 {
             return None;
         }
 
-        self.state
-            .read()
-            .await
+        let state = self.state.load();
+        state
             .caches
             .get(&cache_id)
             .and_then(|cache| {
@@ -118,8 +178,39 @@ impl AffinityCache {
                     cache.dc_partition_to_node.get(partition as usize)
                 }
             })
-            .cloned()
-            .flatten()
+            .and_then(|opt| opt.clone())
+    }
+
+    /// Combined lookup: check freshness + compute partition + resolve node — lock-free via ArcSwap.
+    pub(crate) fn resolve_node_for_key(
+        &self,
+        cache_id: i32,
+        marshaled_key: &[u8],
+        primary: bool,
+    ) -> Option<Arc<str>> {
+        let state = self.state.load();
+        // Check freshness
+        if state.topology_version.is_none() || !state.caches.contains_key(&cache_id) {
+            return None; // Caller will ensure_affinity_mapping and retry
+        }
+        let cache = state.caches.get(&cache_id)?;
+        if cache.key_field_mapping_present {
+            return None;
+        }
+        let partition_count = cache.primary_partition_to_node.len() as i32;
+        if partition_count <= 0 {
+            return None;
+        }
+        // Compute partition from key hash
+        let key_hash = affinity_hash_marshaled(marshaled_key)?;
+        let partition = rendezvous_partition(key_hash, partition_count);
+        // Resolve node — all within the same atomic snapshot
+        let mapping = if primary {
+            &cache.primary_partition_to_node
+        } else {
+            &cache.dc_partition_to_node
+        };
+        mapping.get(partition as usize).and_then(|opt| opt.clone())
     }
 
     pub(crate) async fn node_for_marshaled_key(
@@ -127,23 +218,22 @@ impl AffinityCache {
         cache_id: i32,
         marshaled_key: &[u8],
         primary: bool,
-    ) -> Option<String> {
-        let (partition_count, key_field_mapping_present) = {
-            let state = self.state.read().await;
-            let cache = state.caches.get(&cache_id)?;
-            (
-                cache.primary_partition_to_node.len() as i32,
-                cache.key_field_mapping_present,
-            )
-        };
-
-        if key_field_mapping_present || partition_count <= 0 {
+    ) -> Option<Arc<str>> {
+        let state = self.state.load();
+        let cache = state.caches.get(&cache_id)?;
+        let partition_count = cache.primary_partition_to_node.len() as i32;
+        if cache.key_field_mapping_present || partition_count <= 0 {
             return None;
         }
 
         let key_hash = affinity_hash_marshaled(marshaled_key)?;
         let partition = rendezvous_partition(key_hash, partition_count);
-        self.node_for_partition(cache_id, partition, primary).await
+        let mapping = if primary {
+            &cache.primary_partition_to_node
+        } else {
+            &cache.dc_partition_to_node
+        };
+        mapping.get(partition as usize).and_then(|opt| opt.clone())
     }
 }
 
@@ -193,7 +283,7 @@ impl CachePartitionsResponse {
                 }
 
                 let primary_partition_to_node = read_partition_map(reader)?;
-                let primary_partition_to_node: Arc<[Option<String>]> =
+                let primary_partition_to_node: Arc<[Option<Arc<str>>]> =
                     primary_partition_to_node.into();
                 let dc_partition_to_node = if dc_aware {
                     let dc_map = read_partition_map(reader)?;
@@ -254,7 +344,7 @@ pub(crate) fn marshal_key(key: &impl crate::WritableType) -> IgniteResult<Vec<u8
     Ok(bytes)
 }
 
-fn read_partition_map(reader: &mut impl Read) -> IgniteResult<Vec<Option<String>>> {
+fn read_partition_map(reader: &mut impl Read) -> IgniteResult<Vec<Option<Arc<str>>>> {
     let node_count = read_i32(reader)?;
     if node_count < 0 {
         return Err(IgniteError::from("negative affinity node count"));
@@ -268,7 +358,7 @@ fn read_partition_map(reader: &mut impl Read) -> IgniteResult<Vec<Option<String>
     let mut partition_to_node = Vec::new();
 
     for _ in 0..node_count {
-        let node_id = read_uuid_string(reader)?;
+        let node_id: Arc<str> = Arc::from(read_uuid_string(reader)?.as_str());
         let part_count = read_i32(reader)?;
         if part_count < 0 {
             return Err(IgniteError::from("negative affinity partition count"));
@@ -499,27 +589,27 @@ mod tests {
         assert_eq!(cache.primary_partition_to_node.len(), 3);
         assert_eq!(
             cache.primary_partition_to_node[0],
-            Some(MockUuid::new(node_a.0, node_a.1).as_string())
+            Some(MockUuid::new(node_a.0, node_a.1).as_arc_str())
         );
         assert_eq!(
             cache.primary_partition_to_node[1],
-            Some(MockUuid::new(node_b.0, node_b.1).as_string())
+            Some(MockUuid::new(node_b.0, node_b.1).as_arc_str())
         );
         assert_eq!(
             cache.primary_partition_to_node[2],
-            Some(MockUuid::new(node_a.0, node_a.1).as_string())
+            Some(MockUuid::new(node_a.0, node_a.1).as_arc_str())
         );
         assert_eq!(
             cache.dc_partition_to_node[0],
-            Some(MockUuid::new(node_a.0, node_a.1).as_string())
+            Some(MockUuid::new(node_a.0, node_a.1).as_arc_str())
         );
         assert_eq!(
             cache.dc_partition_to_node[1],
-            Some(MockUuid::new(node_b.0, node_b.1).as_string())
+            Some(MockUuid::new(node_b.0, node_b.1).as_arc_str())
         );
         assert_eq!(
             cache.dc_partition_to_node[2],
-            Some(MockUuid::new(node_b.0, node_b.1).as_string())
+            Some(MockUuid::new(node_b.0, node_b.1).as_arc_str())
         );
     }
 
@@ -606,12 +696,12 @@ mod tests {
             Self { most, least }
         }
 
-        fn as_string(self) -> String {
+        fn as_arc_str(self) -> Arc<str> {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&self.most.to_le_bytes());
             bytes.extend_from_slice(&self.least.to_le_bytes());
             let mut cur = Cursor::new(bytes);
-            read_uuid_string(&mut cur).unwrap()
+            Arc::from(read_uuid_string(&mut cur).unwrap().as_str())
         }
     }
 }

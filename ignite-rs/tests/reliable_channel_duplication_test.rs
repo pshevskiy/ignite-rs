@@ -146,15 +146,11 @@ async fn should_not_duplicate_channel_when_discovered_node_is_removed_and_readde
     let client = new_client(ClientConfig::new(&seed_addr)).await.unwrap();
 
     wait_for(
-        || discovered.active_connection_count() == 1,
-        "expected initial discovered-node connection",
+        || discovered.handshake_count() == 1,
+        "expected initial discovered-node handshake",
     )
     .await;
-    assert_eq!(
-        discovered.handshake_count(),
-        1,
-        "expected exactly one initial discovered-node handshake"
-    );
+    assert_eq!(discovered.active_connection_count(), 1);
 
     let _ = client.get_cache_names().await.unwrap();
     wait_for(
@@ -170,12 +166,11 @@ async fn should_not_duplicate_channel_when_discovered_node_is_removed_and_readde
     )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        discovered.handshake_count(),
-        2,
-        "expected one handshake per lifecycle without duplicate recreated channels"
-    );
+    wait_for(
+        || discovered.handshake_count() == 2,
+        "expected one handshake per lifecycle without duplicate recreated channels",
+    )
+    .await;
 
     drop(client);
     drop(seed);

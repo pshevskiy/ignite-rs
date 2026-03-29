@@ -192,7 +192,7 @@ impl ServiceProxy {
         });
 
         let route = preferred_node
-            .map(RequestRoute::preferred_node)
+            .map(|s| RequestRoute::preferred_node(Arc::from(s.as_str())))
             .unwrap_or_default();
 
         let response: NullableValueResponse<R> = self

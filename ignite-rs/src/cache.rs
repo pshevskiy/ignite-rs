@@ -1,4 +1,5 @@
 use std::convert::TryFrom;
+use std::sync::Arc;
 
 use crate::affinity::marshal_key;
 use crate::api::key_value::{
@@ -18,7 +19,9 @@ use crate::error::{IgniteError, IgniteResult};
 
 use crate::api::OpCode;
 use crate::exec::TokioExec;
-use crate::invoke::{InvokeAllRequest, InvokeAllResponse, InvokeAllResult, InvokeRequest};
+use crate::invoke::{
+    InvokeAllPreparedFirstRequest, InvokeAllResponse, InvokeAllResult, InvokeRequest,
+};
 use crate::protocol::complex_obj::IgniteValue;
 use crate::query::continuous::{
     ContinuousQuery, ContinuousQueryCursor, ContinuousQueryRequest, ContinuousQueryResponse,
@@ -589,7 +592,7 @@ impl QueryIndex {
 /// All caches created from the single IgniteClient shares the common TCP connection
 pub struct CacheCore<K: WritableType + ReadableType, V: WritableType + ReadableType> {
     id: i32,
-    pub _name: String,
+    pub _name: Arc<str>,
     exec: TokioExec,
     tx: Option<TransactionContext>,
     expiry_policy: Option<ExpiryPolicy>,
@@ -624,13 +627,13 @@ impl WritableType for PreparedKey {
 }
 
 impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K, V> {
-    pub(crate) fn new(id: i32, name: String, exec: TokioExec) -> CacheCore<K, V> {
+    pub(crate) fn new(id: i32, name: Arc<str>, exec: TokioExec) -> CacheCore<K, V> {
         Self::new_with_tx(id, name, exec, None)
     }
 
     pub(crate) fn new_with_tx(
         id: i32,
-        name: String,
+        name: Arc<str>,
         exec: TokioExec,
         tx: Option<TransactionContext>,
     ) -> CacheCore<K, V> {
@@ -698,20 +701,6 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         }
     }
 
-    async fn route_for_key(&self, key: &K, primary: bool) -> IgniteResult<Option<RequestRoute>> {
-        if let Some(route) = self.tx_route().await? {
-            return Ok(Some(route));
-        }
-
-        let marshaled_key = marshal_key(key)?;
-
-        Ok(self
-            .exec
-            .affinity_node_for_key(self.id, &marshaled_key, primary)
-            .await
-            .map(RequestRoute::preferred_node))
-    }
-
     async fn prepare_key_route(
         &self,
         key: &K,
@@ -720,12 +709,16 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         let prepared_key = PreparedKey::new(key)?;
         let route = match self.tx_route().await? {
             Some(route) => route,
-            None => self
-                .exec
-                .affinity_node_for_key(self.id, prepared_key.as_marshaled(), primary)
-                .await
-                .map(RequestRoute::preferred_node)
-                .unwrap_or_default(),
+            None => {
+                match self
+                    .exec
+                    .affinity_node_for_key(self.id, prepared_key.as_marshaled(), primary)
+                    .await
+                {
+                    Some(node_id) => RequestRoute::preferred_node(node_id),
+                    None => RequestRoute::default(),
+                }
+            }
         };
         Ok((prepared_key, route))
     }
@@ -1538,20 +1531,30 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         args: &[IgniteValue],
     ) -> IgniteResult<Vec<(Option<K>, InvokeAllResult<R>)>> {
         self.ensure_tx_cache_ops_allowed().await?;
-        let route = match keys.first() {
-            Some(first) => self.route_for_key(first, true).await?,
-            None => self.tx_route().await?,
-        }
-        .unwrap_or_default();
+        let (first_key, remaining_keys) = match keys.split_first() {
+            Some((first, remaining)) => (Some(PreparedKey::new(first)?), remaining),
+            None => (None, &[][..]),
+        };
+        let route = match (self.tx_route().await?, first_key.as_ref()) {
+            (Some(route), _) => route,
+            (None, Some(first_key)) => self
+                .exec
+                .affinity_node_for_key(self.id, first_key.as_marshaled(), true)
+                .await
+                .map(RequestRoute::preferred_node)
+                .unwrap_or_default(),
+            (None, None) => RequestRoute::default(),
+        };
 
         let resp: InvokeAllResponse<K, R> = self
             .map_tx_err(
                 self.exec
                     .send_and_read_with_route(
                         OpCode::CacheInvokeAll,
-                        InvokeAllRequest {
+                        InvokeAllPreparedFirstRequest {
                             cache_info: self.cache_info(false)?,
-                            keys,
+                            first_key: first_key.as_ref(),
+                            remaining_keys,
                             processor,
                             args,
                         },

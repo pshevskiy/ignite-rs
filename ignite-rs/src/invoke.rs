@@ -44,18 +44,25 @@ impl<K: WritableType> WriteableReq for InvokeRequest<'_, K> {
     }
 }
 
-pub(crate) struct InvokeAllRequest<'a, K> {
+pub(crate) struct InvokeAllPreparedFirstRequest<'a, F, K> {
     pub(crate) cache_info: CacheInfo,
-    pub(crate) keys: &'a [K],
+    pub(crate) first_key: Option<&'a F>,
+    pub(crate) remaining_keys: &'a [K],
     pub(crate) processor: &'a BinaryObject,
     pub(crate) args: &'a [IgniteValue],
 }
 
-impl<K: WritableType> WriteableReq for InvokeAllRequest<'_, K> {
+impl<F: WritableType, K: WritableType> WriteableReq for InvokeAllPreparedFirstRequest<'_, F, K> {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
         write_cache_info(writer, self.cache_info.with_keep_binary(true))?;
-        crate::protocol::write_i32(writer, self.keys.len() as i32)?;
-        for key in self.keys {
+        crate::protocol::write_i32(
+            writer,
+            (usize::from(self.first_key.is_some()) + self.remaining_keys.len()) as i32,
+        )?;
+        if let Some(first_key) = self.first_key {
+            first_key.write(writer)?;
+        }
+        for key in self.remaining_keys {
             key.write(writer)?;
         }
         self.processor.write(writer)?;
@@ -70,7 +77,12 @@ impl<K: WritableType> WriteableReq for InvokeAllRequest<'_, K> {
     fn size(&self) -> usize {
         cache_info_size(self.cache_info.with_keep_binary(true))
             + 4
-            + self.keys.iter().map(WritableType::size).sum::<usize>()
+            + self.first_key.map(WritableType::size).unwrap_or(0)
+            + self
+                .remaining_keys
+                .iter()
+                .map(WritableType::size)
+                .sum::<usize>()
             + self.processor.size()
             + 1
             + 4

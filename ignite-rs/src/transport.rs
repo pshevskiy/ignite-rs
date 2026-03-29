@@ -13,8 +13,8 @@ use crate::protocol::{
 };
 use crate::topology::{DiscoveredNode, TopologyCache, TopologySnapshot, TopologyVersion};
 use crate::{ClientConfig, ReadableReq, RetryContext, RetryDecision, RetryPolicy, WriteableReq};
+use arc_swap::ArcSwap;
 use std::cmp;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io;
@@ -183,7 +183,9 @@ struct Channel {
     request_timeout: Option<Duration>,
     metadata: ConnectionMetadata,
     writer_tx: mpsc::UnboundedSender<OutboundRequest>,
-    inflight: Mutex<HashMap<i64, oneshot::Sender<IgniteResult<ResponseFrame>>>>,
+    /// Sharded inflight map — reduces Mutex contention under concurrent load.
+    /// Shard selected by corr_id % SHARD_COUNT.
+    inflight_shards: Box<[StdMutex<HashMap<i64, oneshot::Sender<IgniteResult<ResponseFrame>>>>]>,
     notification_listeners:
         Mutex<HashMap<(i16, i64), mpsc::UnboundedSender<IgniteResult<NotificationFrame>>>>,
     pending_notifications: Mutex<HashMap<(i16, i64), Vec<NotificationFrame>>>,
@@ -210,7 +212,10 @@ impl Channel {
             request_timeout,
             metadata,
             writer_tx,
-            inflight: Mutex::new(HashMap::new()),
+            inflight_shards: (0..16)
+                .map(|_| StdMutex::new(HashMap::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             notification_listeners: Mutex::new(HashMap::new()),
             pending_notifications: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
@@ -219,6 +224,14 @@ impl Channel {
             writer_pump: StdMutex::new(None),
             response_pump: StdMutex::new(None),
         })
+    }
+
+    #[inline]
+    fn inflight_shard(
+        &self,
+        corr_id: i64,
+    ) -> &StdMutex<HashMap<i64, oneshot::Sender<IgniteResult<ResponseFrame>>>> {
+        &self.inflight_shards[(corr_id as usize) % self.inflight_shards.len()]
     }
 
     async fn connect(conf: &ClientConfig, address: String) -> IgniteResult<Arc<Self>> {
@@ -284,17 +297,26 @@ impl Channel {
         }
 
         let (tx, rx) = oneshot::channel();
-        self.inflight.lock().await.insert(corr_id, tx);
+        self.inflight_shard(corr_id)
+            .lock()
+            .unwrap()
+            .insert(corr_id, tx);
 
         if self.writer_tx.send(OutboundRequest { request }).is_err() {
-            self.inflight.lock().await.remove(&corr_id);
+            self.inflight_shard(corr_id)
+                .lock()
+                .unwrap()
+                .remove(&corr_id);
             return Err(self.closed_error().await);
         }
 
         let frame = match self.await_response(corr_id, rx).await {
             Ok(frame) => frame,
             Err(err) => {
-                self.inflight.lock().await.remove(&corr_id);
+                self.inflight_shard(corr_id)
+                    .lock()
+                    .unwrap()
+                    .remove(&corr_id);
                 return Err(err);
             }
         };
@@ -409,7 +431,11 @@ impl Channel {
             loop {
                 match read_incoming_frame(&mut reader, &channel.metadata).await {
                     Ok(IncomingFrame::Response(frame)) => {
-                        let waiter = channel.inflight.lock().await.remove(&frame.correlation_id);
+                        let waiter = channel
+                            .inflight_shard(frame.correlation_id)
+                            .lock()
+                            .unwrap()
+                            .remove(&frame.correlation_id);
                         if let Some(waiter) = waiter {
                             let _ = waiter.send(Ok(frame));
                         }
@@ -439,13 +465,15 @@ impl Channel {
             return;
         }
 
-        let pending = {
-            let mut inflight = self.inflight.lock().await;
-            std::mem::take(&mut *inflight)
-        };
-
-        for (_, waiter) in pending {
-            let _ = waiter.send(Err(IgniteError::connection(detail.as_str())));
+        // Drain all inflight shards
+        for shard in self.inflight_shards.iter() {
+            let pending = {
+                let mut shard = shard.lock().unwrap();
+                std::mem::take(&mut *shard)
+            };
+            for (_, waiter) in pending {
+                let _ = waiter.send(Err(IgniteError::connection(detail.as_str())));
+            }
         }
 
         let listeners = {
@@ -545,17 +573,37 @@ fn aggregate_connect_errors(errors: Vec<IgniteError>) -> IgniteError {
     }
 }
 
+fn build_channels_by_address(
+    channels: &HashMap<String, Arc<Channel>>,
+) -> HashMap<Arc<str>, Vec<Arc<Channel>>> {
+    let mut by_address: HashMap<Arc<str>, Vec<Arc<Channel>>> = HashMap::new();
+    for channel in channels.values() {
+        by_address
+            .entry(Arc::from(channel.address()))
+            .or_default()
+            .push(channel.clone());
+    }
+    by_address
+}
+
 pub(crate) struct ChannelManager {
     conf: ClientConfig,
     affinity: AffinityCache,
     topology: TopologyCache,
     event_bus: EventBus,
     channels: RwLock<HashMap<String, Arc<Channel>>>,
+    channels_by_address: ArcSwap<HashMap<Arc<str>, Vec<Arc<Channel>>>>,
+    /// Lock-free node_id → channel index for partition-aware routing.
+    /// Uses ArcSwap for zero-cost reads (equivalent to Java volatile).
+    node_channels: ArcSwap<HashMap<Arc<str>, Arc<Channel>>>,
     active: RwLock<Arc<Channel>>,
+    cached_active_tx: tokio::sync::watch::Sender<Arc<Channel>>,
+    cached_active_rx: tokio::sync::watch::Receiver<Arc<Channel>>,
     reconnect_guard: Mutex<()>,
     discovery_refresh_guard: Mutex<()>,
     channel_connect_guard: Mutex<()>,
     next_correlation_id: AtomicI64,
+    next_channel_key: AtomicI64,
     next_default_channel_index: AtomicI64,
     reconnect_attempts: StdMutex<VecDeque<Instant>>,
     shutdown: Arc<AtomicBool>,
@@ -564,7 +612,7 @@ pub(crate) struct ChannelManager {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestRoute {
     pinned_address: Option<String>,
-    preferred_node_id: Option<String>,
+    preferred_node_id: Option<Arc<str>>,
     allow_retry: bool,
 }
 
@@ -577,7 +625,7 @@ impl RequestRoute {
         }
     }
 
-    pub(crate) fn preferred_node(node_id: String) -> Self {
+    pub(crate) fn preferred_node(node_id: Arc<str>) -> Self {
         Self {
             pinned_address: None,
             preferred_node_id: Some(node_id),
@@ -619,8 +667,25 @@ impl ChannelManager {
         let topology = TopologyCache::new(seed_endpoints);
         let active =
             Self::connect_any_initial(&conf, &topology, &event_bus, start_index, false).await?;
+        let address = active.address().to_string();
         let mut channels = HashMap::new();
-        channels.insert(active.address().to_string(), active.clone());
+        channels.insert(format!("{}#pool0", address), active.clone());
+
+        for i in 1..conf.connection_pool_size {
+            match Channel::connect(&conf, address.clone()).await {
+                Ok(ch) => {
+                    channels.insert(format!("{}#pool{}", address, i), ch);
+                }
+                Err(_) => {
+                    // Silently skip — the pool will have fewer connections
+                    // than requested, but at least one is guaranteed.
+                }
+            }
+        }
+        let channels_by_address = build_channels_by_address(&channels);
+        let next_channel_key = conf.connection_pool_size as i64;
+
+        let (cached_active_tx, cached_active_rx) = tokio::sync::watch::channel(active.clone());
 
         let manager = Self {
             conf,
@@ -628,11 +693,16 @@ impl ChannelManager {
             topology,
             event_bus,
             channels: RwLock::new(channels),
+            channels_by_address: ArcSwap::from_pointee(channels_by_address),
+            node_channels: ArcSwap::from_pointee(HashMap::new()),
             active: RwLock::new(active.clone()),
+            cached_active_tx,
+            cached_active_rx,
             reconnect_guard: Mutex::new(()),
             discovery_refresh_guard: Mutex::new(()),
             channel_connect_guard: Mutex::new(()),
             next_correlation_id: AtomicI64::new(1),
+            next_channel_key: AtomicI64::new(next_channel_key),
             next_default_channel_index: AtomicI64::new(0),
             reconnect_attempts: StdMutex::new(VecDeque::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -681,6 +751,44 @@ impl ChannelManager {
                 manager.heartbeat_tick(interval).await;
             }
         });
+    }
+
+    fn store_channels_by_address(&self, channels: &HashMap<String, Arc<Channel>>) {
+        self.channels_by_address
+            .store(Arc::new(build_channels_by_address(channels)));
+    }
+
+    async fn insert_channel(&self, channel: Arc<Channel>) {
+        let key = format!(
+            "{}#ch{}",
+            channel.address(),
+            self.next_channel_key.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut channels = self.channels.write().await;
+        channels.insert(key, channel);
+        self.store_channels_by_address(&channels);
+    }
+
+    fn available_channels_from_index(&self, addresses: &[String]) -> Vec<Arc<Channel>> {
+        let indexed = self.channels_by_address.load();
+        let mut available = Vec::new();
+        let mut seen = HashSet::new();
+
+        for address in addresses {
+            if let Some(group) = indexed.get(address.as_str()) {
+                for channel in group {
+                    if !channel.is_available() {
+                        continue;
+                    }
+                    let ptr = Arc::as_ptr(channel) as usize;
+                    if seen.insert(ptr) {
+                        available.push(channel.clone());
+                    }
+                }
+            }
+        }
+
+        available
     }
 
     pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<crate::events::ClientEvent> {
@@ -736,8 +844,8 @@ impl ChannelManager {
     ) -> IgniteResult<()> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let request = Self::encode_request(op_code as i16, corr_id, &data)?;
-        let (flag, _body, _meta) = self
-            .round_trip_with_route(op_code as i16, corr_id, request, true, route)
+        let (flag, _body) = self
+            .round_trip_no_meta(op_code as i16, corr_id, request, true, route)
             .await?;
         match flag {
             Success => Ok(()),
@@ -760,8 +868,18 @@ impl ChannelManager {
         data: impl WriteableReq,
         route: RequestRoute,
     ) -> IgniteResult<T> {
-        let (value, _meta) = self.send_and_read_with_meta(op_code, data, route).await?;
-        Ok(value)
+        let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let (flag, body) = self
+            .round_trip_no_meta(op_code as i16, corr_id, request, true, route)
+            .await?;
+        match flag {
+            Success => {
+                let mut cur = Cursor::new(body);
+                Ok(T::read(&mut cur)?)
+            }
+            Failure { err_msg } => Err(classify_server_error(&err_msg)),
+        }
     }
 
     pub(crate) async fn send_and_read_with_meta<T: ReadableReq>(
@@ -876,59 +994,70 @@ impl ChannelManager {
         &self,
         op_code: i16,
         corr_id: i64,
-        request: Vec<u8>,
+        mut request: Vec<u8>,
         emit_request_events: bool,
     ) -> IgniteResult<(Flag, Vec<u8>, ResponseMeta)> {
         let max_attempts = self.max_attempts();
         let mut attempt = 0usize;
         let mut started_emitted = false;
+        let track_events = emit_request_events && self.event_bus.has_request_subscribers();
 
         loop {
             let channel = self.default_channel().await;
-            let address = channel.address().to_string();
 
-            if emit_request_events && !started_emitted {
+            if track_events && !started_emitted {
                 self.event_bus.emit_request(
                     RequestEventKind::Started,
                     op_code,
                     corr_id,
-                    address.clone(),
+                    channel.address().to_string(),
                     None,
                 );
                 started_emitted = true;
             }
 
-            match channel.request(corr_id, request.clone()).await {
+            // Avoid cloning request on last attempt (pass by ownership).
+            let is_last = attempt + 1 >= max_attempts;
+            let req = if is_last {
+                std::mem::take(&mut request)
+            } else {
+                request.clone()
+            };
+            match channel.request(corr_id, req).await {
                 Ok(response) => {
                     if let Some(version) = response.topology_version {
                         self.handle_topology_change(version).await;
                     }
 
-                    if emit_request_events {
+                    if track_events {
+                        let address = channel.address().to_string();
                         match &response.flag {
                             Success => self.event_bus.emit_request(
                                 RequestEventKind::Succeeded,
                                 op_code,
                                 corr_id,
-                                address.clone(),
+                                address,
                                 None,
                             ),
                             Failure { err_msg } => self.event_bus.emit_request(
                                 RequestEventKind::Failed,
                                 op_code,
                                 corr_id,
-                                address.clone(),
+                                address,
                                 Some(err_msg.clone()),
                             ),
                         }
                     }
 
+                    // Lazy address: only allocate when caller needs ResponseMeta
+                    let address = channel.address().to_string();
                     return Ok((response.flag, response.body, ResponseMeta { address }));
                 }
                 Err(err) => {
+                    let address = channel.address().to_string();
                     let err_desc = err.to_string();
 
-                    if emit_request_events {
+                    if track_events {
                         self.event_bus.emit_request(
                             RequestEventKind::Failed,
                             op_code,
@@ -952,7 +1081,7 @@ impl ChannelManager {
                         return Err(err);
                     }
 
-                    if emit_request_events {
+                    if track_events {
                         self.event_bus.emit_request(
                             RequestEventKind::Retried,
                             op_code,
@@ -967,6 +1096,21 @@ impl ChannelManager {
                 }
             }
         }
+    }
+
+    /// Fast round-trip — skips ResponseMeta allocation, optimized for both default and preferred_node routes.
+    async fn round_trip_no_meta(
+        &self,
+        op_code: i16,
+        corr_id: i64,
+        request: Vec<u8>,
+        emit_request_events: bool,
+        route: RequestRoute,
+    ) -> IgniteResult<(Flag, Vec<u8>)> {
+        let (flag, body, _meta) = self
+            .round_trip_with_route(op_code, corr_id, request, emit_request_events, route)
+            .await?;
+        Ok((flag, body))
     }
 
     async fn round_trip_with_route(
@@ -996,65 +1140,82 @@ impl ChannelManager {
                 ))
             }
         };
-        let address = channel.address().to_string();
+        // Avoid allocating address String unless events are subscribed.
+        let track_events = emit_request_events && self.event_bus.has_request_subscribers();
+        let address = if track_events {
+            Some(channel.address().to_string())
+        } else {
+            None
+        };
 
-        if emit_request_events {
+        if let Some(ref addr) = address {
             self.event_bus.emit_request(
                 RequestEventKind::Started,
                 op_code,
                 corr_id,
-                address.clone(),
+                addr.clone(),
                 None,
             );
         }
 
-        match channel.request(corr_id, request.clone()).await {
+        // Pass request by ownership — only clone for the retry path.
+        let retry_request = if route.allow_retry {
+            Some(request.clone())
+        } else {
+            None
+        };
+        match channel.request(corr_id, request).await {
             Ok(response) => {
                 if let Some(version) = response.topology_version {
                     self.handle_topology_change(version).await;
                 }
 
-                if emit_request_events {
+                if let Some(ref addr) = address {
                     match &response.flag {
                         Success => self.event_bus.emit_request(
                             RequestEventKind::Succeeded,
                             op_code,
                             corr_id,
-                            address.clone(),
+                            addr.clone(),
                             None,
                         ),
                         Failure { err_msg } => self.event_bus.emit_request(
                             RequestEventKind::Failed,
                             op_code,
                             corr_id,
-                            address.clone(),
+                            addr.clone(),
                             Some(err_msg.clone()),
                         ),
                     }
                 }
 
-                Ok((response.flag, response.body, ResponseMeta { address }))
+                let meta_addr = address.unwrap_or_else(|| channel.address().to_string());
+                Ok((
+                    response.flag,
+                    response.body,
+                    ResponseMeta { address: meta_addr },
+                ))
             }
             Err(err) => {
-                if emit_request_events {
+                let addr_str = address.unwrap_or_else(|| channel.address().to_string());
+                if track_events {
                     self.event_bus.emit_request(
                         RequestEventKind::Failed,
                         op_code,
                         corr_id,
-                        address.clone(),
+                        addr_str.clone(),
                         Some(err.to_string()),
                     );
                 }
-
                 self.event_bus.emit_connection(
                     ConnectionEventKind::Closed,
-                    address.clone(),
+                    addr_str,
                     Some(err.to_string()),
                 );
 
-                if route.allow_retry {
+                if let Some(retry_req) = retry_request {
                     self.affinity.invalidate().await;
-                    self.round_trip_internal(op_code, corr_id, request, emit_request_events)
+                    self.round_trip_internal(op_code, corr_id, retry_req, emit_request_events)
                         .await
                 } else {
                     Err(err)
@@ -1076,6 +1237,7 @@ impl ChannelManager {
         let start_index = self.topology.next_index_after(failed_address).await;
         let channel = self.connect_any(start_index, true).await?;
         *self.active.write().await = channel.clone();
+        let _ = self.cached_active_tx.send(channel.clone());
         self.prune_removed_seed_channels(&removed_seed_endpoints, channel.address())
             .await;
         Ok(channel)
@@ -1091,10 +1253,7 @@ impl ChannelManager {
             let address = addresses[index].clone();
             let connect_result = {
                 let _connect_guard = self.channel_connect_guard.lock().await;
-                let existing = {
-                    let channels = self.channels.read().await;
-                    channels.get(&address).cloned()
-                };
+                let existing = self.channel_for_address(&address).await;
 
                 if let Some(existing) = existing {
                     if existing.is_available() {
@@ -1112,14 +1271,7 @@ impl ChannelManager {
 
                         match Channel::connect(&self.conf, address.clone()).await {
                             Ok(channel) => {
-                                match self.channels.write().await.entry(address.clone()) {
-                                    Entry::Vacant(entry) => {
-                                        entry.insert(channel.clone());
-                                    }
-                                    Entry::Occupied(mut entry) => {
-                                        entry.insert(channel.clone());
-                                    }
-                                }
+                                self.insert_channel(channel.clone()).await;
                                 Ok((channel, true))
                             }
                             Err(err) => Err(err),
@@ -1138,10 +1290,7 @@ impl ChannelManager {
 
                     match Channel::connect(&self.conf, address.clone()).await {
                         Ok(channel) => {
-                            self.channels
-                                .write()
-                                .await
-                                .insert(address.clone(), channel.clone());
+                            self.insert_channel(channel.clone()).await;
                             Ok((channel, true))
                         }
                         Err(err) => Err(err),
@@ -1291,6 +1440,10 @@ impl ChannelManager {
     async fn default_channel(&self) -> Arc<Channel> {
         let candidates = self.default_channel_candidates().await;
         if candidates.is_empty() {
+            let cached = self.cached_active_rx.borrow().clone();
+            if cached.is_available() {
+                return cached;
+            }
             return self.active.read().await.clone();
         }
         if candidates.len() == 1 {
@@ -1309,7 +1462,7 @@ impl ChannelManager {
             return self.channel_for_address(address).await;
         }
 
-        if let Some(node_id) = route.preferred_node_id.as_deref() {
+        if let Some(ref node_id) = route.preferred_node_id {
             if let Some(channel) = self.channel_for_node_id(node_id).await {
                 return Some(channel);
             }
@@ -1356,40 +1509,22 @@ impl ChannelManager {
     /// active channel.  This is used for DC-aware routing where only channels
     /// belonging to the current data-center should be considered.
     async fn dc_channels_by_addresses(&self, addresses: Vec<String>) -> Vec<Arc<Channel>> {
-        let channels = self.channels.read().await;
-        let mut available = Vec::new();
-        let mut seen = HashSet::new();
-
-        for address in addresses {
-            let Some(channel) = channels.get(&address) else {
-                continue;
-            };
-            if !channel.is_available() || !seen.insert(address) {
-                continue;
-            }
-            available.push(channel.clone());
-        }
-
-        available
+        self.available_channels_from_index(&addresses)
     }
 
     async fn available_channels_by_addresses(&self, addresses: Vec<String>) -> Vec<Arc<Channel>> {
         let active = self.active.read().await.clone();
-        let channels = self.channels.read().await;
-        let mut available = Vec::new();
-        let mut seen = HashSet::new();
+        let mut available = self.available_channels_from_index(&addresses);
+        let mut seen_active = false;
 
-        for address in addresses {
-            let Some(channel) = channels.get(&address) else {
-                continue;
-            };
-            if !channel.is_available() || !seen.insert(address) {
-                continue;
+        for channel in &available {
+            if Arc::ptr_eq(channel, &active) {
+                seen_active = true;
+                break;
             }
-            available.push(channel.clone());
         }
 
-        if active.is_available() && seen.insert(active.address().to_string()) {
+        if !seen_active && active.is_available() {
             available.push(active);
         }
 
@@ -1397,23 +1532,38 @@ impl ChannelManager {
     }
 
     async fn channel_for_address(&self, address: &str) -> Option<Arc<Channel>> {
-        self.channels
-            .read()
-            .await
+        let indexed = self.channels_by_address.load();
+        indexed
             .get(address)
-            .cloned()
-            .filter(|channel| channel.is_available())
+            .and_then(|group| group.iter().find(|ch| ch.is_available()).cloned())
     }
 
-    async fn channel_for_node_id(&self, node_id: &str) -> Option<Arc<Channel>> {
+    async fn channel_for_node_id(&self, node_id: &Arc<str>) -> Option<Arc<Channel>> {
+        // Fast path: lock-free O(1) lookup via ArcSwap
         {
-            let channels = self.channels.read().await;
-            if let Some(existing) = channels
-                .values()
-                .find(|channel| channel.is_available() && channel.server_node_id() == Some(node_id))
-            {
-                return Some(existing.clone());
+            let nc = self.node_channels.load();
+            if let Some(ch) = nc.get(node_id.as_ref()) {
+                if ch.is_available() {
+                    return Some(ch.clone());
+                }
             }
+        }
+        // Slow path: linear scan of all channels
+        let found = {
+            let channels = self.channels.read().await;
+            channels
+                .values()
+                .find(|channel| {
+                    channel.is_available() && channel.server_node_id() == Some(node_id.as_ref())
+                })
+                .cloned()
+        };
+        if let Some(existing) = found {
+            let mut new_map: HashMap<Arc<str>, Arc<Channel>> =
+                (**self.node_channels.load()).clone();
+            new_map.insert(node_id.clone(), existing.clone());
+            self.node_channels.store(new_map.into());
+            return Some(existing);
         }
 
         let endpoints = self.topology.endpoints_for_node(node_id).await;
@@ -1442,10 +1592,8 @@ impl ChannelManager {
         let channel = {
             let _connect_guard = self.channel_connect_guard.lock().await;
 
-            if let Some(existing) = self.channels.read().await.get(&address).cloned() {
-                if existing.is_available() {
-                    return Ok(existing);
-                }
+            if let Some(existing) = self.channel_for_address(&address).await {
+                return Ok(existing);
             }
 
             self.event_bus.emit_connection(
@@ -1455,10 +1603,7 @@ impl ChannelManager {
             );
 
             let channel = Channel::connect(&self.conf, address.clone()).await?;
-            self.channels
-                .write()
-                .await
-                .insert(address.clone(), channel.clone());
+            self.insert_channel(channel.clone()).await;
             channel
         };
         self.on_channel_connected(channel.clone()).await;
@@ -1472,11 +1617,22 @@ impl ChannelManager {
         cache_id: i32,
         marshaled_key: &[u8],
         primary: bool,
-    ) -> Option<String> {
+    ) -> Option<Arc<str>> {
         if !self.conf.partition_awareness_enabled {
             return None;
         }
-
+        // Fast path: single-node cluster — no routing needed
+        if self.affinity.is_single_node() {
+            return None;
+        }
+        // Lock-free lookup via ArcSwap: freshness check + partition resolve in ONE atomic load.
+        if let Some(node) = self
+            .affinity
+            .resolve_node_for_key(cache_id, marshaled_key, primary)
+        {
+            return Some(node);
+        }
+        // Slow path: mapping was stale — refresh and retry
         self.ensure_affinity_mapping(cache_id).await.ok()?;
         self.affinity
             .node_for_marshaled_key(cache_id, marshaled_key, primary)
@@ -1488,7 +1644,7 @@ impl ChannelManager {
         cache_id: i32,
         partition: i32,
         primary: bool,
-    ) -> Option<String> {
+    ) -> Option<Arc<str>> {
         if !self.conf.partition_awareness_enabled {
             return None;
         }
@@ -1554,12 +1710,7 @@ impl ChannelManager {
     }
 
     async fn on_channel_connected(&self, channel: Arc<Channel>) {
-        if let Some(node_id) = channel.server_node_id() {
-            self.topology.record_node(node_id.to_string()).await;
-            self.topology
-                .record_node_endpoint(node_id.to_string(), channel.address().to_string())
-                .await;
-        }
+        self.cache_channel_identity(channel.clone()).await;
 
         if !self.conf.partition_awareness_enabled {
             return;
@@ -1579,6 +1730,20 @@ impl ChannelManager {
         }
 
         self.prime_discovered_channels(channel.address()).await;
+    }
+
+    async fn cache_channel_identity(&self, channel: Arc<Channel>) {
+        if let Some(node_id) = channel.server_node_id() {
+            self.topology.record_node(node_id.to_string()).await;
+            self.topology
+                .record_node_endpoint(node_id.to_string(), channel.address().to_string())
+                .await;
+            // Cache node_id → channel for O(1) routing (lock-free via ArcSwap)
+            let mut new_map: HashMap<Arc<str>, Arc<Channel>> =
+                (**self.node_channels.load()).clone();
+            new_map.insert(Arc::from(node_id), channel.clone());
+            self.node_channels.store(new_map.into());
+        }
     }
 
     async fn handle_topology_change(&self, version: TopologyVersion) {
@@ -1725,15 +1890,8 @@ impl ChannelManager {
 
             let connect_result = {
                 let _connect_guard = self.channel_connect_guard.lock().await;
-                let existing = {
-                    let channels = self.channels.read().await;
-                    channels.get(&address).cloned()
-                };
-
-                if let Some(existing) = existing {
-                    if existing.is_available() {
-                        continue;
-                    }
+                if self.channel_for_address(&address).await.is_some() {
+                    continue;
                 }
 
                 self.event_bus.emit_connection(
@@ -1744,14 +1902,7 @@ impl ChannelManager {
 
                 match Channel::connect(&self.conf, address.clone()).await {
                     Ok(channel) => {
-                        match self.channels.write().await.entry(address.clone()) {
-                            Entry::Vacant(entry) => {
-                                entry.insert(channel.clone());
-                            }
-                            Entry::Occupied(mut entry) => {
-                                entry.insert(channel.clone());
-                            }
-                        }
+                        self.insert_channel(channel.clone()).await;
                         Ok(channel)
                     }
                     Err(err) => Err(err),
@@ -1760,10 +1911,7 @@ impl ChannelManager {
 
             match connect_result {
                 Ok(channel) => {
-                    if let Some(node_id) = channel.server_node_id() {
-                        self.topology.record_node(node_id.to_string()).await;
-                    }
-
+                    self.cache_channel_identity(channel.clone()).await;
                     self.event_bus
                         .emit_connection(ConnectionEventKind::Connected, address, None);
                 }
@@ -1781,6 +1929,23 @@ impl ChannelManager {
     async fn prune_removed_node_channels(&self, removed_node_ids: &[String]) {
         if removed_node_ids.is_empty() {
             return;
+        }
+
+        // Prune node_channels cache (lock-free swap)
+        {
+            let current = self.node_channels.load();
+            let new_map: HashMap<Arc<str>, Arc<Channel>> = current
+                .iter()
+                .filter(|(node_id, _)| {
+                    !removed_node_ids
+                        .iter()
+                        .any(|removed| removed.as_str() == node_id.as_ref())
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if new_map.len() != current.len() {
+                self.node_channels.store(new_map.into());
+            }
         }
 
         let removed_channels = {
@@ -1803,6 +1968,7 @@ impl ChannelManager {
                     removed_channels.push(channel);
                 }
             }
+            self.store_channels_by_address(&channels);
 
             removed_channels
         };
@@ -1838,10 +2004,18 @@ impl ChannelManager {
                     continue;
                 }
 
-                if let Some(channel) = channels.remove(address) {
-                    removed_channels.push(channel);
+                let keys_to_remove: Vec<String> = channels
+                    .iter()
+                    .filter(|(_, channel)| channel.address() == address)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys_to_remove {
+                    if let Some(channel) = channels.remove(&key) {
+                        removed_channels.push(channel);
+                    }
                 }
             }
+            self.store_channels_by_address(&channels);
 
             removed_channels
         };

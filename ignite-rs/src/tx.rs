@@ -147,7 +147,7 @@ impl Transaction {
         let id = crate::utils::string_to_java_hashcode(name);
         CacheCore::new_with_tx(
             id,
-            name.to_owned(),
+            Arc::from(name),
             self.inner.exec.clone(),
             Some(TransactionContext {
                 inner: self.inner.clone(),

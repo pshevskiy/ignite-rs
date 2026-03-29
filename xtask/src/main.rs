@@ -56,8 +56,7 @@ fn run_test_matrix(bucket_filter: Option<Bucket>) -> Result<()> {
         .filter(|p| **p != "none")
         .map(|p| p.to_string())
         .collect();
-    cleanup_profiles(&workspace_root, &all_profiles)
-        .context("failed initial global cleanup")?;
+    cleanup_profiles(&workspace_root, &all_profiles).context("failed initial global cleanup")?;
 
     run_cargo_check(&workspace_root)?;
 

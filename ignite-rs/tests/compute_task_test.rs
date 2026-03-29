@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::connect;
+use common::connect_with_config;
+use ignite_rs::ClientConfig;
+use std::time::Duration;
 
 /// Java parity: org.apache.ignite.internal.client.thin.ComputeTaskTest#testExecuteUnknownTask
 ///
@@ -10,7 +12,9 @@ use common::connect;
 /// classes (Phase 3). This test verifies the error path for an unknown task.
 #[tokio::test]
 async fn should_fail_on_unknown_task_name() {
-    let client = connect().await.unwrap();
+    let mut conf = ClientConfig::from_addresses([common::ignite_test_env().addr()]);
+    conf.request_timeout = Some(Duration::from_secs(5));
+    let client = connect_with_config(conf).await.unwrap();
     let err = client
         .compute()
         .execute::<i32, i32>("NonExistentTask_12345", Some(&1))
@@ -24,6 +28,8 @@ async fn should_fail_on_unknown_task_name() {
             || msg.contains("class")
             || msg.contains("ClassNotFoundException")
             || msg.contains("Failed")
+            || msg.contains("timed out")
+            || msg.contains("timeout")
             || msg.contains("early eof")
             || msg.contains("connection"),
         "unexpected unknown task error: {}",

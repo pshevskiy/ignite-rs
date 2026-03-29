@@ -35,6 +35,13 @@ pub enum IgniteValue {
     Timestamp(i64, i32), // milliseconds since 1 Jan 1970 UTC, Nanosecond fraction of a millisecond.
     Decimal(i32, Vec<u8>), // scale, big int value in bytes
     Null,
+    /// Map: (map_subtype, entries). Subtype: 1=HashMap, 2=LinkedHashMap.
+    Map(u8, Vec<(IgniteValue, IgniteValue)>),
+    /// Collection: (col_subtype, elements). Subtype: 1=ArrayList, 2=LinkedList, 3=HashSet, 4=LinkedHashSet.
+    Collection(u8, Vec<IgniteValue>),
+    /// OptimizedMarshaller opaque blob (TypeCode 0xFE + length + data).
+    /// Used for JDK-serialized objects that can't be represented as native Ignite types.
+    OpaqueMarshal(Vec<u8>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -58,6 +65,8 @@ pub enum IgniteType {
     Decimal(i32, i32), // precision, scale
     Enum,
     Null,
+    Map,
+    Collection,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -173,6 +182,28 @@ impl ComplexObject {
                 }
                 IgniteValue::Null => {
                     write_null(&mut values)?;
+                }
+                IgniteValue::Map(map_type, entries) => {
+                    write_u8(&mut values, TypeCode::Map as u8)?;
+                    write_i32(&mut values, entries.len() as i32)?;
+                    write_u8(&mut values, *map_type)?;
+                    for (k, v) in entries {
+                        k.write(&mut values)?;
+                        v.write(&mut values)?;
+                    }
+                }
+                IgniteValue::Collection(col_type, items) => {
+                    write_u8(&mut values, TypeCode::Collection as u8)?;
+                    write_i32(&mut values, items.len() as i32)?;
+                    write_u8(&mut values, *col_type)?;
+                    for item in items {
+                        item.write(&mut values)?;
+                    }
+                }
+                IgniteValue::OpaqueMarshal(data) => {
+                    write_u8(&mut values, TypeCode::OptimizedMarshaller as u8)?;
+                    write_i32(&mut values, data.len() as i32)?;
+                    values.write_all(data)?;
                 }
             }
         }
@@ -290,6 +321,30 @@ impl WritableType for IgniteValue {
                 writer.write_all(data)
             }
             IgniteValue::Null => write_null(writer),
+            IgniteValue::Map(map_type, entries) => {
+                write_u8(writer, TypeCode::Map as u8)?;
+                write_i32(writer, entries.len() as i32)?;
+                write_u8(writer, *map_type)?;
+                for (k, v) in entries {
+                    k.write(writer)?;
+                    v.write(writer)?;
+                }
+                Ok(())
+            }
+            IgniteValue::Collection(col_type, items) => {
+                write_u8(writer, TypeCode::Collection as u8)?;
+                write_i32(writer, items.len() as i32)?;
+                write_u8(writer, *col_type)?;
+                for item in items {
+                    item.write(writer)?;
+                }
+                Ok(())
+            }
+            IgniteValue::OpaqueMarshal(data) => {
+                write_u8(writer, TypeCode::OptimizedMarshaller as u8)?;
+                write_i32(writer, data.len() as i32)?;
+                writer.write_all(data)
+            }
         }
     }
 
@@ -318,6 +373,18 @@ impl WritableType for IgniteValue {
             IgniteValue::Timestamp(_, _) => 1 + size_of::<i64>() + size_of::<i32>(),
             IgniteValue::Decimal(_, data) => 1 + size_of::<i32>() + size_of::<i32>() + data.len(),
             IgniteValue::Null => 1,
+            IgniteValue::Map(_, entries) => {
+                1 + size_of::<i32>()
+                    + 1
+                    + entries
+                        .iter()
+                        .map(|(k, v)| k.size() + v.size())
+                        .sum::<usize>()
+            }
+            IgniteValue::Collection(_, items) => {
+                1 + size_of::<i32>() + 1 + items.iter().map(IgniteValue::size).sum::<usize>()
+            }
+            IgniteValue::OpaqueMarshal(data) => 1 + size_of::<i32>() + data.len(),
         }
     }
 }
@@ -344,6 +411,9 @@ impl IgniteValue {
             IgniteValue::Timestamp(_, _) => IgniteType::Timestamp,
             IgniteValue::Decimal(_, _) => IgniteType::Decimal(0, 0),
             IgniteValue::Null => IgniteType::Null,
+            IgniteValue::Map(_, _) => IgniteType::Map,
+            IgniteValue::Collection(_, _) => IgniteType::Collection,
+            IgniteValue::OpaqueMarshal(_) => IgniteType::Binary, // opaque blob
         }
     }
 }
@@ -549,35 +619,27 @@ impl ReadableType for ComplexObject {
                 me.values.push(IgniteValue::Enum(read_enum(reader)?));
             }
             TypeCode::ComplexObj => {
-                // read header minus type code
-                let mut partial_header = vec![0u8; COMPLEX_OBJ_HEADER_LEN as usize - 1];
-                reader.read_exact(&mut partial_header)?;
+                // Read header fields directly from reader (no intermediate allocation).
+                let _version = read_u8(reader)?;
+                let flags = read_u16(reader)?;
+                let type_id = read_i32(reader)?;
+                let _hash_code = read_i32(reader)?;
+                let object_len = read_i32(reader)? as usize;
+                let schema_id = read_i32(reader)?;
+                let field_indexes_offset = read_i32(reader)? as usize;
 
-                // construct full header
-                let mut data = vec![];
-                write_u8(&mut data, TypeCode::ComplexObj as u8)?;
-                data.extend(partial_header);
-
-                // read values from our reconstructed header
-                let mut header = Cursor::new(&mut data);
-                let _type_code = read_u8(&mut header)?; // offset 0
-                assert_eq!(read_u8(&mut header)?, 1, "Only version 1 supported"); // version
-                let flags = read_u16(&mut header)?; // offset 2
-                let type_id = read_i32(&mut header)?; // offset 4
-                let _hash_code = read_i32(&mut header)?; // offset 8
-                let object_len = read_i32(&mut header)? as usize; // offset 12
-                let schema_id = read_i32(&mut header)?; // offset 16
-                let field_indexes_offset = read_i32(&mut header)? as usize; // offset 20
-
-                // compute stuff we need to read body
                 let (one, two) = (
                     (flags & FLAG_OFFSET_ONE_BYTE) != 0,
                     (flags & FLAG_OFFSET_TWO_BYTES) != 0,
                 );
-                assert_eq!(flags & HAS_RAW_DATA, 0, "Cannot read raw data");
+                let has_raw = (flags & HAS_RAW_DATA) != 0;
                 let _compact = flags & FLAG_COMPACT_FOOTER != 0;
-                assert_ne!(flags & FLAG_HAS_SCHEMA, 0, "Schema is required");
-                assert_ne!(flags & FLAG_USER_TYPE, 0, "Only user types are supported");
+                let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
+                if !has_schema && !has_raw {
+                    return Err(IgniteError::from(
+                        "Schema is required for non-raw-data objects",
+                    ));
+                }
                 let _offset_sz = match (one, two) {
                     (true, false) => 1,
                     (false, true) => 2,
@@ -585,18 +647,29 @@ impl ReadableType for ComplexObject {
                     (true, true) => Err(IgniteError::from("Invalid offset flags"))?,
                 };
 
-                // append body
-                let mut body = vec![0u8; object_len - data.len()];
-                reader.read_exact(&mut body)?;
-                data.extend(body);
+                // Read body (field data + schema footer) in one allocation.
+                let body_len = object_len - COMPLEX_OBJ_HEADER_LEN as usize;
+                let mut data = vec![0u8; body_len];
+                reader.read_exact(&mut data)?;
 
                 // for acquiring test fixture data
                 // println!("data={:02X?}", data);
 
                 // read field data
-                let mut remainder = Cursor::new(data);
-                remainder.set_position(COMPLEX_OBJ_HEADER_LEN as u64);
-                while (remainder.position() as usize) < field_indexes_offset {
+                // For HAS_RAW_DATA without FLAG_HAS_SCHEMA (Externalizable):
+                // field_indexes_offset = raw data offset (typically 24 = header length).
+                // Raw data extends to object_len. Use object_len as end boundary.
+                // For FLAG_HAS_SCHEMA: field_indexes_offset = start of schema footer.
+                // data_end is relative to the body buffer (header already consumed).
+                let data_end = if has_raw && !has_schema {
+                    body_len
+                } else if field_indexes_offset > COMPLEX_OBJ_HEADER_LEN as usize {
+                    field_indexes_offset - COMPLEX_OBJ_HEADER_LEN as usize
+                } else {
+                    body_len
+                };
+                let mut remainder = Cursor::new(&data);
+                while (remainder.position() as usize) < data_end {
                     let field_type = TypeCode::try_from(read_u8(&mut remainder)?)?;
                     let val = match field_type {
                         TypeCode::Byte => IgniteValue::Byte(read_u8(&mut remainder)?),
@@ -653,6 +726,51 @@ impl ReadableType for ComplexObject {
                             IgniteValue::Decimal(scale, buf)
                         }
                         TypeCode::Null => IgniteValue::Null,
+                        TypeCode::Map => {
+                            let count = read_i32(&mut remainder)?;
+                            let map_type = read_u8(&mut remainder)?;
+                            let mut entries = Vec::with_capacity(count.max(0) as usize);
+                            for _ in 0..count {
+                                let k = ComplexObject::read(&mut remainder)?
+                                    .map(flatten_complex_value)
+                                    .unwrap_or(IgniteValue::Null);
+                                let v = ComplexObject::read(&mut remainder)?
+                                    .map(flatten_complex_value)
+                                    .unwrap_or(IgniteValue::Null);
+                                entries.push((k, v));
+                            }
+                            IgniteValue::Map(map_type, entries)
+                        }
+                        TypeCode::Collection => {
+                            let count = read_i32(&mut remainder)?;
+                            let col_type = read_u8(&mut remainder)?;
+                            let mut items = Vec::with_capacity(count.max(0) as usize);
+                            for _ in 0..count {
+                                let item = ComplexObject::read(&mut remainder)?
+                                    .map(flatten_complex_value)
+                                    .unwrap_or(IgniteValue::Null);
+                                items.push(item);
+                            }
+                            IgniteValue::Collection(col_type, items)
+                        }
+                        TypeCode::ArrString => {
+                            let len = read_i32(&mut remainder)?;
+                            let mut items = Vec::with_capacity(len.max(0) as usize);
+                            for _ in 0..len {
+                                let s = ComplexObject::read(&mut remainder)?
+                                    .map(flatten_complex_value)
+                                    .unwrap_or(IgniteValue::Null);
+                                items.push(s);
+                            }
+                            IgniteValue::Array(items)
+                        }
+                        TypeCode::OptimizedMarshaller => {
+                            // JDK-serialized opaque object — read length + bytes, store as Binary.
+                            let len = read_i32(&mut remainder)?;
+                            let mut buf = vec![0; len as usize];
+                            remainder.read_exact(&mut buf)?;
+                            IgniteValue::Binary(buf)
+                        }
                         _ => {
                             let msg = format!("Unknown type: {:?}", field_type);
                             Err(IgniteError::from(msg.as_str()))?
@@ -660,13 +778,88 @@ impl ReadableType for ComplexObject {
                     };
                     me.values.push(val);
                 }
-                if let Some(schema) = binary_registry::schema_for(type_id, schema_id) {
-                    me.schema = schema;
+                if has_schema {
+                    // Read footer field_ids to determine field order (matches values order).
+                    // Offsets are body-relative (header already stripped).
+                    let footer_start = if field_indexes_offset > COMPLEX_OBJ_HEADER_LEN as usize {
+                        field_indexes_offset - COMPLEX_OBJ_HEADER_LEN as usize
+                    } else {
+                        0
+                    };
+                    let footer_end = body_len;
+                    let entry_size = _offset_sz + 4; // field_id(4) + offset(offset_sz)
+                    let mut footer_field_ids = Vec::new();
+                    if footer_end > footer_start && entry_size > 0 {
+                        let num_fields = (footer_end - footer_start) / entry_size;
+                        remainder.set_position(footer_start as u64);
+                        for _ in 0..num_fields {
+                            let fid = read_i32(&mut remainder)?;
+                            // skip offset bytes
+                            for _ in 0.._offset_sz {
+                                read_u8(&mut remainder)?;
+                            }
+                            footer_field_ids.push(fid);
+                        }
+                    }
+
+                    if let Some(schema) =
+                        binary_registry::schema_for_ordered(type_id, schema_id, &footer_field_ids)
+                    {
+                        me.schema = schema;
+                    } else if let Some(schema) = binary_registry::schema_for(type_id, schema_id) {
+                        me.schema = schema;
+                    }
                 }
                 // the remainder of bytes are offsets to fields which we have already read
             }
+            TypeCode::Map => {
+                let count = read_i32(reader)?;
+                let map_type = read_u8(reader)?;
+                let mut entries = Vec::with_capacity(count.max(0) as usize);
+                for _ in 0..count {
+                    let k = ComplexObject::read(reader)?
+                        .map(flatten_complex_value)
+                        .unwrap_or(IgniteValue::Null);
+                    let v = ComplexObject::read(reader)?
+                        .map(flatten_complex_value)
+                        .unwrap_or(IgniteValue::Null);
+                    entries.push((k, v));
+                }
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.util.HashMap".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Map(map_type, entries));
+            }
+            TypeCode::Collection => {
+                let count = read_i32(reader)?;
+                let col_type = read_u8(reader)?;
+                let mut items = Vec::with_capacity(count.max(0) as usize);
+                for _ in 0..count {
+                    let item = ComplexObject::read(reader)?
+                        .map(flatten_complex_value)
+                        .unwrap_or(IgniteValue::Null);
+                    items.push(item);
+                }
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.util.HashSet".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Collection(col_type, items));
+            }
             TypeCode::Null => {
                 me.values.push(IgniteValue::Null);
+            }
+            TypeCode::OptimizedMarshaller => {
+                // JDK-serialized opaque object — read length + bytes, store as Binary.
+                let len = read_i32(reader)?;
+                let mut buf = vec![0; len as usize];
+                reader.read_exact(&mut buf)?;
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Object".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::Binary(buf));
             }
             _ => {
                 return Err(IgniteError::from(
@@ -759,6 +952,205 @@ impl WritableType for ComplexObject {
         }
         let (values, schema) = self.get_data().expect("Can't get size!");
         values.len() + schema.len() + COMPLEX_OBJ_HEADER_LEN as usize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LazyBinaryObject: zero-copy field access for read-hot paths
+// ---------------------------------------------------------------------------
+
+/// A BinaryObject that stores raw bytes and parses fields on demand.
+/// Avoids allocating IgniteValue for every field upfront — only the
+/// requested field is parsed. Ideal for read-hot paths where only a
+/// subset of fields is needed.
+#[derive(Debug, Clone)]
+pub struct LazyBinaryObject {
+    /// Raw bytes of the entire body (after the 24-byte header).
+    body: Vec<u8>,
+    /// Field entries: (field_id, offset_in_body) from the schema footer.
+    fields: Vec<(i32, usize)>,
+    /// End of field data region (start of schema footer) relative to body.
+    data_end: usize,
+}
+
+impl LazyBinaryObject {
+    /// Read a ComplexObj from the wire into a lazy representation.
+    /// The type code byte (0x67) must already be consumed.
+    pub fn read_from(reader: &mut impl Read) -> Result<Self, IgniteError> {
+        let _version = read_u8(reader)?;
+        let flags = read_u16(reader)?;
+        let _type_id = read_i32(reader)?;
+        let _hash = read_i32(reader)?;
+        let object_len = read_i32(reader)? as usize;
+        let _schema_id = read_i32(reader)?;
+        let field_indexes_offset = read_i32(reader)? as usize;
+
+        let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
+        let one_byte = (flags & FLAG_OFFSET_ONE_BYTE) != 0;
+        let two_byte = (flags & FLAG_OFFSET_TWO_BYTES) != 0;
+        let offset_sz: usize = match (one_byte, two_byte) {
+            (true, false) => 1,
+            (false, true) => 2,
+            _ => 4,
+        };
+
+        let hdr = COMPLEX_OBJ_HEADER_LEN as usize;
+        let body_len = object_len.saturating_sub(hdr);
+        let mut body = vec![0u8; body_len];
+        reader.read_exact(&mut body)?;
+
+        let data_end = if field_indexes_offset > hdr {
+            field_indexes_offset - hdr
+        } else {
+            body_len
+        };
+
+        // Parse schema footer: [(field_id:i32, offset)] entries.
+        let mut fields = Vec::new();
+        if has_schema && data_end < body_len {
+            let entry_size = 4 + offset_sz;
+            let footer = &body[data_end..];
+            let num_fields = footer.len() / entry_size;
+            for i in 0..num_fields {
+                let base = i * entry_size;
+                if base + entry_size > footer.len() {
+                    break;
+                }
+                let fid = i32::from_le_bytes([
+                    footer[base],
+                    footer[base + 1],
+                    footer[base + 2],
+                    footer[base + 3],
+                ]);
+                let off = match offset_sz {
+                    1 => footer[base + 4] as usize,
+                    2 => u16::from_le_bytes([footer[base + 4], footer[base + 5]]) as usize,
+                    _ => u32::from_le_bytes([
+                        footer[base + 4],
+                        footer[base + 5],
+                        footer[base + 6],
+                        footer[base + 7],
+                    ]) as usize,
+                };
+                // offset is relative to object start, convert to body-relative.
+                let body_off = off.saturating_sub(hdr);
+                fields.push((fid, body_off));
+            }
+        }
+
+        Ok(Self {
+            body,
+            fields,
+            data_end,
+        })
+    }
+
+    /// Look up a field by name. Returns a cursor positioned at the field's
+    /// type code byte. The caller must read the type code + value from it.
+    fn field_offset(&self, name: &str) -> Option<usize> {
+        let field_id = string_to_java_hashcode(&name.to_lowercase());
+        self.fields
+            .iter()
+            .find(|(fid, _)| *fid == field_id)
+            .map(|(_, off)| *off)
+    }
+
+    /// Read an i32 field.
+    pub fn get_i32(&self, name: &str) -> Option<i32> {
+        let off = self.field_offset(name)?;
+        let b = &self.body[off..];
+        if b.first()? == &(TypeCode::Int as u8) {
+            Some(i32::from_le_bytes([b[1], b[2], b[3], b[4]]))
+        } else {
+            None
+        }
+    }
+
+    /// Read an i64 field.
+    pub fn get_i64(&self, name: &str) -> Option<i64> {
+        let off = self.field_offset(name)?;
+        let b = &self.body[off..];
+        if b.first()? == &(TypeCode::Long as u8) {
+            Some(i64::from_le_bytes([
+                b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8],
+            ]))
+        } else {
+            None
+        }
+    }
+
+    /// Read a string field (returns a reference into the body buffer — zero copy).
+    pub fn get_str(&self, name: &str) -> Option<&str> {
+        let off = self.field_offset(name)?;
+        let b = &self.body[off..];
+        if b.first()? != &(TypeCode::String as u8) {
+            return None;
+        }
+        let len = i32::from_le_bytes([b[1], b[2], b[3], b[4]]) as usize;
+        let start = 5;
+        let end = start + len;
+        if end > b.len() {
+            return None;
+        }
+        std::str::from_utf8(&b[start..end]).ok()
+    }
+
+    /// Read a byte array field (returns a reference — zero copy).
+    pub fn get_bytes(&self, name: &str) -> Option<&[u8]> {
+        let off = self.field_offset(name)?;
+        let b = &self.body[off..];
+        if b.first()? != &(TypeCode::ArrByte as u8) {
+            return None;
+        }
+        let len = i32::from_le_bytes([b[1], b[2], b[3], b[4]]) as usize;
+        let start = 5;
+        let end = start + len;
+        if end > b.len() {
+            return None;
+        }
+        Some(&b[start..end])
+    }
+
+    /// Check if a field is Null.
+    pub fn is_null(&self, name: &str) -> bool {
+        match self.field_offset(name) {
+            Some(off) => self.body.get(off) == Some(&(TypeCode::Null as u8)),
+            None => true,
+        }
+    }
+
+    /// Get the full raw body for fields that need advanced parsing
+    /// (Map, Collection, ComplexObj, OptimizedMarshaller).
+    pub fn raw_field_cursor(&self, name: &str) -> Option<Cursor<&[u8]>> {
+        let off = self.field_offset(name)?;
+        Some(Cursor::new(&self.body[off..self.data_end.max(off)]))
+    }
+}
+
+impl crate::ReadableType for LazyBinaryObject {
+    fn read_unwrapped(
+        type_code: TypeCode,
+        reader: &mut impl Read,
+    ) -> crate::error::IgniteResult<Option<Self>> {
+        match type_code {
+            TypeCode::ComplexObj => Ok(Some(LazyBinaryObject::read_from(reader)?)),
+            TypeCode::Null => Ok(None),
+            _ => Err(crate::error::IgniteError::from(
+                format!("LazyBinaryObject: unexpected type code {:?}", type_code).as_str(),
+            )),
+        }
+    }
+}
+
+impl crate::WritableType for LazyBinaryObject {
+    fn write(&self, _writer: &mut dyn Write) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "LazyBinaryObject is read-only",
+        ))
+    }
+    fn size(&self) -> usize {
+        0
     }
 }
 

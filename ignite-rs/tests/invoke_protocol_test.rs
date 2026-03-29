@@ -10,6 +10,7 @@ use ignite_rs::{new_client, ClientConfig, ReadableType, WritableType};
 use ignite_rs_derive::IgniteObj;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const OP_CACHE_INVOKE: i16 = 1024;
@@ -19,6 +20,44 @@ const OP_CACHE_INVOKE_ALL: i16 = 1025;
 struct Person {
     id: i32,
     name: String,
+}
+
+struct CountingKey {
+    value: i32,
+    writes: Arc<AtomicUsize>,
+}
+
+impl CountingKey {
+    fn new(value: i32) -> Self {
+        Self {
+            value,
+            writes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn writes(&self) -> usize {
+        self.writes.load(Ordering::Relaxed)
+    }
+}
+
+impl WritableType for CountingKey {
+    fn write(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.value.write(writer)
+    }
+
+    fn size(&self) -> usize {
+        self.value.size()
+    }
+}
+
+impl ReadableType for CountingKey {
+    fn read_unwrapped(
+        type_code: ignite_rs::protocol::TypeCode,
+        reader: &mut impl std::io::Read,
+    ) -> ignite_rs::error::IgniteResult<Option<Self>> {
+        Ok(i32::read_unwrapped(type_code, reader)?.map(Self::new))
+    }
 }
 
 /// Migrated from Apache Ignite `InvokeTest.testInvokeSimpleCase`:
@@ -107,6 +146,36 @@ async fn should_decode_invoke_all_results_and_errors() {
     assert_eq!(results[0].1, InvokeAllResult::Value(Some(7)));
     assert_eq!(results[1].0, Some(2));
     assert_eq!(results[1].1, InvokeAllResult::Error("Failed".to_string()));
+}
+
+#[tokio::test]
+async fn should_serialize_first_invoke_all_key_once() {
+    let server = spawn_mock_thin_server(MockThinServerConfig {
+        opcode_responses: Some(opcode_responses(vec![(
+            OP_CACHE_INVOKE_ALL,
+            vec![MockResponse::success(encode_invoke_all_response(&[
+                (1, true, Some(7), None),
+                (2, true, Some(9), None),
+            ]))],
+        )])),
+        ..Default::default()
+    });
+
+    let mut conf = ClientConfig::new(server.addr());
+    conf.partition_awareness_enabled = false;
+
+    let ignite = new_client(conf).await.unwrap();
+    let cache = ignite.cache::<CountingKey, i32>("invoke-cache");
+    let processor = ignite.binary().builder("IncrementProcessor").build();
+    let keys = [CountingKey::new(1), CountingKey::new(2)];
+
+    let _ = cache
+        .invoke_all_binary::<i32>(&keys, &processor, &[])
+        .await
+        .unwrap();
+
+    assert_eq!(keys[0].writes(), 1);
+    assert_eq!(keys[1].writes(), 1);
 }
 
 /// Migrated from Apache Ignite `InvokeTest.testSerialization` and `testWithKeepBinary` Rust-native binary path:

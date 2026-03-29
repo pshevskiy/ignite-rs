@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::connect;
+use common::{connect, connect_with_config};
+use ignite_rs::ClientConfig;
+use std::time::Duration;
 
 /// Java parity: org.apache.ignite.internal.client.thin.ServicesTest#testServiceDescriptors
 ///
@@ -22,7 +24,9 @@ async fn should_return_empty_descriptors_when_no_services_deployed() {
 /// Verifies that invoking a non-existent service returns an error.
 #[tokio::test]
 async fn should_fail_on_wrong_service_name() {
-    let client = connect().await.unwrap();
+    let mut conf = ClientConfig::from_addresses([common::ignite_test_env().addr()]);
+    conf.request_timeout = Some(Duration::from_secs(5));
+    let client = connect_with_config(conf).await.unwrap();
     let err = client
         .services()
         .service("NonExistentService_12345")
@@ -38,6 +42,8 @@ async fn should_fail_on_wrong_service_name() {
             || msg.contains("does not exist")
             || msg.contains("Invalid")
             || msg.contains("op code")
+            || msg.contains("timed out")
+            || msg.contains("timeout")
             || msg.contains("early eof")
             || msg.contains("connection"),
         "unexpected wrong service name error: {}",

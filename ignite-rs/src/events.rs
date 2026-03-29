@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -77,7 +78,7 @@ pub enum LifecycleEventKind {
 #[derive(Clone)]
 pub(crate) struct EventBus {
     sender: broadcast::Sender<ClientEvent>,
-    history: Arc<Mutex<Vec<ClientEvent>>>,
+    history: Arc<Mutex<VecDeque<ClientEvent>>>,
     subscriptions: EventSubscriptions,
 }
 
@@ -86,13 +87,19 @@ impl EventBus {
         let (sender, _) = broadcast::channel(256);
         Self {
             sender,
-            history: Arc::new(Mutex::new(Vec::new())),
+            history: Arc::new(Mutex::new(VecDeque::with_capacity(EVENT_HISTORY_LIMIT))),
             subscriptions,
         }
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<ClientEvent> {
-        let snapshot = self.history.lock().expect("event history poisoned").clone();
+        let snapshot = self
+            .history
+            .lock()
+            .expect("event history poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         if snapshot.is_empty() {
             return self.sender.subscribe();
         }
@@ -104,17 +111,33 @@ impl EventBus {
             let _ = sender.send(event);
         }
 
-        std::thread::spawn(move || loop {
-            match upstream.blocking_recv() {
-                Ok(event) => {
-                    if sender.send(event).is_err() {
-                        break;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                loop {
+                    match upstream.recv().await {
+                        Ok(event) => {
+                            if sender.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        });
+            });
+        } else {
+            std::thread::spawn(move || loop {
+                match upstream.blocking_recv() {
+                    Ok(event) => {
+                        if sender.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            });
+        }
 
         receiver
     }
@@ -135,6 +158,10 @@ impl EventBus {
         });
         self.record(&event);
         let _ = self.sender.send(event);
+    }
+
+    pub(crate) fn has_request_subscribers(&self) -> bool {
+        self.subscriptions.request
     }
 
     pub(crate) fn emit_request(
@@ -171,8 +198,8 @@ impl EventBus {
     fn record(&self, event: &ClientEvent) {
         let mut history = self.history.lock().expect("event history poisoned");
         if history.len() == EVENT_HISTORY_LIMIT {
-            history.remove(0);
+            history.pop_front();
         }
-        history.push(event.clone());
+        history.push_back(event.clone());
     }
 }

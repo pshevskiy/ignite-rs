@@ -161,6 +161,7 @@ pub struct ClientConfig {
     pub tcp_ttl: Option<u32>,
     pub tcp_read_buff_size: Option<usize>,
     pub tcp_write_buff_size: Option<usize>,
+    pub connection_pool_size: usize,
     #[cfg(feature = "ssl")]
     pub tls_conf: Option<(rustls::ClientConfig, String)>,
 }
@@ -245,6 +246,7 @@ impl fmt::Debug for ClientConfig {
             .field("tcp_ttl", &self.tcp_ttl)
             .field("tcp_read_buff_size", &self.tcp_read_buff_size)
             .field("tcp_write_buff_size", &self.tcp_write_buff_size)
+            .field("connection_pool_size", &self.connection_pool_size)
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +284,7 @@ impl ClientConfig {
             tcp_ttl: None,
             tcp_read_buff_size: None,
             tcp_write_buff_size: None,
+            connection_pool_size: 1,
             #[cfg(feature = "ssl")]
             tls_conf: None,
         }
@@ -362,6 +365,11 @@ impl ClientConfig {
             }
         }
         Ok(())
+    }
+
+    pub fn with_connection_pool_size(mut self, size: usize) -> Self {
+        self.connection_pool_size = size.max(1);
+        self
     }
 
     pub(crate) fn normalized_addresses(&self) -> IgniteResult<Vec<String>> {
@@ -783,7 +791,11 @@ impl ClientGeneric {
         let id = crate::utils::string_to_java_hashcode(name);
         let name = name.to_owned();
         let exec = self.exec.clone();
-        Ok(crate::cache::CacheCore::new(id, name, exec))
+        Ok(crate::cache::CacheCore::new(
+            id,
+            Arc::from(name.as_str()),
+            exec,
+        ))
     }
 
     async fn get_or_create_cache_impl<
@@ -802,7 +814,11 @@ impl ClientGeneric {
         let id = crate::utils::string_to_java_hashcode(name);
         let name = name.to_owned();
         let exec = self.exec.clone();
-        Ok(crate::cache::CacheCore::new(id, name, exec))
+        Ok(crate::cache::CacheCore::new(
+            id,
+            Arc::from(name.as_str()),
+            exec,
+        ))
     }
 
     async fn create_cache_with_config_impl<
@@ -821,7 +837,11 @@ impl ClientGeneric {
         let id = crate::utils::string_to_java_hashcode(config.name.as_str());
         let name = config.name.clone();
         let exec = self.exec.clone();
-        Ok(crate::cache::CacheCore::new(id, name, exec))
+        Ok(crate::cache::CacheCore::new(
+            id,
+            Arc::from(name.as_str()),
+            exec,
+        ))
     }
 
     async fn get_or_create_cache_with_config_impl<
@@ -840,7 +860,11 @@ impl ClientGeneric {
         let id = crate::utils::string_to_java_hashcode(config.name.as_str());
         let name = config.name.clone();
         let exec = self.exec.clone();
-        Ok(crate::cache::CacheCore::new(id, name, exec))
+        Ok(crate::cache::CacheCore::new(
+            id,
+            Arc::from(name.as_str()),
+            exec,
+        ))
     }
 
     async fn get_cache_config_impl(&self, name: &str) -> IgniteResult<CacheConfiguration> {
@@ -944,7 +968,16 @@ impl ClientGeneric {
         name: &str,
     ) -> crate::cache::Cache<K, V> {
         let id = crate::utils::string_to_java_hashcode(name);
-        crate::cache::CacheCore::new(id, name.to_owned(), self.exec.clone())
+        crate::cache::CacheCore::new(id, Arc::from(name), self.exec.clone())
+    }
+
+    /// Create a cache handle with a pre-computed ID to avoid per-call hashing.
+    pub fn cache_with_id<K: WritableType + ReadableType, V: WritableType + ReadableType>(
+        &self,
+        id: i32,
+        name: Arc<str>,
+    ) -> crate::cache::Cache<K, V> {
+        crate::cache::CacheCore::new(id, name, self.exec.clone())
     }
 
     pub async fn create_cache<K: WritableType + ReadableType, V: WritableType + ReadableType>(

@@ -13,6 +13,8 @@ keywords = ["ignite","client"]
 categories = ["database"]
 
 [dependencies]
+arc-swap = "1"
+
 [dependencies.tokio]
 version = "1"
 features = ["net", "io-util", "sync", "time", "rt", "macros"]

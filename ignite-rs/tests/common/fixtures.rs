@@ -670,9 +670,7 @@ impl IgniteContext {
         match &self.kind {
             IgniteContextKind::Single(env) => env.client_config(),
             IgniteContextKind::Cluster(env) => {
-                let mut conf = ClientConfig::from_addresses(
-                    env.addresses().iter().cloned(),
-                );
+                let mut conf = ClientConfig::from_addresses(env.addresses().iter().cloned());
                 // Containerised clusters advertise internal IPs that are
                 // unreachable from the host.  PA tests that need partition
                 // awareness override the config explicitly.

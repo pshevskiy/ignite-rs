@@ -102,7 +102,7 @@ impl TokioExec {
         cache_id: i32,
         marshaled_key: &[u8],
         primary: bool,
-    ) -> Option<String> {
+    ) -> Option<Arc<str>> {
         self.transport
             .affinity_node_for_key(cache_id, marshaled_key, primary)
             .await
@@ -113,7 +113,7 @@ impl TokioExec {
         cache_id: i32,
         partition: i32,
         primary: bool,
-    ) -> Option<String> {
+    ) -> Option<Arc<str>> {
         self.transport
             .affinity_node_for_partition(cache_id, partition, primary)
             .await
