@@ -331,7 +331,7 @@ impl<K: ReadableType, V: ReadableType> Drop for RegisteredCacheEntryListener<K, 
 fn decode_notification_batch<K: ReadableType, V: ReadableType>(
     frame: &NotificationFrame,
 ) -> IgniteResult<Vec<CacheEntryEvent<K, V>>> {
-    let mut reader = std::io::Cursor::new(frame.body.as_slice());
+    let mut reader = std::io::Cursor::new(&frame.body[frame.payload_offset..]);
     let count = read_i32(&mut reader)?;
     if count < 0 {
         return Err(IgniteError::from("negative continuous query event count"));

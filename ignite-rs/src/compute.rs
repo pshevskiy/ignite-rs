@@ -192,10 +192,10 @@ impl<R: ReadableType> ComputeTask<R> {
 
         match frame.flag {
             Flag::Success => {
-                if frame.body.is_empty() {
+                if frame.payload_offset >= frame.body.len() {
                     return Ok(None);
                 }
-                let mut cursor = Cursor::new(frame.body);
+                let mut cursor = Cursor::new(&frame.body[frame.payload_offset..]);
                 R::read(&mut cursor)
             }
             Flag::Failure { err_msg } => Err(IgniteError::server(err_msg)),

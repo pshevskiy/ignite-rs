@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io;
 use std::io::{Cursor, Write};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
@@ -191,7 +191,8 @@ struct Channel {
     pending_notifications: Mutex<HashMap<(i16, i64), Vec<NotificationFrame>>>,
     closed: AtomicBool,
     last_error: Mutex<Option<String>>,
-    last_send_at: StdMutex<Instant>,
+    last_send_at_ms: AtomicU64,
+    created_at: Instant,
     writer_pump: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     response_pump: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -220,7 +221,8 @@ impl Channel {
             pending_notifications: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             last_error: Mutex::new(None),
-            last_send_at: StdMutex::new(Instant::now()),
+            last_send_at_ms: AtomicU64::new(0),
+            created_at: Instant::now(),
             writer_pump: StdMutex::new(None),
             response_pump: StdMutex::new(None),
         })
@@ -277,18 +279,14 @@ impl Channel {
     }
 
     fn idle_for(&self) -> Duration {
-        let last_send = *self
-            .last_send_at
-            .lock()
-            .expect("channel last_send_at mutex poisoned");
+        let ms = self.last_send_at_ms.load(Ordering::Relaxed);
+        let last_send = self.created_at + Duration::from_millis(ms);
         last_send.elapsed()
     }
 
     fn mark_sent(&self) {
-        *self
-            .last_send_at
-            .lock()
-            .expect("channel last_send_at mutex poisoned") = Instant::now();
+        let ms = self.created_at.elapsed().as_millis() as u64;
+        self.last_send_at_ms.store(ms, Ordering::Relaxed);
     }
 
     async fn request(&self, corr_id: i64, request: Vec<u8>) -> IgniteResult<ResponseFrame> {
@@ -844,7 +842,7 @@ impl ChannelManager {
     ) -> IgniteResult<()> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let request = Self::encode_request(op_code as i16, corr_id, &data)?;
-        let (flag, _body) = self
+        let (flag, _body, _offset) = self
             .round_trip_no_meta(op_code as i16, corr_id, request, true, route)
             .await?;
         match flag {
@@ -870,12 +868,12 @@ impl ChannelManager {
     ) -> IgniteResult<T> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let request = Self::encode_request(op_code as i16, corr_id, &data)?;
-        let (flag, body) = self
+        let (flag, body, payload_offset) = self
             .round_trip_no_meta(op_code as i16, corr_id, request, true, route)
             .await?;
         match flag {
             Success => {
-                let mut cur = Cursor::new(body);
+                let mut cur = Cursor::new(&body[payload_offset..]);
                 Ok(T::read(&mut cur)?)
             }
             Failure { err_msg } => Err(classify_server_error(&err_msg)),
@@ -890,12 +888,12 @@ impl ChannelManager {
     ) -> IgniteResult<(T, ResponseMeta)> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let request = Self::encode_request(op_code as i16, corr_id, &data)?;
-        let (flag, body, meta) = self
+        let (flag, body, payload_offset, meta) = self
             .round_trip_with_route(op_code as i16, corr_id, request, true, route)
             .await?;
         match flag {
             Success => {
-                let mut cur = Cursor::new(body);
+                let mut cur = Cursor::new(&body[payload_offset..]);
                 Ok((T::read(&mut cur)?, meta))
             }
             Failure { err_msg } => Err(classify_server_error(&err_msg)),
@@ -940,7 +938,7 @@ impl ChannelManager {
         let frame = channel.request(corr_id, request).await?;
         match frame.flag {
             Success => {
-                let mut cur = Cursor::new(frame.body);
+                let mut cur = Cursor::new(&frame.body[frame.payload_offset..]);
                 T::read(&mut cur)
             }
             Failure { err_msg } => Err(classify_server_error(&err_msg)),
@@ -996,7 +994,7 @@ impl ChannelManager {
         corr_id: i64,
         mut request: Vec<u8>,
         emit_request_events: bool,
-    ) -> IgniteResult<(Flag, Vec<u8>, ResponseMeta)> {
+    ) -> IgniteResult<(Flag, Vec<u8>, usize, ResponseMeta)> {
         let max_attempts = self.max_attempts();
         let mut attempt = 0usize;
         let mut started_emitted = false;
@@ -1051,7 +1049,7 @@ impl ChannelManager {
 
                     // Lazy address: only allocate when caller needs ResponseMeta
                     let address = channel.address().to_string();
-                    return Ok((response.flag, response.body, ResponseMeta { address }));
+                    return Ok((response.flag, response.body, response.payload_offset, ResponseMeta { address }));
                 }
                 Err(err) => {
                     let address = channel.address().to_string();
@@ -1106,11 +1104,11 @@ impl ChannelManager {
         request: Vec<u8>,
         emit_request_events: bool,
         route: RequestRoute,
-    ) -> IgniteResult<(Flag, Vec<u8>)> {
-        let (flag, body, _meta) = self
+    ) -> IgniteResult<(Flag, Vec<u8>, usize)> {
+        let (flag, body, payload_offset, _meta) = self
             .round_trip_with_route(op_code, corr_id, request, emit_request_events, route)
             .await?;
-        Ok((flag, body))
+        Ok((flag, body, payload_offset))
     }
 
     async fn round_trip_with_route(
@@ -1120,7 +1118,7 @@ impl ChannelManager {
         request: Vec<u8>,
         emit_request_events: bool,
         route: RequestRoute,
-    ) -> IgniteResult<(Flag, Vec<u8>, ResponseMeta)> {
+    ) -> IgniteResult<(Flag, Vec<u8>, usize, ResponseMeta)> {
         if route.is_default() {
             return self
                 .round_trip_internal(op_code, corr_id, request, emit_request_events)
@@ -1193,6 +1191,7 @@ impl ChannelManager {
                 Ok((
                     response.flag,
                     response.body,
+                    response.payload_offset,
                     ResponseMeta { address: meta_addr },
                 ))
             }

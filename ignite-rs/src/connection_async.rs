@@ -56,6 +56,8 @@ pub(crate) struct ResponseFrame {
     pub(crate) correlation_id: i64,
     pub(crate) flag: Flag,
     pub(crate) body: Vec<u8>,
+    /// Offset into `body` where the payload starts (after header/flags).
+    pub(crate) payload_offset: usize,
     pub(crate) topology_version: Option<TopologyVersion>,
 }
 
@@ -65,6 +67,8 @@ pub(crate) struct NotificationFrame {
     pub(crate) op_code: i16,
     pub(crate) flag: Flag,
     pub(crate) body: Vec<u8>,
+    /// Offset into `body` where the payload starts.
+    pub(crate) payload_offset: usize,
     #[allow(dead_code)]
     pub(crate) topology_version: Option<TopologyVersion>,
 }
@@ -205,9 +209,21 @@ where
     W: AsyncWrite + Unpin,
 {
     with_timeout_ignite(request_timeout, async {
-        for request in requests {
+        if requests.len() == 1 {
+            // Fast path: single request, no coalescing needed.
             writer
-                .write_all(request)
+                .write_all(requests[0])
+                .await
+                .map_err(|err| IgniteError::connection(err.to_string()))?;
+        } else {
+            // Coalesce multiple requests into a single write to reduce syscalls.
+            let total: usize = requests.iter().map(|r| r.len()).sum();
+            let mut buf = Vec::with_capacity(total);
+            for request in requests {
+                buf.extend_from_slice(request);
+            }
+            writer
+                .write_all(&buf)
                 .await
                 .map_err(|err| IgniteError::connection(err.to_string()))?;
         }
@@ -238,7 +254,10 @@ pub(crate) async fn read_incoming_frame(
     }
     let body_len = body_len_i32 as usize;
 
-    let mut body = vec![0u8; body_len];
+    // SAFETY: read_exact fills all `body_len` bytes before any read access.
+    // Skipping zero-init avoids unnecessary memset on every response.
+    let mut body = Vec::with_capacity(body_len);
+    unsafe { body.set_len(body_len); }
     reader
         .read_exact(&mut body)
         .await
@@ -280,9 +299,9 @@ pub(crate) async fn read_incoming_frame(
         }
     };
 
-    let payload = match &flag {
-        Success => body.split_off(rdr.position() as usize),
-        Failure { .. } => Vec::new(),
+    let payload_offset = match &flag {
+        Success => rdr.position() as usize,
+        Failure { .. } => body.len(),
     };
 
     if let Some(op_code) = notification_op_code {
@@ -290,14 +309,16 @@ pub(crate) async fn read_incoming_frame(
             resource_id: correlation_id,
             op_code,
             flag,
-            body: payload,
+            body,
+            payload_offset,
             topology_version,
         }))
     } else {
         Ok(IncomingFrame::Response(ResponseFrame {
             correlation_id,
             flag,
-            body: payload,
+            body,
+            payload_offset,
             topology_version,
         }))
     }
