@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 
+pub mod bulk_put;
+
 const FLAG_NO_FAILOVER: u8 = 0x01;
 const FLAG_NO_RESULT_CACHE: u8 = 0x02;
 
