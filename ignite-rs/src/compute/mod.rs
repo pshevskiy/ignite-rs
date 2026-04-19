@@ -35,6 +35,24 @@ pub struct ComputeTask<R> {
 }
 
 impl Compute {
+    /// Invoke `PutAllComputeTask` with a typed `BulkPutParams` argument.
+    ///
+    /// Convenience wrapper around `execute(task_name, arg)` that uses the
+    /// canonical Java FQN for the server-side task and the typed response
+    /// decoder. Returns `None` only if the server explicitly returns a null
+    /// payload — for a successful compute run the response is always
+    /// `Some(BulkPutResponseParams)`.
+    pub async fn execute_put_all(
+        &self,
+        params: &bulk_put::BulkPutParams,
+    ) -> IgniteResult<Option<bulk_put::BulkPutResponseParams>> {
+        self.execute::<bulk_put::BulkPutParams, bulk_put::BulkPutResponseParams>(
+            bulk_put::PUT_ALL_COMPUTE_TASK,
+            Some(params),
+        )
+        .await
+    }
+
     pub(crate) fn new(exec: TokioExec, cluster_group: Option<ClusterGroup>) -> Self {
         Self {
             cluster_group: cluster_group

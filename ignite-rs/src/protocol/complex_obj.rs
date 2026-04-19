@@ -42,6 +42,12 @@ pub enum IgniteValue {
     /// OptimizedMarshaller opaque blob (TypeCode 0xFE + length + data).
     /// Used for JDK-serialized objects that can't be represented as native Ignite types.
     OpaqueMarshal(Vec<u8>),
+    /// Pre-encoded wire bytes (written verbatim). The caller has already
+    /// produced a full Ignite wire payload — type code prefix included —
+    /// for a value that doesn't fit any of the above variants (e.g.
+    /// `AffinityKey` with its non-USER_TYPE flag layout). Bypasses the
+    /// schema-registry path.
+    PreEncoded(Vec<u8>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -205,6 +211,9 @@ impl ComplexObject {
                     write_i32(&mut values, data.len() as i32)?;
                     values.write_all(data)?;
                 }
+                IgniteValue::PreEncoded(data) => {
+                    values.write_all(data)?;
+                }
             }
         }
         Ok((values, schema))
@@ -345,6 +354,7 @@ impl WritableType for IgniteValue {
                 write_i32(writer, data.len() as i32)?;
                 writer.write_all(data)
             }
+            IgniteValue::PreEncoded(data) => writer.write_all(data),
         }
     }
 
@@ -385,6 +395,7 @@ impl WritableType for IgniteValue {
                 1 + size_of::<i32>() + 1 + items.iter().map(IgniteValue::size).sum::<usize>()
             }
             IgniteValue::OpaqueMarshal(data) => 1 + size_of::<i32>() + data.len(),
+            IgniteValue::PreEncoded(data) => data.len(),
         }
     }
 }
@@ -414,6 +425,7 @@ impl IgniteValue {
             IgniteValue::Map(_, _) => IgniteType::Map,
             IgniteValue::Collection(_, _) => IgniteType::Collection,
             IgniteValue::OpaqueMarshal(_) => IgniteType::Binary, // opaque blob
+            IgniteValue::PreEncoded(_) => IgniteType::Object, // pre-encoded object
         }
     }
 }
