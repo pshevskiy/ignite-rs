@@ -16,7 +16,12 @@ use std::io::{self, Cursor, Read, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-const JAVA_PLATFORM_ID: u8 = 1;
+/// Java platform id, matches `MarshallerPlatformIds.JAVA_ID` in the Apache
+/// Ignite source. The DotNet ID is 1, which is what this constant used to
+/// hold — register calls were going to the .NET mapping table, so the Java
+/// `MarshallerContext.getClassName(platformId=0, typeId=...)` lookup then
+/// reported "Failed to resolve .NET class '...' in Java [platformId=0, ...]".
+const JAVA_PLATFORM_ID: u8 = 0;
 
 pub type BinaryObject = ComplexObject;
 pub type BinaryField = IgniteField;

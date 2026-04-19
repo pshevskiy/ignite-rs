@@ -25,11 +25,14 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-use crate::binary::{BinaryObject, BinaryObjectBuilder};
+use crate::binary::{
+    Binary, BinaryEnumVariant, BinaryFieldMetadata, BinaryObject, BinaryObjectBuilder,
+    BinarySchema, BinaryTypeMetadata,
+};
 use crate::error::{IgniteError, IgniteResult};
-use crate::protocol::complex_obj::{ComplexObject, IgniteValue};
+use crate::protocol::complex_obj::{ComplexObject, IgniteField, IgniteType, IgniteValue};
 use crate::protocol::{read_u8, TypeCode};
-use crate::utils::string_to_java_hashcode;
+use crate::utils::{get_schema_id, string_to_java_hashcode};
 use crate::{ReadableType, WritableType};
 
 /// Fully-qualified class names as shipped in the Java compute-task JAR.
@@ -175,10 +178,22 @@ impl PutParams {
         // binary marshaller doesn't require this (fields are looked up by
         // hashed id at read time) but stable ordering produces stable
         // schema_ids, which makes test golden-bytes reproducible.
+        //
+        // The `object` field is declared as `BinaryObject` on the Java side;
+        // Java's reflective writer emits it via the `BINARY_OBJ` (WrappedData,
+        // type code 27) path — `writeBinaryObject()` in `BinaryWriterExImpl`.
+        // The server reader then keeps the value as a raw `BinaryObject`
+        // without trying to deserialize it as a POJO (crucial for types
+        // like `UcpRecord` whose class is not on the server's classpath).
+        // If we instead emit a plain `ComplexObj` (type code 103), the server
+        // treats the field as a generic Object and tries to resolve the
+        // nested typeId to a class, failing with "Failed to resolve class
+        // name [typeId=859486279]" for `UcpRecord`.
+        let object_wrapped = IgniteValue::PreEncoded(encode_wrapped_binary_object(&self.object));
         BinaryObjectBuilder::new(class_names::PUT_PARAMS)
             .set_field("cacheName", self.cache_name.as_str())
             .set_field_value("key", self.key.clone())
-            .set_field_value("object", IgniteValue::Object(Box::new(self.object.clone())))
+            .set_field_value("object", object_wrapped)
             .set_field("forceUpdate", self.force_update)
             .set_field_value(
                 "indexContext",
@@ -189,6 +204,27 @@ impl PutParams {
             .set_field("index", self.index)
             .build()
     }
+}
+
+/// Encode a `BinaryObject` as the `BINARY_OBJ` (WrappedData) field payload:
+/// `[type_code(27, 1 byte), length(i32), bytes, start(i32)]`. Matches Java's
+/// `BinaryWriterExImpl.writeBinaryObject(BinaryObjectEx)`.
+fn encode_wrapped_binary_object(object: &BinaryObject) -> Vec<u8> {
+    let mut object_bytes = Vec::with_capacity(object.size());
+    // BinaryObject::write always produces a self-contained `ComplexObj` blob
+    // with its own 24-byte header; we embed those bytes verbatim after the
+    // WrappedData envelope.
+    object.write(&mut object_bytes).expect("BinaryObject write to Vec cannot fail");
+    let body_len = object_bytes.len() as i32;
+
+    let mut out = Vec::with_capacity(1 + 4 + object_bytes.len() + 4);
+    out.push(crate::protocol::TypeCode::WrappedData as u8);
+    out.extend_from_slice(&body_len.to_le_bytes());
+    out.extend_from_slice(&object_bytes);
+    // `start` offset: Java uses the offset inside the wrapped byte array.
+    // Since our wrapped bytes start with the ComplexObj at offset 0, start=0.
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out
 }
 
 impl WritableType for PutParams {
@@ -225,6 +261,35 @@ impl BulkPutParams {
         BinaryObjectBuilder::new(class_names::BULK_PUT_PARAMS)
             .set_field_value("putParamsList", list)
             .build()
+    }
+
+    /// Send `PutBinaryType` AND `RegisterBinaryTypeName` for every POJO the
+    /// server needs to deserialize the request. Without this, the server
+    /// reports "Failed to resolve class name [typeId=...]" — `PutBinaryType`
+    /// only populates `BinaryContext` (field layout), whereas
+    /// `MarshallerContext.getClassName` (used during `arg.deserialize()`)
+    /// reads from a separate typeId→className table that is filled by
+    /// `RegisterBinaryTypeName`.
+    ///
+    /// Safe to call repeatedly — both ops are idempotent on the server side.
+    pub async fn register_types(&self, binary: &Binary) -> IgniteResult<()> {
+        for (type_name, build) in all_metadata_builders() {
+            let meta = build();
+            binary.put_type(&meta).await?;
+            binary.register_type_name(meta.type_id, type_name).await?;
+        }
+        // Pre-register the response-side schemas in the local registry so the
+        // decoder can look them up by `(typeId, schemaId, footer field ids)`
+        // when reading the compute-task result. Without this local hint the
+        // decoder can't associate field offsets with field names and
+        // `BinaryObject::field("putResultMap")` returns None.
+        //
+        // Building a throwaway `BinaryObject` via `BinaryObjectBuilder` is
+        // enough — `build()` calls `register_complex_schema` on the schema,
+        // which is all the decoder needs (it never sends the empty values
+        // anywhere).
+        prewarm_response_schemas();
+        Ok(())
     }
 }
 
@@ -416,6 +481,218 @@ impl ReadableType for BulkPutResponseParams {
         let type_code = TypeCode::try_from(read_u8(reader).map_err(IgniteError::from)?)?;
         Self::read_unwrapped(type_code, reader)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Binary type metadata builders (PutBinaryType payloads)
+// ---------------------------------------------------------------------------
+//
+// The server-side `ClientExecuteTaskRequest` deserializes the compute-task
+// argument before dispatch, which forces it to resolve each referenced
+// `typeId` via binary metadata. Types defined only inside the
+// `global-compute-tasks-*.jar` are not published to the thin-client metadata
+// store on cluster start; we must send `PutBinaryType` for them ourselves,
+// matching what the Java client does implicitly when serializing these POJOs.
+
+fn field_metadata(name: &str, type_code: TypeCode) -> BinaryFieldMetadata {
+    BinaryFieldMetadata {
+        name: name.to_string(),
+        type_id: type_code as i32,
+        field_id: string_to_java_hashcode(&name.to_lowercase()),
+    }
+}
+
+fn metadata_for_schema(type_name: &str, fields: Vec<(&str, IgniteType)>) -> BinaryTypeMetadata {
+    let ignite_fields: Vec<IgniteField> = fields
+        .iter()
+        .map(|(name, ty)| IgniteField {
+            name: name.to_string(),
+            r#type: ty.clone(),
+        })
+        .collect();
+    let field_metas: Vec<BinaryFieldMetadata> = fields
+        .iter()
+        .map(|(name, ty)| field_metadata(name, ignite_type_to_code(ty)))
+        .collect();
+
+    BinaryTypeMetadata {
+        type_id: string_to_java_hashcode(&type_name.to_lowercase()),
+        type_name: type_name.to_string(),
+        affinity_key_field_name: None,
+        fields: field_metas.clone(),
+        is_enum: false,
+        enum_values: Vec::new(),
+        schemas: vec![BinarySchema {
+            id: get_schema_id(&ignite_fields),
+            field_ids: field_metas.iter().map(|f| f.field_id).collect(),
+        }],
+    }
+}
+
+fn ignite_type_to_code(ty: &IgniteType) -> TypeCode {
+    match ty {
+        IgniteType::Byte => TypeCode::Byte,
+        IgniteType::String => TypeCode::String,
+        IgniteType::Long => TypeCode::Long,
+        IgniteType::Int => TypeCode::Int,
+        IgniteType::Short => TypeCode::Short,
+        IgniteType::Float => TypeCode::Float,
+        IgniteType::Double => TypeCode::Double,
+        IgniteType::Char => TypeCode::Char,
+        IgniteType::Bool => TypeCode::Bool,
+        IgniteType::Uuid => TypeCode::Uuid,
+        IgniteType::Date => TypeCode::Date,
+        IgniteType::Time => TypeCode::Time,
+        IgniteType::Binary => TypeCode::ArrByte,
+        IgniteType::Object => TypeCode::ComplexObj,
+        IgniteType::Array => TypeCode::ArrObj,
+        IgniteType::Enum => TypeCode::Enum,
+        IgniteType::Timestamp => TypeCode::Timestamp,
+        IgniteType::Decimal(_, _) => TypeCode::Decimal,
+        IgniteType::Null => TypeCode::Null,
+        IgniteType::Map => TypeCode::Map,
+        IgniteType::Collection => TypeCode::Collection,
+    }
+}
+
+fn bulk_put_params_metadata() -> BinaryTypeMetadata {
+    metadata_for_schema(
+        class_names::BULK_PUT_PARAMS,
+        vec![("putParamsList", IgniteType::Collection)],
+    )
+}
+
+fn put_params_metadata() -> BinaryTypeMetadata {
+    // Field list mirrors `PutParams::to_binary` — order matters for schemaId.
+    // NB: the Java `object` field is declared as `BinaryObject` which maps to
+    // Ignite's `BINARY_OBJ` field-type id (27 = `WrappedData`), not the
+    // generic `OBJ` id (103 = `ComplexObj`). The chosen id drives server-side
+    // behaviour: `BINARY_OBJ` skips POJO deserialization and keeps the field
+    // as a raw `BinaryObject` — required when the server does not have the
+    // inner class (e.g. `UcpRecord`) on its classpath.
+    let fields: Vec<IgniteField> = vec![
+        ("cacheName", IgniteType::String),
+        ("key", IgniteType::Object),
+        ("object", IgniteType::Object),
+        ("forceUpdate", IgniteType::Bool),
+        ("indexContext", IgniteType::Object),
+        ("isSecondaryIndexesExists", IgniteType::Bool),
+        ("saveStrategy", IgniteType::Enum),
+        ("index", IgniteType::Int),
+    ]
+    .into_iter()
+    .map(|(name, ty)| IgniteField {
+        name: name.to_string(),
+        r#type: ty,
+    })
+    .collect();
+
+    let type_code_for_field = |name: &str, ty: &IgniteType| -> TypeCode {
+        if name == "object" {
+            TypeCode::WrappedData
+        } else {
+            ignite_type_to_code(ty)
+        }
+    };
+    let field_metas: Vec<BinaryFieldMetadata> = fields
+        .iter()
+        .map(|f| BinaryFieldMetadata {
+            name: f.name.clone(),
+            type_id: type_code_for_field(&f.name, &f.r#type) as i32,
+            field_id: string_to_java_hashcode(&f.name.to_lowercase()),
+        })
+        .collect();
+
+    BinaryTypeMetadata {
+        type_id: string_to_java_hashcode(&class_names::PUT_PARAMS.to_lowercase()),
+        type_name: class_names::PUT_PARAMS.to_string(),
+        affinity_key_field_name: None,
+        fields: field_metas.clone(),
+        is_enum: false,
+        enum_values: Vec::new(),
+        schemas: vec![BinarySchema {
+            id: get_schema_id(&fields),
+            field_ids: field_metas.iter().map(|f| f.field_id).collect(),
+        }],
+    }
+}
+
+fn index_context_metadata() -> BinaryTypeMetadata {
+    metadata_for_schema(
+        class_names::INDEX_CONTEXT,
+        vec![
+            ("indexName2UniqueFactor", IgniteType::Map),
+            ("indexName2AtomicFactor", IgniteType::Map),
+            ("indexName2CacheName", IgniteType::Map),
+        ],
+    )
+}
+
+fn save_strategy_metadata() -> BinaryTypeMetadata {
+    BinaryTypeMetadata {
+        type_id: string_to_java_hashcode(&class_names::SAVE_STRATEGY.to_lowercase()),
+        type_name: class_names::SAVE_STRATEGY.to_string(),
+        affinity_key_field_name: None,
+        fields: Vec::new(),
+        is_enum: true,
+        enum_values: vec![
+            BinaryEnumVariant {
+                name: "TRANSACTION".to_string(),
+                ordinal: SaveStrategy::Transaction.ordinal(),
+            },
+            BinaryEnumVariant {
+                name: "ATOMIC".to_string(),
+                ordinal: SaveStrategy::Atomic.ordinal(),
+            },
+        ],
+        schemas: Vec::new(),
+    }
+}
+
+/// Register the response-side schemas (`BulkPutResponseParams`, `PutResult`)
+/// in the Rust-side binary registry so the compute-task response decoder can
+/// resolve field offsets → field names. We don't ship these to the server —
+/// the server already has the classes (from the compute-tasks JAR) and
+/// derives the metadata via reflection when it serializes the response.
+fn prewarm_response_schemas() {
+    // BulkPutResponseParams { putResultMap: Map }
+    let _ = BinaryObjectBuilder::new(class_names::BULK_PUT_RESPONSE_PARAMS)
+        .set_field_value("putResultMap", IgniteValue::Map(1, Vec::new()))
+        .build();
+    // PutResult { status: Enum, message: String, key: Object, index: Int }
+    let _ = BinaryObjectBuilder::new(class_names::PUT_RESULT)
+        .set_field_value(
+            "status",
+            IgniteValue::Enum(crate::Enum {
+                type_id: 0,
+                ordinal: 0,
+            }),
+        )
+        .set_field_value("message", IgniteValue::Null)
+        .set_field_value("key", IgniteValue::Long(0))
+        .set_field_value("index", IgniteValue::Int(0))
+        .build();
+}
+
+/// `(FQN, builder)` pairs for every POJO the server must deserialize on
+/// input. Response-side POJOs (`BulkPutResponseParams`, `PutResult`,
+/// `PutStatus`) are **not** registered here — the server has the classes on
+/// its classpath (from the compute-tasks JAR) and discovers the metadata via
+/// reflection when the job's reduce step serializes the output. Pre-emptively
+/// registering them risks a "type for field 'X' differs" conflict with the
+/// reflection-derived descriptor if our field-type ids don't match Ignite's
+/// Java reflection modes exactly (e.g. `Map<K,V>` declared as the interface
+/// maps to `OBJECT`, not `MAP`).
+///
+/// Iteration order is significant only for determinism — the server accepts
+/// any order.
+fn all_metadata_builders() -> Vec<(&'static str, fn() -> BinaryTypeMetadata)> {
+    vec![
+        (class_names::BULK_PUT_PARAMS, bulk_put_params_metadata),
+        (class_names::PUT_PARAMS, put_params_metadata),
+        (class_names::INDEX_CONTEXT, index_context_metadata),
+        (class_names::SAVE_STRATEGY, save_strategy_metadata),
+    ]
 }
 
 // ---------------------------------------------------------------------------

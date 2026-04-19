@@ -60,6 +60,7 @@ pub enum SqlValue {
     Binary(Vec<u8>),
     Array(Vec<SqlValue>),
     Collection(Vec<SqlValue>),
+    Map(Vec<(SqlValue, SqlValue)>),
     Enum(Enum),
     ComplexObject(ComplexObject),
 }
@@ -925,6 +926,23 @@ pub(crate) fn read_sql_value_unwrapped(
                 values.push(read_sql_value(reader)?);
             }
             Ok(SqlValue::Collection(values))
+        }
+        TypeCode::Map => {
+            // Some cluster-node attributes are Maps (observed in Ignite 2.17.0
+            // topologies, e.g. user-defined attributes of type java.util.Map).
+            // Wire layout matches Ignite's generic Map: count(i32) + subtype(u8)
+            // + (key, value)* pairs. We don't care about the subtype at the
+            // SqlValue level — just surface the entries so compute-task dispatch
+            // can read node attributes without bailing out.
+            let len = read_i32(reader).map_err(IgniteError::from)? as usize;
+            let _map_type = read_u8(reader).map_err(IgniteError::from)?;
+            let mut entries = Vec::with_capacity(len);
+            for _ in 0..len {
+                let k = read_sql_value(reader)?;
+                let v = read_sql_value(reader)?;
+                entries.push((k, v));
+            }
+            Ok(SqlValue::Map(entries))
         }
         TypeCode::WrappedData => {
             read_i32(reader).map_err(IgniteError::from)?;

@@ -3,7 +3,7 @@ use crate::cluster::{parse_uuid_parts, ClusterGroup};
 use crate::connection_async::NotificationFrame;
 use crate::error::{IgniteError, IgniteResult};
 use crate::exec::TokioExec;
-use crate::protocol::{read_i64, write_i32, write_i64, write_null, write_string, write_u8, Flag};
+use crate::protocol::{read_i64, write_i32, write_i64, write_null, write_string_type_code, write_u8, Flag};
 use crate::transport::RequestRoute;
 use crate::{ReadableReq, ReadableType, WritableType, WriteableReq};
 use std::io::{self, Cursor, Read, Write};
@@ -16,6 +16,11 @@ pub mod bulk_put;
 
 const FLAG_NO_FAILOVER: u8 = 0x01;
 const FLAG_NO_RESULT_CACHE: u8 = 0x02;
+/// Keep the compute task argument as a `BinaryObject` on the server — skips
+/// the `arg.deserialize()` call in `ClientExecuteTaskRequest.process()`, which
+/// would otherwise require the server to have the POJO class on its classpath.
+/// Matches Java's `ClientComputeTask.KEEP_BINARY_FLAG_MASK`.
+const FLAG_KEEP_BINARY: u8 = 0x04;
 
 #[derive(Clone)]
 pub struct Compute {
@@ -46,6 +51,23 @@ impl Compute {
         &self,
         params: &bulk_put::BulkPutParams,
     ) -> IgniteResult<Option<bulk_put::BulkPutResponseParams>> {
+        // Register the BulkPutParams / PutParams / IndexContext / SaveStrategy
+        // type metadata (plus response-side types) with the server before
+        // invoking the task. Without this the grid reports "Failed to resolve
+        // class name [typeId=...]" when deserializing the compute-task
+        // argument, because these POJOs only exist in the compute-task JAR and
+        // are never sent to the grid via normal cache ops.
+        let binary = crate::binary::Binary::new(self.exec.clone());
+        params.register_types(&binary).await?;
+
+        // The task's `map()` signature is `map(..., BulkPutParams args)`, so
+        // the server must deserialize the task argument into a concrete
+        // `BulkPutParams` POJO (KEEP_BINARY would leave it as
+        // `BinaryObjectImpl` and fail the cast). The nested `PutParams.object`
+        // field is declared as `BinaryObject` and is serialized via the
+        // `WrappedData` (BINARY_OBJ) envelope in `PutParams::to_binary` so
+        // the server keeps the inner value as a `BinaryObject` without
+        // loading its class (e.g. `UcpRecord`).
         self.execute::<bulk_put::BulkPutParams, bulk_put::BulkPutResponseParams>(
             bulk_put::PUT_ALL_COMPUTE_TASK,
             Some(params),
@@ -99,6 +121,20 @@ impl Compute {
             exec: self.exec.clone(),
             cluster_group: self.cluster_group.clone(),
             flags: self.flags | FLAG_NO_RESULT_CACHE,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+
+    /// Keep the compute-task argument as a `BinaryObject` on the server (does
+    /// not deserialize into a POJO). Required when the POJO class is not
+    /// available on the server's classpath — the task implementation must use
+    /// `BinaryObject` accessors (e.g. `param.getObject()` returns a
+    /// `BinaryObject`) regardless of this flag.
+    pub fn with_keep_binary(&self) -> Self {
+        Self {
+            exec: self.exec.clone(),
+            cluster_group: self.cluster_group.clone(),
+            flags: self.flags | FLAG_KEEP_BINARY,
             timeout_ms: self.timeout_ms,
         }
     }
@@ -265,7 +301,11 @@ impl<A: WritableType> WriteableReq for ComputeExecuteRequest<'_, A> {
         }
         write_u8(writer, self.flags)?;
         write_i64(writer, self.timeout_ms)?;
-        write_string(writer, &self.task_name)?;
+        // Java's `BinaryReaderEx.readString()` reads a TypeCode byte and
+        // expects STRING (9). `write_string` alone writes just length+bytes
+        // which the server parses as a stray type code (observed as
+        // "Unexpected field type [pos=39, expected=String, actual=54]").
+        write_string_type_code(writer, &self.task_name)?;
         match self.arg {
             Some(arg) => arg.write(writer)?,
             None => write_null(writer)?,
@@ -277,6 +317,8 @@ impl<A: WritableType> WriteableReq for ComputeExecuteRequest<'_, A> {
         4 + self.node_ids.len() * 16
             + 1
             + 8
+            // TypeCode byte (1) + length (4) + UTF-8 bytes.
+            + 1
             + 4
             + self.task_name.len()
             + self.arg.map(WritableType::size).unwrap_or(1)
