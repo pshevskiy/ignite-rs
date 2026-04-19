@@ -777,11 +777,32 @@ impl ReadableType for ComplexObject {
                             IgniteValue::Array(items)
                         }
                         TypeCode::OptimizedMarshaller => {
-                            // JDK-serialized opaque object — read length + bytes, store as Binary.
+                            // JDK-serialized opaque object — preserve as OpaqueMarshal so a
+                            // subsequent write round-trips with the same TypeCode byte. Losing
+                            // the type distinction (e.g. storing as Binary then rewriting as
+                            // ArrByte/9 instead of OptimizedMarshaller/254) breaks byte-level
+                            // `replace_if_equals` on the server side (REG-1).
                             let len = read_i32(&mut remainder)?;
                             let mut buf = vec![0; len as usize];
                             remainder.read_exact(&mut buf)?;
-                            IgniteValue::Binary(buf)
+                            IgniteValue::OpaqueMarshal(buf)
+                        }
+                        TypeCode::WrappedData => {
+                            // `BINARY_OBJ` field-level wrapper — Java `BinaryWriterExImpl
+                            // .writeBinaryObject`: `[type_code(1) | length(4) | bytes(length) |
+                            // start_offset(4)]`. Decode into an inner ComplexObject so field
+                            // access (`obj.field("...")`) works on the wrapped value.
+                            let len = read_i32(&mut remainder)? as usize;
+                            let mut buf = vec![0u8; len];
+                            remainder.read_exact(&mut buf)?;
+                            let start_offset = read_i32(&mut remainder)? as usize;
+                            let mut inner = Cursor::new(&buf[start_offset..]);
+                            let inner_type = TypeCode::try_from(read_u8(&mut inner)?)?;
+                            let inner_obj = ComplexObject::read_unwrapped(inner_type, &mut inner)?;
+                            match inner_obj {
+                                Some(obj) => IgniteValue::Object(Box::new(obj)),
+                                None => IgniteValue::Null,
+                            }
                         }
                         _ => {
                             let msg = format!("Unknown type: {:?}", field_type);
@@ -863,7 +884,8 @@ impl ReadableType for ComplexObject {
                 me.values.push(IgniteValue::Null);
             }
             TypeCode::OptimizedMarshaller => {
-                // JDK-serialized opaque object — read length + bytes, store as Binary.
+                // JDK-serialized opaque object — preserve as OpaqueMarshal so a write
+                // round-trip retains the original TypeCode byte (REG-1).
                 let len = read_i32(reader)?;
                 let mut buf = vec![0; len as usize];
                 reader.read_exact(&mut buf)?;
@@ -871,7 +893,7 @@ impl ReadableType for ComplexObject {
                     type_name: "java.lang.Object".to_string(),
                     fields: vec![],
                 });
-                me.values.push(IgniteValue::Binary(buf));
+                me.values.push(IgniteValue::OpaqueMarshal(buf));
             }
             _ => {
                 return Err(IgniteError::from(
