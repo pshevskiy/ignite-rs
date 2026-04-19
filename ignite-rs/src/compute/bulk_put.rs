@@ -263,19 +263,25 @@ impl BulkPutParams {
             .build()
     }
 
-    /// Send `PutBinaryType` AND `RegisterBinaryTypeName` for every POJO the
-    /// server needs to deserialize the request. Without this, the server
-    /// reports "Failed to resolve class name [typeId=...]" — `PutBinaryType`
-    /// only populates `BinaryContext` (field layout), whereas
-    /// `MarshallerContext.getClassName` (used during `arg.deserialize()`)
-    /// reads from a separate typeId→className table that is filled by
-    /// `RegisterBinaryTypeName`.
+    /// Send `RegisterBinaryTypeName` for every POJO the server needs to
+    /// deserialize the request. Without this, the server reports "Failed to
+    /// resolve class name [typeId=...]" — `MarshallerContext.getClassName`
+    /// (called during `arg.deserialize()`) reads a `typeId → className`
+    /// table populated by the register-type-name opcode.
     ///
-    /// Safe to call repeatedly — both ops are idempotent on the server side.
+    /// We deliberately do NOT send `PutBinaryType` (field-layout metadata).
+    /// The server discovers layout via reflection on its classpath and via
+    /// the compact-footer=false wire format we emit, and pre-registering
+    /// our own metadata risks "type for field 'X' differs: Expected 'Map'
+    /// but 'Object' was provided" conflicts on fields whose Java declared
+    /// type is an interface (Map, List, etc.) — Ignite treats those as
+    /// `BinaryWriteMode.OBJECT` while an instinctive "it's a Map" choice
+    /// on our side emits the `MAP` type id.
+    ///
+    /// Safe to call repeatedly — `register_type_name` is idempotent.
     pub async fn register_types(&self, binary: &Binary) -> IgniteResult<()> {
         for (type_name, build) in all_metadata_builders() {
             let meta = build();
-            binary.put_type(&meta).await?;
             binary.register_type_name(meta.type_id, type_name).await?;
         }
         // Pre-register the response-side schemas in the local registry so the
@@ -556,9 +562,15 @@ fn ignite_type_to_code(ty: &IgniteType) -> TypeCode {
 }
 
 fn bulk_put_params_metadata() -> BinaryTypeMetadata {
+    // Java declares `putParamsList: List<PutParams>`. `List` is an interface,
+    // so Ignite's reflective descriptor treats it as `OBJECT` unless the
+    // runtime instance is a known concrete class (ArrayList/LinkedList).
+    // Matching that on our registration avoids the "type for field
+    // 'putParamsList' mismatch" conflict when the server's reduce-step
+    // serializer auto-registers the class.
     metadata_for_schema(
         class_names::BULK_PUT_PARAMS,
-        vec![("putParamsList", IgniteType::Collection)],
+        vec![("putParamsList", IgniteType::Object)],
     )
 }
 
@@ -618,12 +630,22 @@ fn put_params_metadata() -> BinaryTypeMetadata {
 }
 
 fn index_context_metadata() -> BinaryTypeMetadata {
+    // Java declares each field as `Map<String, ...>`. `Map` is an interface,
+    // and Ignite's reflective descriptor uses `BinaryWriteMode.OBJECT` (103)
+    // for any non-{HashMap, LinkedHashMap} Map field — see
+    // `BinaryUtils.mode(cls)`. Registering these fields with type id `Map`
+    // (25) conflicts with the reflection-derived descriptor on the server:
+    //   "type for field 'indexName2UniqueFactor': Expected 'Map' but
+    //    'Object' was provided" (the server's reflection call sees Map, our
+    //    pre-registration sent Object — and vice versa once we fixed that).
+    // Use the same OBJECT type id we get from `IgniteType::Object` so both
+    // sides agree.
     metadata_for_schema(
         class_names::INDEX_CONTEXT,
         vec![
-            ("indexName2UniqueFactor", IgniteType::Map),
-            ("indexName2AtomicFactor", IgniteType::Map),
-            ("indexName2CacheName", IgniteType::Map),
+            ("indexName2UniqueFactor", IgniteType::Object),
+            ("indexName2AtomicFactor", IgniteType::Object),
+            ("indexName2CacheName", IgniteType::Object),
         ],
     )
 }
