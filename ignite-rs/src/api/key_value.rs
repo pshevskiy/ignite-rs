@@ -233,7 +233,7 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 write_bool(writer, false)?; // enforce join order
                 write_bool(writer, false)?; // collocated
                 write_bool(writer, false)?; // lazy
-                write_i64(writer, 500i64)?; // timeout (ms)
+                write_i64(writer, 0i64)?; // timeout (ms) — 0 = no timeout (FND-024)
                 write_bool(writer, true)?; // include field names
                 Ok(())
             }

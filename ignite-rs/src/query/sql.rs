@@ -335,7 +335,9 @@ impl<Row> SqlFieldsQuery<Row> {
             enforce_join_order: false,
             collocated: false,
             lazy: false,
-            timeout_ms: 500,
+            // FND-024: Java default timeout is 0 (no timeout) per
+            // ClientCacheSqlFieldsQueryRequest; preserve that default here.
+            timeout_ms: 0,
             include_field_names: true,
             update_batch_size: 1,
             partitions: None,
@@ -1303,5 +1305,16 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(partitions.to_string().contains("Illegal partition"));
+    }
+
+    /// FND-024: Java default SQL fields timeout is 0 (no timeout). Rust must match.
+    #[test]
+    fn should_default_sql_fields_query_timeout_to_zero() {
+        let query = SqlFieldsQuery::<Vec<SqlValue>>::new("SELECT 1");
+        assert_eq!(
+            query.timeout_ms(),
+            0,
+            "default timeout must be 0 (no timeout) per Java ClientCacheSqlFieldsQueryRequest"
+        );
     }
 }
