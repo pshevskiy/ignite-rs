@@ -179,10 +179,49 @@ impl ServiceProxy {
         }
     }
 
+    /// Invoke a service method. Per-argument Java parameter type IDs are
+    /// derived from the `IgniteValue` variant via [`default_param_type_id`] —
+    /// matching Java when the declared parameter type is the standard wrapper
+    /// class for that value (e.g. `Integer` for `IgniteValue::Int`).
+    ///
+    /// For methods with overloaded signatures (e.g. `process(int)` vs
+    /// `process(long)`), use [`invoke_with_types`](Self::invoke_with_types)
+    /// to supply exact type IDs matching the target overload's declared
+    /// parameter class names.
     pub async fn invoke<R: ReadableType>(
         &self,
         method: &str,
         args: &[IgniteValue],
+    ) -> IgniteResult<Option<R>> {
+        let typed_args: Vec<(i32, &IgniteValue)> = args
+            .iter()
+            .map(|arg| (default_param_type_id(arg), arg))
+            .collect();
+        self.invoke_typed(method, &typed_args).await
+    }
+
+    /// Invoke a service method with explicit per-argument Java parameter type
+    /// IDs. Pairs of `(typeId, argValue)` — `typeId` must match the declared
+    /// Java parameter type via `BinaryContext.typeId(parameterType.getName())`
+    /// so the server resolves the correct overload (§7.4, FND-048).
+    ///
+    /// Use [`param_type_id`] to compute a typeId from a Java class name.
+    pub async fn invoke_with_types<R: ReadableType>(
+        &self,
+        method: &str,
+        args: &[(i32, IgniteValue)],
+    ) -> IgniteResult<Option<R>> {
+        let typed_args: Vec<(i32, &IgniteValue)> = args
+            .iter()
+            .map(|(type_id, value)| (*type_id, value))
+            .collect();
+        self.invoke_typed(method, &typed_args).await
+    }
+
+    async fn invoke_typed<R: ReadableType>(
+        &self,
+        method: &str,
+        args: &[(i32, &IgniteValue)],
     ) -> IgniteResult<Option<R>> {
         let cluster_node_ids = self.services.cluster_group.node_ids().await?;
         if cluster_node_ids.is_empty() {
@@ -221,6 +260,106 @@ impl ServiceProxy {
     }
 }
 
+/// Java `BinaryContext.typeId(className)` — for well-known wrapper classes
+/// and primitive arrays the server resolves to a fixed
+/// `GridBinaryMarshaller` constant (e.g. `Integer` → `INT = 3`); for other
+/// class names it falls through to the `SIMPLE_NAME_LOWER_CASE_MAPPER`
+/// which hashes `simple_name(name).to_lowercase()` (Java hashcode).
+///
+/// Used for the `SERVICE_INVOKE` per-argument `paramTypeId` prefix (§7.1).
+pub fn param_type_id(java_class_name: &str) -> i32 {
+    use crate::utils::string_to_java_hashcode;
+
+    // Predefined mappings from `BinaryContext.registerPredefinedType(...)`
+    // — the simple lowercase class name maps to a `GridBinaryMarshaller`
+    // constant. Primitives (`int`, `long`, …) are NOT predefined; they
+    // hash through to `string_to_java_hashcode` just like user classes.
+    let simple_lower = simple_name_lowercase(java_class_name);
+    match simple_lower.as_str() {
+        "object" => -1,
+        "byte" if java_class_name == "java.lang.Byte" => 1,
+        "short" if java_class_name == "java.lang.Short" => 2,
+        "integer" => 3,
+        "long" if java_class_name == "java.lang.Long" => 4,
+        "float" if java_class_name == "java.lang.Float" => 5,
+        "double" if java_class_name == "java.lang.Double" => 6,
+        "character" => 7,
+        "boolean" if java_class_name == "java.lang.Boolean" => 8,
+        "string" if java_class_name == "java.lang.String" => 9,
+        "uuid" if java_class_name == "java.util.UUID" => 10,
+        "date" if java_class_name == "java.util.Date" => 11,
+        "timestamp" if java_class_name == "java.sql.Timestamp" => 33,
+        "time" if java_class_name == "java.sql.Time" => 36,
+        "bigdecimal" if java_class_name == "java.math.BigDecimal" => 30,
+        "byte[]" => 12,
+        "short[]" => 13,
+        "int[]" => 14,
+        "long[]" => 15,
+        "float[]" => 16,
+        "double[]" => 17,
+        "char[]" => 18,
+        "boolean[]" => 19,
+        _ => string_to_java_hashcode(&simple_lower),
+    }
+}
+
+/// Java `SIMPLE_NAME_LOWER_CASE_MAPPER.typeName(clsName)` — strips package
+/// then lowercases. For primitive-array class names (`"[B"`, `"[I"`, …)
+/// Java returns the canonical `Type[]` form used by `BinaryContext`'s
+/// predefined-type table; this helper normalizes the few forms we need.
+fn simple_name_lowercase(class_name: &str) -> String {
+    let canonical = match class_name {
+        "[B" => "byte[]",
+        "[S" => "short[]",
+        "[I" => "int[]",
+        "[J" => "long[]",
+        "[F" => "float[]",
+        "[D" => "double[]",
+        "[C" => "char[]",
+        "[Z" => "boolean[]",
+        other => other,
+    };
+    let simple = match canonical.rfind(['.', '$']) {
+        Some(idx) => &canonical[idx + 1..],
+        None => canonical,
+    };
+    simple.to_lowercase()
+}
+
+/// Derive a Java parameter type ID from an `IgniteValue` variant, assuming
+/// the method's declared parameter type is the standard Java wrapper class
+/// for that value (`Integer` for `Int`, `String` for `String`, …). For
+/// `IgniteValue::Object` the ComplexObject's type_name is used. For
+/// `Null` / `Map` / `Collection` / `PreEncoded` / `OpaqueMarshal` this
+/// returns `OBJECT = -1` — callers needing overload-precise dispatch must
+/// use [`ServiceProxy::invoke_with_types`].
+fn default_param_type_id(value: &IgniteValue) -> i32 {
+    match value {
+        IgniteValue::Byte(_) => 1,
+        IgniteValue::Short(_) => 2,
+        IgniteValue::Int(_) => 3,
+        IgniteValue::Long(_) => 4,
+        IgniteValue::Float(_) => 5,
+        IgniteValue::Double(_) => 6,
+        IgniteValue::Char(_) => 7,
+        IgniteValue::Bool(_) => 8,
+        IgniteValue::String(_) => 9,
+        IgniteValue::Uuid(_, _) => 10,
+        IgniteValue::Date(_) => 11,
+        IgniteValue::Binary(_) => 12,
+        IgniteValue::Array(_) => 23, // Object[] → OBJ_ARR
+        IgniteValue::Enum(_) => 28,
+        IgniteValue::Timestamp(_, _) => 33,
+        IgniteValue::Time(_) => 36,
+        IgniteValue::Decimal(_, _) => 30,
+        IgniteValue::Object(obj) => param_type_id(obj.type_name()),
+        // Null, Map, Collection, PreEncoded, OpaqueMarshal have no single
+        // canonical Java parameter-type mapping. Fall back to OBJECT=-1
+        // (matches a method declared as `Object`).
+        _ => -1,
+    }
+}
+
 struct EmptyRequest;
 
 impl WriteableReq for EmptyRequest {
@@ -252,7 +391,7 @@ struct ServiceInvokeRequest<'a> {
     timeout_ms: i64,
     cluster_node_ids: Vec<String>,
     method_name: String,
-    args: &'a [IgniteValue],
+    args: &'a [(i32, &'a IgniteValue)],
     call_context: Option<&'a ServiceCallContext>,
 }
 
@@ -279,7 +418,13 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
         }
         write_string_type_code(writer, &self.method_name)?;
         write_i32(writer, self.args.len() as i32)?;
-        for arg in self.args {
+        // FND-045: Each arg is prefixed with the declared-parameter typeId.
+        // Java `ClientServicesImpl.java:395-398@2.17.0` writes
+        // `(i32 paramTypeId, <any-object> argValue)` per arg — the server
+        // uses the `(methodName, List<paramTypeId>)` pair to resolve the
+        // correct overload (§7.4, FND-048).
+        for (type_id, arg) in self.args {
+            write_i32(writer, *type_id)?;
             arg.write(writer)?;
         }
         write_nullable_map(writer, self.call_context.map(|ctx| &ctx.values))?;
@@ -295,7 +440,11 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
             + self.cluster_node_ids.len() * 16
             + 1 + 4 + self.method_name.len()
             + 4
-            + self.args.iter().map(WritableType::size).sum::<usize>()
+            + self
+                .args
+                .iter()
+                .map(|(_, arg)| 4 + arg.size())
+                .sum::<usize>()
             + nullable_map_size(self.call_context.map(|ctx| &ctx.values))
     }
 }
@@ -399,9 +548,10 @@ mod tests {
     use crate::protocol::TypeCode;
 
     const TYPE_CODE_STRING: u8 = TypeCode::String as u8;
+    const TYPE_CODE_INT: u8 = TypeCode::Int as u8;
 
     fn build_request<'a>(
-        args: &'a [IgniteValue],
+        args: &'a [(i32, &'a IgniteValue)],
         call_context: Option<&'a ServiceCallContext>,
     ) -> ServiceInvokeRequest<'a> {
         ServiceInvokeRequest {
@@ -446,7 +596,8 @@ mod tests {
     /// 4-byte request-length pre-allocation is correct.
     #[test]
     fn service_invoke_size_matches_written_bytes() {
-        let args = [IgniteValue::from("ping".to_string())];
+        let ping = IgniteValue::from("ping".to_string());
+        let args: [(i32, &IgniteValue); 1] = [(9, &ping)];
         let req = build_request(&args, None);
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
@@ -467,5 +618,104 @@ mod tests {
             buf[flags_offset], FLAG_PARAMETER_TYPES_MASK,
             "flags byte must be 0x02 (FLAG_PARAMETER_TYPES_MASK)"
         );
+    }
+
+    /// FND-045: Each arg is prefixed with a 4-byte `paramTypeId`. With an
+    /// `Int` arg (value 7), Java sends `typeId=3` (GridBinaryMarshaller.INT
+    /// for `Integer.class`) followed by the typed int object.
+    #[test]
+    fn args_are_prefixed_with_param_type_id() {
+        let int_val = IgniteValue::Int(7);
+        let args: [(i32, &IgniteValue); 1] = [(3, &int_val)];
+        let req = build_request(&args, None);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // method_name typed header = 1+4+1 ("m"). Preceded by:
+        //   typed svc_name (1+4+3=8) + flags (1) + timeout (8) + nodeCount (4) = 21.
+        let method_start = 1 + 4 + "svc".len() + 1 + 8 + 4;
+        let after_method = method_start + 1 + 4 + "m".len();
+        // arg_count (4) then first arg: typeId (4) + int object (1+4=5).
+        let arg_count = i32::from_le_bytes(
+            buf[after_method..after_method + 4].try_into().unwrap(),
+        );
+        assert_eq!(arg_count, 1);
+        let type_id_offset = after_method + 4;
+        let type_id = i32::from_le_bytes(
+            buf[type_id_offset..type_id_offset + 4].try_into().unwrap(),
+        );
+        assert_eq!(type_id, 3, "Integer typeId must be GridBinaryMarshaller.INT = 3");
+        // Arg value: TypeCode::Int then 4 bytes of i32.
+        let arg_code_offset = type_id_offset + 4;
+        assert_eq!(buf[arg_code_offset], TYPE_CODE_INT);
+    }
+
+    /// FND-045 helper: `param_type_id` maps Java class names to
+    /// `GridBinaryMarshaller` constants for predefined wrappers, matching
+    /// `BinaryContext.typeId(...)` on the Java side.
+    #[test]
+    fn param_type_id_matches_java_predefined_constants() {
+        assert_eq!(param_type_id("java.lang.Byte"), 1);
+        assert_eq!(param_type_id("java.lang.Short"), 2);
+        assert_eq!(param_type_id("java.lang.Integer"), 3);
+        assert_eq!(param_type_id("java.lang.Long"), 4);
+        assert_eq!(param_type_id("java.lang.Float"), 5);
+        assert_eq!(param_type_id("java.lang.Double"), 6);
+        assert_eq!(param_type_id("java.lang.Character"), 7);
+        assert_eq!(param_type_id("java.lang.Boolean"), 8);
+        assert_eq!(param_type_id("java.lang.String"), 9);
+        assert_eq!(param_type_id("java.util.UUID"), 10);
+        assert_eq!(param_type_id("java.util.Date"), 11);
+        assert_eq!(param_type_id("byte[]"), 12);
+        assert_eq!(param_type_id("int[]"), 14);
+        assert_eq!(param_type_id("java.sql.Timestamp"), 33);
+    }
+
+    /// FND-045 helper: primitives `int`, `long`, etc. are NOT predefined in
+    /// `BinaryContext`; they hash through the SIMPLE_NAME_LOWER_CASE_MAPPER.
+    /// `BinaryBasicIdMapper.lowerCaseHashCode("int") == "int".hashCode()`
+    /// (lowercase hashing leaves ASCII unchanged).
+    #[test]
+    fn param_type_id_primitive_names_use_hashcode() {
+        use crate::utils::string_to_java_hashcode;
+        assert_eq!(param_type_id("int"), string_to_java_hashcode("int"));
+        assert_eq!(param_type_id("long"), string_to_java_hashcode("long"));
+    }
+
+    /// FND-048 (overload dispatch): sending `process` with `Int(7)` should
+    /// emit the typeId for `Integer` (3), while the same method with
+    /// `Long(7)` emits typeId `Long` (4). Server uses
+    /// `(methodName, List<paramTypeId>)` to pick the overload.
+    #[test]
+    fn overload_dispatch_uses_distinct_type_ids_per_arg_variant() {
+        let int_val = IgniteValue::Int(7);
+        let long_val = IgniteValue::Long(7);
+        let args_int: [(i32, &IgniteValue); 1] = [(default_param_type_id(&int_val), &int_val)];
+        let args_long: [(i32, &IgniteValue); 1] = [(default_param_type_id(&long_val), &long_val)];
+
+        let mut buf_int = Vec::new();
+        build_request(&args_int, None).write(&mut buf_int).unwrap();
+        let mut buf_long = Vec::new();
+        build_request(&args_long, None)
+            .write(&mut buf_long)
+            .unwrap();
+
+        let method_start = 1 + 4 + "svc".len() + 1 + 8 + 4;
+        let after_method = method_start + 1 + 4 + "m".len();
+        let type_id_offset = after_method + 4;
+
+        let int_type_id = i32::from_le_bytes(
+            buf_int[type_id_offset..type_id_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let long_type_id = i32::from_le_bytes(
+            buf_long[type_id_offset..type_id_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(int_type_id, 3);
+        assert_eq!(long_type_id, 4);
+        assert_ne!(int_type_id, long_type_id);
     }
 }

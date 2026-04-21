@@ -259,6 +259,8 @@ fn decode_service_invoke_payload(payload: &[u8]) -> DecodedInvokePayload {
     let method_name = ignite_rs::protocol::read_string(&mut cursor).unwrap();
     let arg_count = ignite_rs::protocol::read_i32(&mut cursor).unwrap();
     let arg0 = if arg_count > 0 {
+        // FND-045: each arg is prefixed with i32 paramTypeId.
+        let _param_type_id = ignite_rs::protocol::read_i32(&mut cursor).unwrap();
         String::read(&mut cursor).unwrap()
     } else {
         None
