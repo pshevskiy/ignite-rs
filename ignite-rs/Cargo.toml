@@ -27,6 +27,7 @@ optional = true
 hex-literal = "0.4.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net", "process"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
+dhat = "0.3"
 ignite-rs_derive = { path = "../ignite-rs_derive" }
 testcontainers = { version = "0.15", features = ["experimental"] }
 bollard = "0.13"
@@ -54,3 +55,6 @@ harness = false
 [[bench]]
 name = "hot_path"
 harness = false
+
+[[example]]
+name = "dhat_hot_path"
