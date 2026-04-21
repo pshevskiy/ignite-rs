@@ -17,12 +17,15 @@ use arc_swap::ArcSwap;
 use std::cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
+use std::future::Future;
 use std::io;
 use std::io::{Cursor, Write};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
 const REQ_HEADER_SIZE_BYTES: i32 = 10;
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -178,14 +181,108 @@ impl ReadableReq for DataCenterNodesResp {
     }
 }
 
+/// A slot in the in-flight request table. Replaces the per-request
+/// `oneshot::channel()` + `HashMap<i64, Sender>` pair (PFND-004). The slot is
+/// shared between the request task (waiter) and the response pump (filler)
+/// via `Arc<InFlightSlot>` stored in `Channel::inflight_shards`.
+///
+/// Keeping the waker, completion flag, and result behind a single `Mutex`
+/// ensures exactly one heap allocation per in-flight request (the `Arc`
+/// itself) — no additional allocation from a separate waker-storage path.
+/// `tokio::sync::Notify` was measured to allocate an extra linked-list node
+/// on first poll; we avoid that by wiring the waker ourselves.
+struct InFlightSlot {
+    inner: StdMutex<SlotInner>,
+}
+
+struct SlotInner {
+    /// Filled exactly once by the response pump, the writer pump
+    /// (connection-lost path), or `mark_broken` (drain-all path). The waiter
+    /// takes it out inside `WaitFuture::poll`.
+    result: Option<IgniteResult<ResponseFrame>>,
+    /// Parked waker from the waiter's `WaitFuture`, if any. `None` before
+    /// the first `poll`, and re-set on subsequent polls if the waker clones
+    /// differently. Cleared when consumed by a filler calling `fill()`.
+    waker: Option<Waker>,
+    /// Set to true when `fill()` stores a result. The waiter checks this
+    /// flag under the same mutex to detect completion.
+    done: bool,
+}
+
+impl InFlightSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: StdMutex::new(SlotInner {
+                result: None,
+                waker: None,
+                done: false,
+            }),
+        })
+    }
+
+    /// Store a result in the slot and wake the waiter, if any. Called by the
+    /// response pump (success path), the request entry path
+    /// (connection-lost), and `mark_broken` (drain-all).
+    fn fill(&self, result: IgniteResult<ResponseFrame>) {
+        let waker = {
+            let mut guard = self.inner.lock().expect("InFlightSlot poisoned");
+            if guard.done {
+                // Already filled (e.g. late response after timeout or a
+                // duplicate drain). Preserve the first result.
+                return;
+            }
+            guard.result = Some(result);
+            guard.done = true;
+            guard.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+/// Future returned by `InFlightSlot::wait` — a hand-rolled awaitable over
+/// the slot state. No heap allocation beyond the `Arc<InFlightSlot>` held
+/// by the caller and the in-flight map; the waker node lives inline inside
+/// this future's stack (task-owned) state. See PFND-004.
+struct WaitFuture<'a> {
+    slot: &'a InFlightSlot,
+}
+
+impl<'a> Future for WaitFuture<'a> {
+    type Output = IgniteResult<ResponseFrame>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut guard = self.slot.inner.lock().expect("InFlightSlot poisoned");
+        if guard.done {
+            let taken = guard.result.take().unwrap_or_else(|| {
+                Err(IgniteError::connection(
+                    "InFlightSlot finished without a result",
+                ))
+            });
+            Poll::Ready(taken)
+        } else {
+            // Only replace the stored waker if it would observably change
+            // behavior. Saves a clone on re-polls from the same task.
+            match &guard.waker {
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => guard.waker = Some(cx.waker().clone()),
+            }
+            Poll::Pending
+        }
+    }
+}
+
 struct Channel {
     address: String,
     request_timeout: Option<Duration>,
     metadata: ConnectionMetadata,
     writer_tx: mpsc::UnboundedSender<OutboundRequest>,
-    /// Sharded inflight map — reduces Mutex contention under concurrent load.
-    /// Shard selected by corr_id % SHARD_COUNT.
-    inflight_shards: Box<[StdMutex<HashMap<i64, oneshot::Sender<IgniteResult<ResponseFrame>>>>]>,
+    /// Sharded in-flight request table — reduces Mutex contention under
+    /// concurrent load. Shard selected by corr_id % SHARD_COUNT. Each slot is
+    /// an `Arc<InFlightSlot>` shared with the awaiting request task; replaces
+    /// the per-request `oneshot::channel()` allocation (PFND-004).
+    inflight_shards: Box<[StdMutex<HashMap<i64, Arc<InFlightSlot>>>]>,
     notification_listeners:
         Mutex<HashMap<(i16, i64), mpsc::UnboundedSender<IgniteResult<NotificationFrame>>>>,
     pending_notifications: Mutex<HashMap<(i16, i64), Vec<NotificationFrame>>>,
@@ -229,10 +326,7 @@ impl Channel {
     }
 
     #[inline]
-    fn inflight_shard(
-        &self,
-        corr_id: i64,
-    ) -> &StdMutex<HashMap<i64, oneshot::Sender<IgniteResult<ResponseFrame>>>> {
+    fn inflight_shard(&self, corr_id: i64) -> &StdMutex<HashMap<i64, Arc<InFlightSlot>>> {
         &self.inflight_shards[(corr_id as usize) % self.inflight_shards.len()]
     }
 
@@ -314,11 +408,15 @@ impl Channel {
             return Err(self.closed_error().await);
         }
 
-        let (tx, rx) = oneshot::channel();
+        // Insert an in-flight slot keyed by corr_id. The response pump takes
+        // it out on reply; `mark_broken` drains all slots on failure. One
+        // allocation per request (the `Arc<InFlightSlot>`); no per-request
+        // oneshot channel, no boxed future (PFND-004).
+        let slot = InFlightSlot::new();
         self.inflight_shard(corr_id)
             .lock()
             .unwrap()
-            .insert(corr_id, tx);
+            .insert(corr_id, slot.clone());
 
         if self.writer_tx.send(OutboundRequest { request }).is_err() {
             self.inflight_shard(corr_id)
@@ -328,7 +426,7 @@ impl Channel {
             return Err(self.closed_error().await);
         }
 
-        let frame = match self.await_response(corr_id, rx).await {
+        let frame = match self.await_response(&slot).await {
             Ok(frame) => frame,
             Err(err) => {
                 self.inflight_shard(corr_id)
@@ -349,20 +447,17 @@ impl Channel {
         Ok(frame)
     }
 
-    async fn await_response(
-        &self,
-        corr_id: i64,
-        rx: oneshot::Receiver<IgniteResult<ResponseFrame>>,
-    ) -> IgniteResult<ResponseFrame> {
+    async fn await_response(&self, slot: &InFlightSlot) -> IgniteResult<ResponseFrame> {
+        let waiter = WaitFuture { slot };
         match self.request_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, rx).await {
-                Ok(result) => resolve_response(corr_id, result),
+            Some(timeout) => match tokio::time::timeout(timeout, waiter).await {
+                Ok(result) => result,
                 Err(_) => Err(IgniteError::connection(format!(
                     "Operation timed out after {:?}",
                     timeout
                 ))),
             },
-            None => resolve_response(corr_id, rx.await),
+            None => waiter.await,
         }
     }
 
@@ -449,13 +544,13 @@ impl Channel {
             loop {
                 match read_incoming_frame(&mut reader, &channel.metadata).await {
                     Ok(IncomingFrame::Response(frame)) => {
-                        let waiter = channel
+                        let slot = channel
                             .inflight_shard(frame.correlation_id)
                             .lock()
                             .unwrap()
                             .remove(&frame.correlation_id);
-                        if let Some(waiter) = waiter {
-                            let _ = waiter.send(Ok(frame));
+                        if let Some(slot) = slot {
+                            slot.fill(Ok(frame));
                         }
                     }
                     Ok(IncomingFrame::Notification(frame)) => {
@@ -483,14 +578,14 @@ impl Channel {
             return;
         }
 
-        // Drain all inflight shards
+        // Drain all inflight shards — fail every waiter with a connection error.
         for shard in self.inflight_shards.iter() {
             let pending = {
                 let mut shard = shard.lock().unwrap();
                 std::mem::take(&mut *shard)
             };
-            for (_, waiter) in pending {
-                let _ = waiter.send(Err(IgniteError::connection(detail.as_str())));
+            for (_, slot) in pending {
+                slot.fill(Err(IgniteError::connection(detail.as_str())));
             }
         }
 
@@ -544,19 +639,6 @@ impl Channel {
             Some(detail) => IgniteError::connection(detail),
             None => IgniteError::connection("channel is closed"),
         }
-    }
-}
-
-fn resolve_response(
-    corr_id: i64,
-    response: Result<IgniteResult<ResponseFrame>, oneshot::error::RecvError>,
-) -> IgniteResult<ResponseFrame> {
-    match response {
-        Ok(result) => result,
-        Err(_) => Err(IgniteError::connection(format!(
-            "response pump stopped while waiting for correlation id {}",
-            corr_id
-        ))),
     }
 }
 
@@ -1085,7 +1167,12 @@ impl ChannelManager {
 
                     // Lazy address: only allocate when caller needs ResponseMeta
                     let address = channel.address().to_string();
-                    return Ok((response.flag, response.body, response.payload_offset, ResponseMeta { address }));
+                    return Ok((
+                        response.flag,
+                        response.body,
+                        response.payload_offset,
+                        ResponseMeta { address },
+                    ));
                 }
                 Err(err) => {
                     let address = channel.address().to_string();
@@ -1659,7 +1746,9 @@ impl ChannelManager {
     /// Gates the trailing `bool forceDeactivation` on `CLUSTER_CHANGE_STATE`
     /// (Java §9, FND-056).
     pub(crate) async fn supports_force_deactivation_flag(&self) -> bool {
-        self.default_channel().await.supports_force_deactivation_flag()
+        self.default_channel()
+            .await
+            .supports_force_deactivation_flag()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {
@@ -2396,8 +2485,9 @@ mod tests {
 
     #[test]
     fn encode_request_backpatches_length_on_size_mismatch() {
-        let buf = ChannelManager::encode_request(0x42i16, 0x11_22_33_44_55_66_77_88i64, &LyingPayload)
-            .expect("encode");
+        let buf =
+            ChannelManager::encode_request(0x42i16, 0x11_22_33_44_55_66_77_88i64, &LyingPayload)
+                .expect("encode");
         // Frame layout:
         //   [0..4]  i32 length (should equal buf.len() - 4 per Java)
         //   [4..6]  i16 op_code
@@ -2524,21 +2614,21 @@ mod tests {
 
         // The Java ClientRetryReadPolicy ops, as i16 opcodes.
         let java_read_policy_ops: &[OpCode] = &[
-            OpCode::CacheGetNames,          // CACHE_GET_NAMES
-            OpCode::CacheGet,               // CACHE_GET
-            OpCode::CacheContainsKey,       // CACHE_CONTAINS_KEY
-            OpCode::CacheContainsKeys,      // CACHE_CONTAINS_KEYS
-            OpCode::CacheGetConfiguration,  // CACHE_GET_CONFIGURATION
-            OpCode::CacheGetSize,           // CACHE_GET_SIZE
-            OpCode::CacheGetAll,            // CACHE_GET_ALL
-            OpCode::QueryScan,              // QUERY_SCAN
-            OpCode::QueryContinuous,        // QUERY_CONTINUOUS
-            OpCode::ClusterGetState,        // CLUSTER_GET_STATE
-            OpCode::ClusterGetWalState,     // CLUSTER_GET_WAL_STATE
-            OpCode::ClusterGroupGetNodeIds, // CLUSTER_GROUP_GET_NODE_IDS → CLUSTER_GROUP_GET_NODES
+            OpCode::CacheGetNames,           // CACHE_GET_NAMES
+            OpCode::CacheGet,                // CACHE_GET
+            OpCode::CacheContainsKey,        // CACHE_CONTAINS_KEY
+            OpCode::CacheContainsKeys,       // CACHE_CONTAINS_KEYS
+            OpCode::CacheGetConfiguration,   // CACHE_GET_CONFIGURATION
+            OpCode::CacheGetSize,            // CACHE_GET_SIZE
+            OpCode::CacheGetAll,             // CACHE_GET_ALL
+            OpCode::QueryScan,               // QUERY_SCAN
+            OpCode::QueryContinuous,         // QUERY_CONTINUOUS
+            OpCode::ClusterGetState,         // CLUSTER_GET_STATE
+            OpCode::ClusterGetWalState,      // CLUSTER_GET_WAL_STATE
+            OpCode::ClusterGroupGetNodeIds,  // CLUSTER_GROUP_GET_NODE_IDS → CLUSTER_GROUP_GET_NODES
             OpCode::ClusterGroupGetNodeInfo, // CLUSTER_GROUP_GET_NODE_INFO → CLUSTER_GROUP_GET_NODES
-            OpCode::ServiceGetDescriptors,  // SERVICE_GET_DESCRIPTORS
-            OpCode::ServiceGetDescriptor,   // SERVICE_GET_DESCRIPTOR
+            OpCode::ServiceGetDescriptors,   // SERVICE_GET_DESCRIPTORS
+            OpCode::ServiceGetDescriptor,    // SERVICE_GET_DESCRIPTOR
         ];
 
         for op in java_read_policy_ops {
