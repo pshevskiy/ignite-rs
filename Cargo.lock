@@ -820,6 +820,7 @@ version = "0.1.1"
 dependencies = [
  "arc-swap",
  "bollard",
+ "bytes",
  "criterion",
  "dhat",
  "futures-util",

@@ -3,6 +3,7 @@ use crate::protocol::Flag::{Failure, Success};
 use crate::protocol::{read_i16, read_i32, read_i64, read_string, write_i32, Flag, TypeCode};
 use crate::topology::TopologyVersion;
 use crate::ClientConfig;
+use bytes::{Bytes, BytesMut};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::future::Future;
@@ -97,7 +98,10 @@ pub(crate) struct ConnectionMetadata {
 pub(crate) struct ResponseFrame {
     pub(crate) correlation_id: i64,
     pub(crate) flag: Flag,
-    pub(crate) body: Vec<u8>,
+    /// Reference-counted view of the response body bytes. The response pump
+    /// hands off a `Bytes` slice of its reusable `BytesMut` read buffer — no
+    /// per-frame heap allocation once the buffer is warmed up (PFND-005).
+    pub(crate) body: Bytes,
     /// Offset into `body` where the payload starts (after header/flags).
     pub(crate) payload_offset: usize,
     pub(crate) topology_version: Option<TopologyVersion>,
@@ -108,7 +112,7 @@ pub(crate) struct NotificationFrame {
     pub(crate) resource_id: i64,
     pub(crate) op_code: i16,
     pub(crate) flag: Flag,
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Bytes,
     /// Offset into `body` where the payload starts.
     pub(crate) payload_offset: usize,
     #[allow(dead_code)]
@@ -283,6 +287,7 @@ where
 pub(crate) async fn read_incoming_frame(
     reader: &mut AsyncReadHalf,
     metadata: &ConnectionMetadata,
+    buf: &mut BytesMut,
 ) -> IgniteResult<IncomingFrame> {
     let mut len_buf = [0u8; 4];
     reader
@@ -296,16 +301,22 @@ pub(crate) async fn read_incoming_frame(
     }
     let body_len = body_len_i32 as usize;
 
+    // PFND-005 — reuse the caller-provided `BytesMut` as a read buffer, then
+    // hand off a `Bytes` view to the decoder. When no prior frame's `Bytes`
+    // view is still alive, `BytesMut` reuses its underlying allocation —
+    // eliminating the per-frame ~2 KB allocation from `attach_response_pump`.
+    buf.clear();
+    buf.reserve(body_len);
     // SAFETY: read_exact fills all `body_len` bytes before any read access.
     // Skipping zero-init avoids unnecessary memset on every response.
-    let mut body = Vec::with_capacity(body_len);
-    unsafe { body.set_len(body_len); }
+    unsafe { buf.set_len(body_len); }
     reader
-        .read_exact(&mut body)
+        .read_exact(&mut buf[..body_len])
         .await
         .map_err(|err| IgniteError::connection(err.to_string()))?;
+    let body: Bytes = buf.split_to(body_len).freeze();
 
-    let mut rdr = Cursor::new(&body);
+    let mut rdr = Cursor::new(body.as_ref());
     let correlation_id = read_i64(&mut rdr)?;
     let mut topology_version = None;
 
@@ -1134,7 +1145,10 @@ mod tests {
             },
             server_node_id: None,
         };
-        let frame = read_incoming_frame(&mut reader, &meta).await.unwrap();
+        let mut buf = bytes::BytesMut::new();
+        let frame = read_incoming_frame(&mut reader, &meta, &mut buf)
+            .await
+            .unwrap();
 
         writer_fut.await.unwrap();
 

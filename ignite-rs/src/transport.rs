@@ -57,18 +57,6 @@ impl ReadableReq for LongResp {
     }
 }
 
-struct RawPayload {
-    body: Vec<u8>,
-}
-
-impl ReadableReq for RawPayload {
-    fn read(reader: &mut impl io::Read) -> IgniteResult<Self> {
-        let mut body = Vec::new();
-        reader.read_to_end(&mut body).map_err(IgniteError::from)?;
-        Ok(Self { body })
-    }
-}
-
 struct NodeEndpointsReq {
     start_topology_version: i64,
     end_topology_version: i64,
@@ -541,8 +529,16 @@ impl Channel {
     fn attach_response_pump(self: &Arc<Self>, mut reader: AsyncReadHalf) {
         let channel = self.clone();
         let handle = tokio::spawn(async move {
+            // PFND-005 — reusable read buffer for the response pump. Each
+            // `read_incoming_frame` call resets this buffer, reads the frame
+            // body into it, then hands off a ref-counted `Bytes` slice to the
+            // waiter via `InFlightSlot::fill`. When all awaiters drop their
+            // `Bytes` before the next frame arrives, `BytesMut::reserve` reuses
+            // the same underlying allocation — removing the per-frame heap
+            // allocation that dominated the dhat profile (site #0).
+            let mut read_buf = bytes::BytesMut::with_capacity(4096);
             loop {
-                match read_incoming_frame(&mut reader, &channel.metadata).await {
+                match read_incoming_frame(&mut reader, &channel.metadata, &mut read_buf).await {
                     Ok(IncomingFrame::Response(frame)) => {
                         let slot = channel
                             .inflight_shard(frame.correlation_id)
@@ -1063,6 +1059,45 @@ impl ChannelManager {
         }
     }
 
+    /// PFND-005 — return the raw payload `Bytes` (the response body starting
+    /// at `payload_offset`) without copying through a `ReadableReq::read`.
+    /// The old `RawPayload` path did a `read_to_end` that cloned the entire
+    /// body into a fresh `Vec<u8>` (dhat site #2). This helper hands back a
+    /// ref-counted slice of the read buffer instead.
+    async fn send_internal_and_get_payload_on_channel(
+        &self,
+        channel: Arc<Channel>,
+        op_code: OpCode,
+        data: impl WriteableReq,
+    ) -> IgniteResult<bytes::Bytes> {
+        let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let frame = channel.request(corr_id, request).await?;
+        match frame.flag {
+            Success => Ok(frame.body.slice(frame.payload_offset..)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
+        }
+    }
+
+    /// PFND-005 — as `send_and_read_with_meta` but returns the raw payload
+    /// `Bytes` (zero-copy) instead of driving a `ReadableReq`.
+    async fn send_and_get_payload_with_meta(
+        &self,
+        op_code: OpCode,
+        data: impl WriteableReq,
+        route: RequestRoute,
+    ) -> IgniteResult<(bytes::Bytes, ResponseMeta)> {
+        let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let (flag, body, payload_offset, meta) = self
+            .round_trip_with_route(op_code as i16, corr_id, request, true, route)
+            .await?;
+        match flag {
+            Success => Ok((body.slice(payload_offset..), meta)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
+        }
+    }
+
     async fn resolve_heartbeat_interval(&self) -> Option<Duration> {
         if !self.active.read().await.supports_heartbeat() {
             return None;
@@ -1112,7 +1147,7 @@ impl ChannelManager {
         corr_id: i64,
         mut request: Vec<u8>,
         emit_request_events: bool,
-    ) -> IgniteResult<(Flag, Vec<u8>, usize, ResponseMeta)> {
+    ) -> IgniteResult<(Flag, bytes::Bytes, usize, ResponseMeta)> {
         let max_attempts = self.max_attempts();
         let mut attempt = 0usize;
         let mut started_emitted = false;
@@ -1227,7 +1262,7 @@ impl ChannelManager {
         request: Vec<u8>,
         emit_request_events: bool,
         route: RequestRoute,
-    ) -> IgniteResult<(Flag, Vec<u8>, usize)> {
+    ) -> IgniteResult<(Flag, bytes::Bytes, usize)> {
         let (flag, body, payload_offset, _meta) = self
             .round_trip_with_route(op_code, corr_id, request, emit_request_events, route)
             .await?;
@@ -1241,7 +1276,7 @@ impl ChannelManager {
         request: Vec<u8>,
         emit_request_events: bool,
         route: RequestRoute,
-    ) -> IgniteResult<(Flag, Vec<u8>, usize, ResponseMeta)> {
+    ) -> IgniteResult<(Flag, bytes::Bytes, usize, ResponseMeta)> {
         if route.is_default() {
             return self
                 .round_trip_internal(op_code, corr_id, request, emit_request_events)
@@ -1827,8 +1862,8 @@ impl ChannelManager {
         let dc_aware_request = active.supports_dc_aware();
         let all_affinity_mappings = active.supports_all_affinity_mappings();
         let dc_id = self.data_center_id().map(str::to_owned);
-        let (raw, meta): (RawPayload, ResponseMeta) = match self
-            .send_and_read_with_meta(
+        let (raw_body, meta) = match self
+            .send_and_get_payload_with_meta(
                 OpCode::CachePartitions,
                 CachePartitionsRequest {
                     all_affinity_mappings,
@@ -1859,7 +1894,7 @@ impl ChannelManager {
             .unwrap_or(all_affinity_mappings);
 
         let response = match CachePartitionsResponse::read_with_flags(
-            &mut Cursor::new(&raw.body),
+            &mut Cursor::new(raw_body.as_ref()),
             dc_aware,
             response_all_affinity_mappings,
         ) {
@@ -1949,8 +1984,8 @@ impl ChannelManager {
                 .map(|version| version.major)
                 .unwrap_or(-1);
 
-            let raw = self
-                .send_internal_and_read_on_channel::<RawPayload>(
+            let raw_body = self
+                .send_internal_and_get_payload_on_channel(
                     channel.clone(),
                     OpCode::ClusterGroupGetNodeEndpoints,
                     NodeEndpointsReq {
@@ -1959,17 +1994,18 @@ impl ChannelManager {
                     },
                 )
                 .await?;
-            let response = NodeEndpointsResp::read(&mut Cursor::new(&raw.body)).map_err(|err| {
-                IgniteError::from(
-                    format!(
-                        "failed to decode discovered endpoints response ({} bytes, prefix {}): {}",
-                        raw.body.len(),
-                        hex_prefix(&raw.body, 32),
-                        err
+            let response = NodeEndpointsResp::read(&mut Cursor::new(raw_body.as_ref()))
+                .map_err(|err| {
+                    IgniteError::from(
+                        format!(
+                            "failed to decode discovered endpoints response ({} bytes, prefix {}): {}",
+                            raw_body.len(),
+                            hex_prefix(raw_body.as_ref(), 32),
+                            err
+                        )
+                        .as_str(),
                     )
-                    .as_str(),
-                )
-            })?;
+                })?;
 
             let added_nodes = self.normalize_discovered_nodes(response.added_nodes)?;
 
