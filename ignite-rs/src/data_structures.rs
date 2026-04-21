@@ -1198,4 +1198,59 @@ mod tests {
         // CAS with expected == value (idempotent write): always returns value.
         assert_eq!(derive(5, 5, 5), 5);
     }
+
+    /// FND-052 (coverage) — `OP_SET_ITERATOR_START` request identity
+    /// matches Java `ClientIgniteSetImpl#writeIdentity@2.17.0:346-355`:
+    ///   writeString(name)          // typed String
+    ///   out.writeInt(cacheId)       // raw i32
+    ///   out.writeBoolean(colocated) // raw bool
+    /// followed by `writeInt(pageSize)` (§8.2 iterator start tail).
+    /// Pinned against drift.
+    #[test]
+    fn set_iterator_start_request_matches_java_wire_shape() {
+        let req = SetIteratorStartRequest {
+            identity: SetIdentityRequest {
+                name: "myset".to_string(),
+                cache_id: 0x1234_5678,
+                colocated: true,
+            },
+            page_size: 32,
+        };
+        let mut expected = Vec::new();
+        // name: typed String
+        expected.push(9);
+        expected.extend_from_slice(&5i32.to_le_bytes());
+        expected.extend_from_slice(b"myset");
+        // cacheId: raw i32
+        expected.extend_from_slice(&0x1234_5678i32.to_le_bytes());
+        // colocated: raw bool
+        expected.push(1);
+        // pageSize: raw i32
+        expected.extend_from_slice(&32i32.to_le_bytes());
+        assert_eq!(encode(&req), expected);
+        assert_eq!(req.size(), expected.len());
+    }
+
+    /// FND-052 (coverage) — Identity request on its own (used by SIZE,
+    /// CLEAR, CLOSE, EXISTS) writes exactly `name, cacheId, colocated` with
+    /// no tail. Pinned to guard the shared identity prefix.
+    #[test]
+    fn set_identity_request_matches_java_write_identity() {
+        let req = SetIdentityRequest {
+            name: "s".to_string(),
+            cache_id: -1,
+            colocated: false,
+        };
+        let mut expected = Vec::new();
+        // name
+        expected.push(9);
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.push(b's');
+        // cacheId
+        expected.extend_from_slice(&(-1i32).to_le_bytes());
+        // colocated
+        expected.push(0);
+        assert_eq!(encode(&req), expected);
+        assert_eq!(req.size(), expected.len());
+    }
 }
