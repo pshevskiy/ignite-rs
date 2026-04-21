@@ -1,0 +1,6 @@
+{
+  "name" : "arr_time_roundtrip",
+  "kind" : "arr_time",
+  "value" : "[0,86399999,null]",
+  "bytes_len" : 24
+}

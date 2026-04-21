@@ -280,6 +280,35 @@ fn read_all_fixtures() {
                 let obj = decode(&bytes);
                 assert!(obj.is_some() || obj.is_none()); // either path is fine
             }
+            // FND-014: typed arrays must decode as `IgniteValue::ArrTyped`
+            // with the outer TypeCode preserved and the expected element
+            // count matching. The element values are verified by shape via
+            // the write/round-trip test rather than duplicating per-type
+            // parsing here.
+            "arr_string" | "arr_uuid" | "arr_date" | "arr_decimal"
+            | "arr_timestamp" | "arr_time" => {
+                let obj = decode(&bytes).unwrap_or_else(|| panic!("{}: decode", name));
+                match first_value(&obj) {
+                    IgniteValue::ArrTyped { type_code, elements } => {
+                        let expected_code: u8 = match kind.as_str() {
+                            "arr_string" => 20,
+                            "arr_uuid" => 21,
+                            "arr_date" => 22,
+                            "arr_decimal" => 31,
+                            "arr_timestamp" => 34,
+                            "arr_time" => 37,
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            *type_code, expected_code,
+                            "{}: outer TypeCode {:#x} mismatch (expected {:#x})",
+                            name, type_code, expected_code
+                        );
+                        assert!(!elements.is_empty(), "{}: empty typed array", name);
+                    }
+                    other => panic!("{}: expected ArrTyped, got {:?}", name, other),
+                }
+            }
             other => {
                 panic!("{}: unhandled kind {}", name, other);
             }

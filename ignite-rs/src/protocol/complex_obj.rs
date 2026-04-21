@@ -15,6 +15,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Clone)]
+#[non_exhaustive]
 pub enum IgniteValue {
     Byte(u8),
     String(String),
@@ -53,6 +54,16 @@ pub enum IgniteValue {
     /// `AffinityKey` with its non-USER_TYPE flag layout). Bypasses the
     /// schema-registry path.
     PreEncoded(Vec<u8>),
+    /// FND-014: typed array — preserves the original `TypeCode` so decode
+    /// → re-encode round-trips byte-identically. `type_code` is one of:
+    /// `0x14` `ArrString`, `0x15` `ArrUuid`, `0x16` `ArrDate`, `0x1F`
+    /// `ArrDecimal`, `0x22` `ArrTimestamp`, `0x25` `ArrTime`.
+    /// Wire layout per Java §2.1/§2.4: `i32 length`, then length ×
+    /// (`i8` inner-type-code + body, or `NULL = 0x65`).
+    ArrTyped {
+        type_code: u8,
+        elements: Vec<IgniteValue>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -222,6 +233,16 @@ impl ComplexObject {
                 }
                 IgniteValue::PreEncoded(data) => {
                     values.write_all(data)?;
+                }
+                IgniteValue::ArrTyped {
+                    type_code,
+                    elements,
+                } => {
+                    write_u8(&mut values, *type_code)?;
+                    write_i32(&mut values, elements.len() as i32)?;
+                    for item in elements {
+                        item.write(&mut values)?;
+                    }
                 }
             }
         }
@@ -398,6 +419,21 @@ impl WritableType for IgniteValue {
                 writer.write_all(data)
             }
             IgniteValue::PreEncoded(data) => writer.write_all(data),
+            IgniteValue::ArrTyped {
+                type_code,
+                elements,
+            } => {
+                // Java §2.1 / §2.4: typed arrays emit `<type_code> i32 length`,
+                // then length × (inner element: code + body OR `NULL=0x65`).
+                // `IgniteValue::write` already emits `NULL` for the `Null`
+                // variant, so delegate per-element encoding.
+                write_u8(writer, *type_code)?;
+                write_i32(writer, elements.len() as i32)?;
+                for item in elements {
+                    item.write(writer)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -439,6 +475,12 @@ impl WritableType for IgniteValue {
             }
             IgniteValue::OpaqueMarshal(data) => 1 + size_of::<i32>() + data.len(),
             IgniteValue::PreEncoded(data) => data.len(),
+            IgniteValue::ArrTyped {
+                type_code: _,
+                elements,
+            } => {
+                1 + size_of::<i32>() + elements.iter().map(IgniteValue::size).sum::<usize>()
+            }
         }
     }
 }
@@ -511,6 +553,7 @@ impl IgniteValue {
             IgniteValue::Collection(_, _) => IgniteType::Collection,
             IgniteValue::OpaqueMarshal(_) => IgniteType::Binary, // opaque blob
             IgniteValue::PreEncoded(_) => IgniteType::Object, // pre-encoded object
+            IgniteValue::ArrTyped { .. } => IgniteType::Array,
         }
     }
 }
@@ -682,6 +725,32 @@ impl ReadableType for ComplexObject {
                 });
                 me.values.push(IgniteValue::Time(read_i64(reader)?));
             }
+            TypeCode::Timestamp => {
+                // Java §2.1 TIMESTAMP = 0x21: `i64 ms, i32 nanos`. Required
+                // for FND-014 typed-array round-trip: TIMESTAMP_ARR elements
+                // dispatch through this top-level reader.
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.sql.Timestamp".to_string(),
+                    fields: vec![],
+                });
+                let ms = read_i64(reader)?;
+                let nanos = read_i32(reader)?;
+                me.values.push(IgniteValue::Timestamp(ms, nanos));
+            }
+            TypeCode::Decimal => {
+                // Java §2.1 DECIMAL = 0x1E: `i32 scale, i32 magLen, magnitude
+                // bytes (BigInteger.toByteArray())`. Required for FND-014
+                // typed-array round-trip: DECIMAL_ARR elements dispatch here.
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.math.BigDecimal".to_string(),
+                    fields: vec![],
+                });
+                let scale = read_i32(reader)?;
+                let len = read_i32(reader)?;
+                let mut buf = vec![0u8; len.max(0) as usize];
+                reader.read_exact(&mut buf)?;
+                me.values.push(IgniteValue::Decimal(scale, buf));
+            }
             TypeCode::ArrByte => {
                 let len = read_i32(reader)?;
                 let mut data = vec![0; len as usize];
@@ -714,6 +783,41 @@ impl ReadableType for ComplexObject {
                     fields: vec![],
                 });
                 me.values.push(IgniteValue::Enum(read_enum(reader)?));
+            }
+            TypeCode::ArrString
+            | TypeCode::ArrUuid
+            | TypeCode::ArrDate
+            | TypeCode::ArrDecimal
+            | TypeCode::ArrTimestamp
+            | TypeCode::ArrTime => {
+                // FND-014: typed arrays with per-element code at top-level
+                // (e.g. returned as a `get()` value). Element layout matches
+                // the field-level decoder path at complex_obj.rs:896.
+                let tc = match type_code {
+                    TypeCode::ArrString => 20u8,
+                    TypeCode::ArrUuid => 21u8,
+                    TypeCode::ArrDate => 22u8,
+                    TypeCode::ArrDecimal => 31u8,
+                    TypeCode::ArrTimestamp => 34u8,
+                    TypeCode::ArrTime => 37u8,
+                    _ => unreachable!(),
+                };
+                let len = read_i32(reader)?;
+                let mut items = Vec::with_capacity(len.max(0) as usize);
+                for _ in 0..len {
+                    let item = ComplexObject::read(reader)?
+                        .map(flatten_complex_value)
+                        .unwrap_or(IgniteValue::Null);
+                    items.push(item);
+                }
+                me.schema = Arc::new(ComplexObjectSchema {
+                    type_name: "java.lang.Object[]".to_string(),
+                    fields: vec![],
+                });
+                me.values.push(IgniteValue::ArrTyped {
+                    type_code: tc,
+                    elements: items,
+                });
             }
             TypeCode::ComplexObj => {
                 // Read header fields directly from reader (no intermediate allocation).
@@ -850,16 +954,30 @@ impl ReadableType for ComplexObject {
                             }
                             IgniteValue::Collection(col_type, items)
                         }
-                        TypeCode::ArrString => {
+                        TypeCode::ArrString
+                        | TypeCode::ArrUuid
+                        | TypeCode::ArrDate
+                        | TypeCode::ArrDecimal
+                        | TypeCode::ArrTimestamp
+                        | TypeCode::ArrTime => {
+                            // FND-014: Java §2.1/§2.4 typed array — preserve
+                            // the original `TypeCode` so decode → re-encode
+                            // round-trips byte-identically. Wire layout:
+                            //   i32 length
+                            //   length × (i8 inner-code + body, or NULL=0x65).
+                            let tc = field_type as u8;
                             let len = read_i32(&mut remainder)?;
                             let mut items = Vec::with_capacity(len.max(0) as usize);
                             for _ in 0..len {
-                                let s = ComplexObject::read(&mut remainder)?
+                                let item = ComplexObject::read(&mut remainder)?
                                     .map(flatten_complex_value)
                                     .unwrap_or(IgniteValue::Null);
-                                items.push(s);
+                                items.push(item);
                             }
-                            IgniteValue::Array(items)
+                            IgniteValue::ArrTyped {
+                                type_code: tc,
+                                elements: items,
+                            }
                         }
                         TypeCode::ArrEnum => {
                             // Java §2.1 ENUM_ARR: i32 componentTypeId; i32 length;
@@ -1543,6 +1661,250 @@ mod tests {
             }
             other => panic!("expected Array, got {:?}", other),
         }
+    }
+
+    // ---- FND-014: typed array round-trip fidelity ----------------------
+    //
+    // Java §2.1 typed arrays (`ArrString=0x14`, `ArrUuid=0x15`,
+    // `ArrDate=0x16`, `ArrDecimal=0x1F`, `ArrTimestamp=0x22`,
+    // `ArrTime=0x25`) serialize each element as `(code + body)` or `NULL`.
+    // Without `IgniteValue::ArrTyped`, decode lost the outer code and
+    // re-encode emitted `ArrObj` — a REG-1-class round-trip regression.
+
+    /// Helper: wrap a single `IgniteValue` field in a minimal ComplexObject
+    /// on the wire, then decode → re-encode via the real read/write paths.
+    /// Returns the decoded field value.
+    fn wrap_field_bytes_and_decode(field_bytes: &[u8]) -> IgniteValue {
+        let data_len = field_bytes.len() as i32;
+        let footer_start_abs = COMPLEX_OBJ_HEADER_LEN + data_len;
+        // Footer: field_id(4) + offset(4) — 4-byte offset if max offset won't
+        // fit in u8. For these tests we pick a single field at offset 24, so
+        // u8 fits, but we pick u32 for simplicity (no flag bits for offset
+        // size set). Decoder tolerates both.
+        let mut schema_entry = Vec::new();
+        schema_entry.extend_from_slice(&0x0000DEADi32.to_le_bytes());
+        schema_entry.extend_from_slice(&(COMPLEX_OBJ_HEADER_LEN).to_le_bytes());
+        let total_len = footer_start_abs + schema_entry.len() as i32;
+        let mut obj_bytes: Vec<u8> = Vec::new();
+        obj_bytes.push(TypeCode::ComplexObj as u8);
+        obj_bytes.push(1u8); // version
+        let flags: u16 = FLAG_HAS_SCHEMA | FLAG_USER_TYPE;
+        obj_bytes.extend_from_slice(&flags.to_le_bytes());
+        obj_bytes.extend_from_slice(&0x12345678i32.to_le_bytes()); // type_id
+        obj_bytes.extend_from_slice(&0i32.to_le_bytes()); // hash
+        obj_bytes.extend_from_slice(&total_len.to_le_bytes());
+        obj_bytes.extend_from_slice(&0i32.to_le_bytes()); // schema_id
+        obj_bytes.extend_from_slice(&footer_start_abs.to_le_bytes());
+        obj_bytes.extend_from_slice(field_bytes);
+        obj_bytes.extend_from_slice(&schema_entry);
+
+        let mut cur = Cursor::new(obj_bytes);
+        let code = read_u8(&mut cur).unwrap();
+        let obj = ComplexObject::read_unwrapped(code.try_into().unwrap(), &mut cur)
+            .expect("decode")
+            .unwrap();
+        assert_eq!(obj.values.len(), 1, "expected one field");
+        obj.values.into_iter().next().unwrap()
+    }
+
+    /// Decode a synthetic typed-array field from wire bytes, check we get
+    /// `IgniteValue::ArrTyped { type_code, elements }`, then re-encode the
+    /// field via `IgniteValue::write` and assert the bytes are identical.
+    fn check_typed_array_round_trip(type_code: u8, inner_bytes: Vec<u8>, expected: Vec<IgniteValue>) {
+        // Build the field bytes: <type_code> <i32 count> <elements>.
+        let mut field_bytes: Vec<u8> = Vec::new();
+        field_bytes.push(type_code);
+        field_bytes.extend_from_slice(&(expected.len() as i32).to_le_bytes());
+        field_bytes.extend_from_slice(&inner_bytes);
+
+        let decoded = wrap_field_bytes_and_decode(&field_bytes);
+        match decoded {
+            IgniteValue::ArrTyped {
+                type_code: tc,
+                elements,
+            } => {
+                assert_eq!(tc, type_code, "decoded type_code mismatch");
+                assert_eq!(elements, expected, "decoded elements mismatch");
+                // Re-encode the same value via WritableType::write and
+                // assert the bytes match the original field payload.
+                let reconstituted = IgniteValue::ArrTyped {
+                    type_code,
+                    elements,
+                };
+                let mut out = Vec::new();
+                reconstituted.write(&mut out).unwrap();
+                assert_eq!(
+                    out, field_bytes,
+                    "re-encoded bytes differ for type_code {:#x}",
+                    type_code
+                );
+            }
+            other => panic!(
+                "expected ArrTyped {{ type_code: {:#x} }}, got {:?}",
+                type_code, other
+            ),
+        }
+    }
+
+    #[test]
+    fn arr_string_round_trip() {
+        // STRING_ARR = 0x14. Elements: "hello", "мир" (UTF-8), Null.
+        let mut inner = Vec::new();
+        // "hello"
+        inner.push(TypeCode::String as u8);
+        inner.extend_from_slice(&5i32.to_le_bytes());
+        inner.extend_from_slice(b"hello");
+        // "мир" (6 UTF-8 bytes)
+        let mir = "мир".as_bytes();
+        inner.push(TypeCode::String as u8);
+        inner.extend_from_slice(&(mir.len() as i32).to_le_bytes());
+        inner.extend_from_slice(mir);
+        // Null
+        inner.push(TypeCode::Null as u8);
+
+        check_typed_array_round_trip(
+            0x14,
+            inner,
+            vec![
+                IgniteValue::String("hello".into()),
+                IgniteValue::String("мир".into()),
+                IgniteValue::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn arr_uuid_round_trip() {
+        // UUID_ARR = 0x15. Elements: two UUIDs, one Null.
+        let mut inner = Vec::new();
+        inner.push(TypeCode::Uuid as u8);
+        inner.extend_from_slice(&0x0102030405060708i64.to_le_bytes()); // most
+        inner.extend_from_slice(&0x090A0B0C0D0E0F10i64.to_le_bytes()); // least
+        inner.push(TypeCode::Uuid as u8);
+        inner.extend_from_slice(&(-1i64).to_le_bytes());
+        inner.extend_from_slice(&(-2i64).to_le_bytes());
+        inner.push(TypeCode::Null as u8);
+
+        check_typed_array_round_trip(
+            0x15,
+            inner,
+            vec![
+                IgniteValue::Uuid(0x0102030405060708, 0x090A0B0C0D0E0F10),
+                IgniteValue::Uuid(-1, -2),
+                IgniteValue::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn arr_date_round_trip() {
+        // DATE_ARR = 0x16. Elements: Date(ms=0), Date(ms=-1), Null.
+        let mut inner = Vec::new();
+        inner.push(TypeCode::Date as u8);
+        inner.extend_from_slice(&0i64.to_le_bytes());
+        inner.push(TypeCode::Date as u8);
+        inner.extend_from_slice(&(-1i64).to_le_bytes());
+        inner.push(TypeCode::Null as u8);
+
+        check_typed_array_round_trip(
+            0x16,
+            inner,
+            vec![
+                IgniteValue::Date(0),
+                IgniteValue::Date(-1),
+                IgniteValue::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn arr_decimal_round_trip() {
+        // DECIMAL_ARR = 0x1F. Elements: Decimal(scale=2, mag=[0x30,0x39]=12345),
+        // Decimal(scale=0, mag=[0xFF,0xCE] = -50 in two's complement), Null.
+        let mut inner = Vec::new();
+        inner.push(TypeCode::Decimal as u8);
+        inner.extend_from_slice(&2i32.to_le_bytes());
+        inner.extend_from_slice(&2i32.to_le_bytes());
+        inner.extend_from_slice(&[0x30u8, 0x39]);
+        inner.push(TypeCode::Decimal as u8);
+        inner.extend_from_slice(&0i32.to_le_bytes());
+        inner.extend_from_slice(&2i32.to_le_bytes());
+        inner.extend_from_slice(&[0xFFu8, 0xCE]);
+        inner.push(TypeCode::Null as u8);
+
+        check_typed_array_round_trip(
+            0x1F,
+            inner,
+            vec![
+                IgniteValue::Decimal(2, vec![0x30, 0x39]),
+                IgniteValue::Decimal(0, vec![0xFF, 0xCE]),
+                IgniteValue::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn arr_timestamp_round_trip() {
+        // TIMESTAMP_ARR = 0x22. Elements: Timestamp(ms=1, ns=2),
+        // Timestamp(ms=-1, ns=999999), Null.
+        let mut inner = Vec::new();
+        inner.push(TypeCode::Timestamp as u8);
+        inner.extend_from_slice(&1i64.to_le_bytes());
+        inner.extend_from_slice(&2i32.to_le_bytes());
+        inner.push(TypeCode::Timestamp as u8);
+        inner.extend_from_slice(&(-1i64).to_le_bytes());
+        inner.extend_from_slice(&999_999i32.to_le_bytes());
+        inner.push(TypeCode::Null as u8);
+
+        check_typed_array_round_trip(
+            0x22,
+            inner,
+            vec![
+                IgniteValue::Timestamp(1, 2),
+                IgniteValue::Timestamp(-1, 999_999),
+                IgniteValue::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn arr_time_round_trip() {
+        // TIME_ARR = 0x25. Elements: Time(0), Time(86399999), Null.
+        let mut inner = Vec::new();
+        inner.push(TypeCode::Time as u8);
+        inner.extend_from_slice(&0i64.to_le_bytes());
+        inner.push(TypeCode::Time as u8);
+        inner.extend_from_slice(&86_399_999i64.to_le_bytes());
+        inner.push(TypeCode::Null as u8);
+
+        check_typed_array_round_trip(
+            0x25,
+            inner,
+            vec![
+                IgniteValue::Time(0),
+                IgniteValue::Time(86_399_999),
+                IgniteValue::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn arr_typed_size_matches_written_len() {
+        // Sanity: `WritableType::size` reports the same number of bytes
+        // `WritableType::write` emits — required for FND-018 offset-width
+        // selection and for buffer pre-sizing in request batches.
+        let v = IgniteValue::ArrTyped {
+            type_code: 0x14,
+            elements: vec![
+                IgniteValue::String("x".into()),
+                IgniteValue::Null,
+                IgniteValue::String("yz".into()),
+            ],
+        };
+        let mut buf = Vec::new();
+        v.write(&mut buf).unwrap();
+        assert_eq!(v.size(), buf.len(), "size vs. write mismatch");
+        assert_eq!(buf[0], 0x14, "first byte must be outer TypeCode");
     }
 
     #[test]

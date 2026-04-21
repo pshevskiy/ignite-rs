@@ -1,0 +1,6 @@
+{
+  "name" : "arr_decimal_roundtrip",
+  "kind" : "arr_decimal",
+  "value" : "[scale=2|mag=[48,57],scale=0|mag=[255,206],null]",
+  "bytes_len" : 28
+}

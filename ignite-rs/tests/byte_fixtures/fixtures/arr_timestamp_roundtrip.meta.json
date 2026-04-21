@@ -1,0 +1,6 @@
+{
+  "name" : "arr_timestamp_roundtrip",
+  "kind" : "arr_timestamp",
+  "value" : "[1|2,-1|999999,null]",
+  "bytes_len" : 32
+}

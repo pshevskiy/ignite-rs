@@ -37,14 +37,22 @@ public class FixtureGenerator {
     static final byte TYPE_CHAR     = 7;
     static final byte TYPE_BOOL     = 8;
     static final byte TYPE_STRING   = 9;
+    static final byte TYPE_UUID     = 10;
+    static final byte TYPE_DATE     = 11;
     static final byte TYPE_ARR_BYTE = 12;
     static final byte TYPE_ARR_INT  = 14;
     static final byte TYPE_ARR_LONG = 15;
     static final byte TYPE_ARR_STR  = 20;
+    static final byte TYPE_ARR_UUID = 21;
+    static final byte TYPE_ARR_DATE = 22;
     static final byte TYPE_COLLECTION = 24;
     static final byte TYPE_MAP      = 25;
     static final byte TYPE_DECIMAL  = 30;
+    static final byte TYPE_ARR_DECIMAL = 31;
     static final byte TYPE_TIMESTAMP = 33;
+    static final byte TYPE_ARR_TIMESTAMP = 34;
+    static final byte TYPE_TIME     = 36;
+    static final byte TYPE_ARR_TIME = 37;
     static final byte TYPE_ENUM     = 28;
     static final byte TYPE_NULL     = 101;
     static final byte TYPE_OPT_MARSH = (byte) 0xFE;
@@ -97,6 +105,17 @@ public class FixtureGenerator {
         // ----------------------- OptimizedMarshaller opaque blob -----------------------
         // Ignite-rs preserves the opaque blob verbatim; we synthesize a short one.
         corpus.put("opaque_blob",    opaqueFixture(new byte[]{(byte)0xAC, (byte)0xED, 0x00, 0x05}));
+
+        // ----------------------- FND-014: typed arrays with per-element code -----------------------
+        // Each element is `<inner-code> <body>` or `NULL`. Decoder preserves
+        // the outer TypeCode via `IgniteValue::ArrTyped` so round-trip is
+        // byte-identical.
+        corpus.put("arr_string_roundtrip", arrStringRoundTripFixture());
+        corpus.put("arr_uuid_roundtrip",   arrUuidRoundTripFixture());
+        corpus.put("arr_date_roundtrip",   arrDateRoundTripFixture());
+        corpus.put("arr_decimal_roundtrip", arrDecimalRoundTripFixture());
+        corpus.put("arr_timestamp_roundtrip", arrTimestampRoundTripFixture());
+        corpus.put("arr_time_roundtrip",   arrTimeRoundTripFixture());
 
         // Emit.
         for (Map.Entry<String, Fixture> e : corpus.entrySet()) {
@@ -255,6 +274,107 @@ public class FixtureGenerator {
         }
         sb.append("]");
         return new Fixture(bos.toByteArray(), "opaque", sb.toString(), null);
+    }
+
+    // ----------------------- FND-014 typed-array fixtures -----------------------
+
+    static Fixture arrStringRoundTripFixture() {
+        // STRING_ARR = 0x14. Elements: "a", NULL, "мир".
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        bos.write(TYPE_ARR_STR);
+        writeLeInt(bos, 3);
+        // "a"
+        bos.write(TYPE_STRING);
+        byte[] a = "a".getBytes(StandardCharsets.UTF_8);
+        writeLeInt(bos, a.length);
+        bos.write(a, 0, a.length);
+        // NULL
+        bos.write(TYPE_NULL);
+        // "мир"
+        bos.write(TYPE_STRING);
+        byte[] mir = "мир".getBytes(StandardCharsets.UTF_8);
+        writeLeInt(bos, mir.length);
+        bos.write(mir, 0, mir.length);
+        return new Fixture(bos.toByteArray(), "arr_string", "[a,null,мир]", null);
+    }
+
+    static Fixture arrUuidRoundTripFixture() {
+        // UUID_ARR = 0x15. Elements: two UUIDs, one NULL.
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        bos.write(TYPE_ARR_UUID);
+        writeLeInt(bos, 3);
+        bos.write(TYPE_UUID);
+        writeLeLong(bos, 0x0102030405060708L);
+        writeLeLong(bos, 0x090A0B0C0D0E0F10L);
+        bos.write(TYPE_UUID);
+        writeLeLong(bos, -1L);
+        writeLeLong(bos, -2L);
+        bos.write(TYPE_NULL);
+        return new Fixture(bos.toByteArray(), "arr_uuid", "[uuid0,uuid1,null]", null);
+    }
+
+    static Fixture arrDateRoundTripFixture() {
+        // DATE_ARR = 0x16. Elements: Date(0), Date(-1), NULL.
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        bos.write(TYPE_ARR_DATE);
+        writeLeInt(bos, 3);
+        bos.write(TYPE_DATE);
+        writeLeLong(bos, 0L);
+        bos.write(TYPE_DATE);
+        writeLeLong(bos, -1L);
+        bos.write(TYPE_NULL);
+        return new Fixture(bos.toByteArray(), "arr_date", "[0,-1,null]", null);
+    }
+
+    static Fixture arrDecimalRoundTripFixture() {
+        // DECIMAL_ARR = 0x1F. Elements:
+        //   Decimal(scale=2, mag=[0x30,0x39]=12345 -> 123.45),
+        //   Decimal(scale=0, mag=[0xFF,0xCE] = -50 via two's-complement),
+        //   NULL.
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        bos.write(TYPE_ARR_DECIMAL);
+        writeLeInt(bos, 3);
+        bos.write(TYPE_DECIMAL);
+        writeLeInt(bos, 2);
+        writeLeInt(bos, 2);
+        bos.write(new byte[]{0x30, 0x39}, 0, 2);
+        bos.write(TYPE_DECIMAL);
+        writeLeInt(bos, 0);
+        writeLeInt(bos, 2);
+        bos.write(new byte[]{(byte)0xFF, (byte)0xCE}, 0, 2);
+        bos.write(TYPE_NULL);
+        return new Fixture(bos.toByteArray(), "arr_decimal",
+                "[scale=2|mag=[48,57],scale=0|mag=[255,206],null]", null);
+    }
+
+    static Fixture arrTimestampRoundTripFixture() {
+        // TIMESTAMP_ARR = 0x22. Elements: Timestamp(1, 2),
+        // Timestamp(-1, 999999), NULL.
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        bos.write(TYPE_ARR_TIMESTAMP);
+        writeLeInt(bos, 3);
+        bos.write(TYPE_TIMESTAMP);
+        writeLeLong(bos, 1L);
+        writeLeInt(bos, 2);
+        bos.write(TYPE_TIMESTAMP);
+        writeLeLong(bos, -1L);
+        writeLeInt(bos, 999_999);
+        bos.write(TYPE_NULL);
+        return new Fixture(bos.toByteArray(), "arr_timestamp",
+                "[1|2,-1|999999,null]", null);
+    }
+
+    static Fixture arrTimeRoundTripFixture() {
+        // TIME_ARR = 0x25. Elements: Time(0), Time(86399999), NULL.
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        bos.write(TYPE_ARR_TIME);
+        writeLeInt(bos, 3);
+        bos.write(TYPE_TIME);
+        writeLeLong(bos, 0L);
+        bos.write(TYPE_TIME);
+        writeLeLong(bos, 86_399_999L);
+        bos.write(TYPE_NULL);
+        return new Fixture(bos.toByteArray(), "arr_time", "[0,86399999,null]", null);
     }
 
     // ----------------------- Little-endian helpers -----------------------

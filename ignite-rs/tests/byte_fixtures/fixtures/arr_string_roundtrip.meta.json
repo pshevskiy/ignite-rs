@@ -1,0 +1,6 @@
+{
+  "name" : "arr_string_roundtrip",
+  "kind" : "arr_string",
+  "value" : "[a,null,мир]",
+  "bytes_len" : 23
+}

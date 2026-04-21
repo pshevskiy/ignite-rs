@@ -1,0 +1,6 @@
+{
+  "name" : "arr_uuid_roundtrip",
+  "kind" : "arr_uuid",
+  "value" : "[uuid0,uuid1,null]",
+  "bytes_len" : 40
+}
