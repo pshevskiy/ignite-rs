@@ -101,15 +101,19 @@ pub struct ComplexObject {
 }
 
 impl ComplexObject {
-    fn get_data(&self) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    /// Returns `(values_bytes, schema_bytes, offset_flag)`. `offset_flag` is one of
+    /// `FLAG_OFFSET_ONE_BYTE`, `FLAG_OFFSET_TWO_BYTES`, or 0 (= four-byte offsets).
+    /// The footer entry layout is `i32 field_id + offset-of-chosen-width` — matching
+    /// Java `BinaryUtils.java:935-938@2.17.0`.
+    fn get_data(&self) -> std::io::Result<(Vec<u8>, Vec<u8>, u16)> {
+        // First emit the field data while collecting absolute field offsets so
+        // we can decide the narrowest common offset width. Write the footer only
+        // after the decision is made (Java does the same: offsets are buffered
+        // and re-written at the chosen width when the object is finalised).
         let mut values: Vec<u8> = Vec::new();
-        let mut schema: Vec<u8> = Vec::new();
-        for (val, field) in self.values.iter().zip(self.schema.fields.iter()) {
-            write_i32(
-                &mut schema,
-                string_to_java_hashcode(field.name.to_lowercase().as_str()),
-            )?;
-            write_i32(&mut schema, COMPLEX_OBJ_HEADER_LEN + values.len() as i32)?;
+        let mut offsets: Vec<i32> = Vec::with_capacity(self.values.len());
+        for (val, _field) in self.values.iter().zip(self.schema.fields.iter()) {
+            offsets.push(COMPLEX_OBJ_HEADER_LEN + values.len() as i32);
             match val {
                 IgniteValue::Byte(val) => {
                     write_u8(&mut values, TypeCode::Byte as u8)?;
@@ -221,7 +225,41 @@ impl ComplexObject {
                 }
             }
         }
-        Ok((values, schema))
+        // Pick the narrowest offset width that fits every collected offset.
+        // Java `BinaryUtils.java:935-938@2.17.0` does the same: 1-byte offsets
+        // when all fit in u8, 2-byte when all fit in u16, otherwise 4-byte.
+        let max_offset = offsets.iter().copied().max().unwrap_or(0);
+        let offset_flag = if max_offset < 0 {
+            0
+        } else if max_offset <= u8::MAX as i32 {
+            FLAG_OFFSET_ONE_BYTE
+        } else if max_offset <= u16::MAX as i32 {
+            FLAG_OFFSET_TWO_BYTES
+        } else {
+            0
+        };
+
+        // Emit the footer using the chosen width.
+        let mut schema: Vec<u8> = Vec::with_capacity(
+            self.schema.fields.len()
+                * (4 + match offset_flag {
+                    FLAG_OFFSET_ONE_BYTE => 1,
+                    FLAG_OFFSET_TWO_BYTES => 2,
+                    _ => 4,
+                }),
+        );
+        for (field, offset) in self.schema.fields.iter().zip(offsets.iter()) {
+            write_i32(
+                &mut schema,
+                string_to_java_hashcode(field.name.to_lowercase().as_str()),
+            )?;
+            match offset_flag {
+                FLAG_OFFSET_ONE_BYTE => write_u8(&mut schema, *offset as u8)?,
+                FLAG_OFFSET_TWO_BYTES => write_u16(&mut schema, *offset as u16)?,
+                _ => write_i32(&mut schema, *offset)?,
+            }
+        }
+        Ok((values, schema, offset_flag))
     }
 
     pub fn type_name(&self) -> &str {
@@ -1012,19 +1050,20 @@ impl WritableType for ComplexObject {
 
         // write fields to vec so we can hash
         binary_registry::register_complex_schema(self.schema.as_ref());
-        let (values, schema) = self.get_data()?;
+        let (values, schema, offset_flag) = self.get_data()?;
 
         // https://apacheignite.readme.io/docs/binary-client-protocol-data-format#complex-object
-        let flags = FLAG_HAS_SCHEMA | FLAG_USER_TYPE;
+        let flags = FLAG_HAS_SCHEMA | FLAG_USER_TYPE | offset_flag;
         let type_name = self.schema.type_name.to_lowercase();
         let type_id = string_to_java_hashcode(type_name.as_str());
         let schema_id = get_schema_id(&self.schema.fields);
+        let total_len = (COMPLEX_OBJ_HEADER_LEN as usize + values.len() + schema.len()) as i32;
         write_u8(writer, TypeCode::ComplexObj as u8)?; // complex type - offset 0
         write_u8(writer, 1)?; // version - offset 1
-        write_u16(writer, flags)?; // flags - 2 - TODO: > 1 byte offsets
+        write_u16(writer, flags)?; // flags - offset 2
         write_i32(writer, type_id)?; // type_id - offset 4
         write_i32(writer, bytes_to_java_hashcode(values.as_slice()))?; // hash - offset 8
-        write_i32(writer, self.size() as i32)?; // size - offset 12
+        write_i32(writer, total_len)?; // size - offset 12
         write_i32(writer, schema_id)?; // schema_id - offset 16
         write_i32(writer, COMPLEX_OBJ_HEADER_LEN + values.len() as i32)?; // offset to schema
         writer.write_all(&values)?; // field data - offset 24
@@ -1048,7 +1087,7 @@ impl WritableType for ComplexObject {
             };
             return size_of::<i32>() + 1 + val.len();
         }
-        let (values, schema) = self.get_data().expect("Can't get size!");
+        let (values, schema, _offset_flag) = self.get_data().expect("Can't get size!");
         values.len() + schema.len() + COMPLEX_OBJ_HEADER_LEN as usize
     }
 }
@@ -1258,6 +1297,55 @@ mod tests {
     use crate::protocol::complex_obj::ComplexObject;
     use std::convert::TryInto;
 
+    /// FND-018: Java's encoder picks the narrowest offset width (u8/u16/u32)
+    /// based on the object's max field offset and sets the corresponding flag
+    /// bit. Rust previously always emitted u32 offsets with flags=0x03,
+    /// producing different wire bytes than Java for the same logical object
+    /// (I1 violation).
+    #[test]
+    fn small_object_uses_one_byte_offsets_with_flag_set() {
+        // Tiny object: two small primitive fields — max field offset is 1,
+        // easily fits in u8. Java would set FLAG_OFFSET_ONE_BYTE and emit a
+        // single-byte offset per footer entry.
+        let schema = Arc::new(ComplexObjectSchema {
+            type_name: "t.Small".to_string(),
+            fields: vec![
+                IgniteField {
+                    name: "a".to_string(),
+                    r#type: IgniteType::Byte,
+                },
+                IgniteField {
+                    name: "b".to_string(),
+                    r#type: IgniteType::Byte,
+                },
+            ],
+        });
+        let obj = ComplexObject {
+            schema,
+            values: vec![IgniteValue::Byte(1), IgniteValue::Byte(2)],
+        };
+        let mut bytes = Vec::new();
+        obj.write(&mut bytes).unwrap();
+
+        // flags word at offset +2 (little-endian u16).
+        let flags = u16::from_le_bytes([bytes[2], bytes[3]]);
+        assert!(
+            flags & FLAG_OFFSET_ONE_BYTE != 0,
+            "expected FLAG_OFFSET_ONE_BYTE in flags word, got 0x{:04X}",
+            flags
+        );
+        assert!(
+            flags & FLAG_OFFSET_TWO_BYTES == 0,
+            "did not expect FLAG_OFFSET_TWO_BYTES, got 0x{:04X}",
+            flags
+        );
+
+        // Per-field footer entry: i32 field_id + u8 offset = 5 bytes.
+        // Object layout: 24-byte header + 2 field bodies (each 2 bytes) + 2
+        // footer entries (5 bytes each) = 24 + 4 + 10 = 38 bytes.
+        assert_eq!(bytes.len(), 24 + 4 + 5 * 2);
+    }
+
     /// FND-016: a `ComplexObject` field typed `BinaryObject` on the Java side
     /// is serialized via the `BINARY_OBJ` envelope (TypeCode 0x1B): `[0x1B |
     /// i32 length | length bytes | i32 offset]`. Decoding and re-encoding the
@@ -1459,17 +1547,20 @@ mod tests {
 
     #[test]
     fn test_round_trip() {
+        // Post-FND-018: max field offset is 0x126 (294), fits in u16, so
+        // FLAG_OFFSET_TWO_BYTES is set (flags = 0x13) and each footer entry
+        // is 4-byte field_id + 2-byte offset. Total length shrinks accordingly.
         let expected_bytes = hex_literal::hex!(
             "67" // type
             "01" // version
-            "03 00" // flags for has schema, user type
+            "13 00" // flags for has schema, user type, two-byte offsets
             "34 59 48 16" // Hash of type name (type_id)
             "BA 27 D2 B2" // Hash of fields slice (hash_code)
-            "7B 01 00 00" // total size including header
+            "67 01 00 00" // total size including header (0x167 = 359)
             "C0 40 3B B5" // hash of field names (schema_id)
-            "2B 01 00 00" // offset to field indexes
+            "2B 01 00 00" // offset to field indexes (0x12B = 299)
             "09 42 00 00 00 30 78 35 62 35 38 36 37 35 37 63 33 36 65 62 34 63 39 34 66 36 39 30 31 35 66 33 63 62 36 64 33 64 35 62 35 31 63 36 64 62 61 63 65 36 64 33 37 63 62 66 33 34 64 33 36 37 62 30 31 37 31 63 39 34 61 09 13 00 00 00 32 30 32 32 2D 30 31 2D 30 31 20 30 30 3A 30 30 3A 32 30 09 2A 00 00 00 30 78 45 41 36 37 34 66 64 44 65 37 31 34 66 64 39 37 39 64 65 33 45 64 46 30 46 35 36 41 41 39 37 31 36 42 38 39 38 65 63 38 09 42 00 00 00 30 78 33 32 61 65 64 30 63 66 33 31 36 64 31 37 66 30 64 37 63 39 61 62 65 63 63 62 39 38 31 31 37 32 34 61 61 35 38 63 30 39 63 65 35 33 31 66 36 31 66 33 38 36 35 37 38 31 63 38 33 65 32 33 63 32 09 15 00 00 00 32 2E 33 32 30 35 31 33 31 31 30 36 31 37 39 39 31 65 2B 31 38 03 74 0E 02 00 03 47 F7 C9 01 03 E5 05 CA 01 09 0B 00 00 00 36 31 35 38 34 33 34 33 37 32 39 03 DF 01 00 00"
-            "80 85 A9 4C 18 00 00 00 D1 6B B5 43 5F 00 00 00 7F 66 31 06 77 00 00 00 83 4B 7D 3C A6 00 00 00 2F 4F 4F C8 ED 00 00 00 7E 20 86 06 07 01 00 00 63 75 84 A0 0C 01 00 00 D5 F6 86 6F 11 01 00 00 90 98 68 68 16 01 00 00 6E 68 A6 AB 26 01 00 00" // schema
+            "80 85 A9 4C 18 00 D1 6B B5 43 5F 00 7F 66 31 06 77 00 83 4B 7D 3C A6 00 2F 4F 4F C8 ED 00 7E 20 86 06 07 01 63 75 84 A0 0C 01 D5 F6 86 6F 11 01 90 98 68 68 16 01 6E 68 A6 AB 26 01" // schema (u16 offsets)
         );
         let schema = ComplexObjectSchema {
             type_name: "VT.PUBLIC.BLOCKS-3178274329684762144".to_string(),
