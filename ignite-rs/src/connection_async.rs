@@ -489,8 +489,17 @@ fn handshake_features(conf: &ClientConfig) -> Vec<u8> {
     set_feature_bit(&mut features, FEATURE_NODE_ENDPOINTS);
     set_feature_bit(&mut features, FEATURE_QRY_PARTITIONS_BATCH_SIZE);
     set_feature_bit(&mut features, FEATURE_HEARTBEAT);
-    set_feature_bit(&mut features, FEATURE_DC_AWARE);
-    set_feature_bit(&mut features, FEATURE_QRY_INITIATOR_ID);
+    // FND-005: bits 22, 23 (DC_AWARE, QRY_INITIATOR_ID) are Gridgain-downstream
+    // extensions not present in Java 2.17.0 (which stops at bit 19). Against a
+    // pure 2.17.0 server the server's `BitSet.valueOf(bytes)` discards these
+    // bits silently. We only claim them when the user has opted into the
+    // DC-aware wire extension via `IGNITE_DATA_CENTER_ID`. This keeps the
+    // handshake bitmap byte-identical to Java's for the default single-DC
+    // path while preserving rsc-cache-rs's multi-DC routing.
+    if conf.user_attributes.contains_key("IGNITE_DATA_CENTER_ID") {
+        set_feature_bit(&mut features, FEATURE_DC_AWARE);
+        set_feature_bit(&mut features, FEATURE_QRY_INITIATOR_ID);
+    }
     features
 }
 
@@ -661,16 +670,18 @@ mod tests {
         assert_eq!(req[12], TypeCode::ArrByte as u8);
 
         let features_len = i32::from_le_bytes([req[13], req[14], req[15], req[16]]);
-        assert_eq!(features_len, 3);
         assert_ne!(
             req[17] & (1 << 7),
             0,
             "QRY_PARTITIONS_BATCH_SIZE feature bit should be set"
         );
-        assert_ne!(
-            req[19] & (1 << 7),
-            0,
-            "QRY_INITIATOR_ID feature bit should be set"
+        // FND-005: DC_AWARE (bit 22) and QRY_INITIATOR_ID (bit 23) are beyond
+        // Java 2.17.0's 0-19 range. Without IGNITE_DATA_CENTER_ID in
+        // user_attributes, Rust must NOT claim those bits, so the features
+        // bitmap only covers bits 0-11 (fits in 2 bytes).
+        assert_eq!(
+            features_len, 2,
+            "without DC_ID config, features bitmap stops at bit 11 (HEARTBEAT)"
         );
 
         let username_pos = 17 + features_len as usize;
@@ -685,6 +696,43 @@ mod tests {
 
         let password_pos = username_pos + 1 + 4 + username_len as usize;
         assert_eq!(req[password_pos], TypeCode::String as u8);
+    }
+
+    /// FND-005: DC-aware extension bits (22, 23) must be claimed only when
+    /// the user has configured `IGNITE_DATA_CENTER_ID`. Against a pure Java
+    /// 2.17.0 server with no DC config, these invented bits must stay zero.
+    #[test]
+    fn handshake_features_omits_dc_aware_bits_by_default() {
+        let conf = ClientConfig::new("127.0.0.1:10800");
+        let req = build_handshake_request(&conf).expect("serialize");
+        let features_len = i32::from_le_bytes([req[13], req[14], req[15], req[16]]) as usize;
+        // Bits 22, 23 live in byte index 2 of the features bitmap, bits 6 and 7.
+        // Without DC_ID config they must be zero; byte 2 should not even be present.
+        assert!(
+            features_len <= 2,
+            "features should be <=2 bytes (bit 11 is the highest real Java 2.17.0 bit ignite-rs claims), got {}",
+            features_len
+        );
+    }
+
+    /// FND-005: when the user sets `IGNITE_DATA_CENTER_ID` user attribute,
+    /// Rust opts into the DC-aware wire extension. In that case the invented
+    /// bits 22 and 23 are claimed so the downstream Gridgain server can route
+    /// DC-aware queries.
+    #[test]
+    fn handshake_features_claims_dc_aware_bits_when_dc_id_configured() {
+        let mut conf = ClientConfig::new("127.0.0.1:10800");
+        conf.user_attributes
+            .insert("IGNITE_DATA_CENTER_ID".to_string(), "dc-1".to_string());
+        let req = build_handshake_request(&conf).expect("serialize");
+        let features_len = i32::from_le_bytes([req[13], req[14], req[15], req[16]]) as usize;
+        assert!(features_len >= 3, "need 3+ bytes to cover bits 22, 23");
+        assert_ne!(req[19] & (1 << 6), 0, "DC_AWARE (bit 22) must be claimed");
+        assert_ne!(
+            req[19] & (1 << 7),
+            0,
+            "QRY_INITIATOR_ID (bit 23) must be claimed"
+        );
     }
 
     #[test]
