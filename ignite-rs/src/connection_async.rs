@@ -123,6 +123,12 @@ pub(crate) struct ConnectionCapabilities {
     /// throws `ClientFeatureNotSupportedByServerException`
     /// (`ClientServicesImpl.java:414-418@2.17.0`).
     pub(crate) get_service_descriptors: bool,
+    /// Java `ProtocolBitmaskFeature.SERVICE_INVOKE` (bit 5). Required to send
+    /// `SERVICE_INVOKE` when no `ServiceCallContext` is supplied. With a
+    /// context, `SERVICE_INVOKE_CALLCTX` (bit 10) is required instead — Java
+    /// uses `checkFeatureSupported(callAttrs != null ? SERVICE_INVOKE_CALLCTX
+    /// : SERVICE_INVOKE)` (`ClientServicesImpl.java:363-364@2.17.0`).
+    pub(crate) service_invoke: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -517,6 +523,7 @@ where
                     &features,
                     FEATURE_GET_SERVICE_DESCRIPTORS,
                 ),
+                service_invoke: feature_supported(&features, FEATURE_SERVICE_INVOKE),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

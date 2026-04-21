@@ -468,6 +468,10 @@ impl Channel {
         self.metadata.capabilities.get_service_descriptors
     }
 
+    fn supports_service_invoke(&self) -> bool {
+        self.metadata.capabilities.service_invoke
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -913,9 +917,14 @@ pub(crate) struct IndexQueryCapabilities {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ServiceInvokeCapabilities {
+    /// Server advertises `SERVICE_INVOKE` (bit 5). Required to send
+    /// `SERVICE_INVOKE` at all when no `ServiceCallContext` is supplied —
+    /// see `ClientServicesImpl.java:363-364@2.17.0`.
+    pub(crate) service_invoke: bool,
     /// Server advertises `SERVICE_INVOKE_CALLCTX` (bit 10). When false, the
     /// `SERVICE_INVOKE` writer must omit the trailing `callAttrs` map field
     /// entirely — see `ClientServicesImpl.java:401-404@2.17.0`. FND-047.
+    /// Also required (in lieu of bit 5) when a call-context IS supplied.
     pub(crate) service_invoke_callctx: bool,
 }
 
@@ -2035,6 +2044,7 @@ impl ChannelManager {
     pub(crate) async fn service_invoke_capabilities(&self) -> ServiceInvokeCapabilities {
         let channel = self.default_channel().await;
         ServiceInvokeCapabilities {
+            service_invoke: channel.supports_service_invoke(),
             service_invoke_callctx: channel.supports_service_invoke_callctx(),
         }
     }

@@ -261,6 +261,28 @@ impl ServiceProxy {
         // explicit ServiceCallContext was supplied).
         let caps = self.services.exec.service_invoke_capabilities().await;
 
+        // FND gate: Java `ClientServicesImpl.writeServiceInvokeRequest` calls
+        // `checkFeatureSupported(callAttrs != null ? SERVICE_INVOKE_CALLCTX
+        // : SERVICE_INVOKE)` — i.e. when no call-context is supplied the
+        // base SERVICE_INVOKE bit (5) must be present; otherwise
+        // SERVICE_INVOKE_CALLCTX (10) is the required bit
+        // (`ClientServicesImpl.java:363-364@2.17.0`).
+        let required_bit_supported = if self.call_context.is_some() {
+            caps.service_invoke_callctx
+        } else {
+            caps.service_invoke
+        };
+        if !required_bit_supported {
+            let bit_name = if self.call_context.is_some() {
+                "SERVICE_INVOKE_CALLCTX"
+            } else {
+                "SERVICE_INVOKE"
+            };
+            return Err(IgniteError::from(
+                format!("{} is not supported by the server", bit_name).as_str(),
+            ));
+        }
+
         let response: NullableValueResponse<R> = self
             .services
             .exec
