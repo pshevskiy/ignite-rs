@@ -1654,11 +1654,40 @@ fn should_disconnect_on_cache_names(config: &MockThinServerConfig) -> bool {
 }
 
 fn mock_feature_bytes() -> Vec<u8> {
+    // Mirror a fully-featured Apache Ignite 2.17.0 server in the mock
+    // handshake response so integration tests aren't blocked by
+    // client-side feature-bit gates. Bits advertised:
+    //   byte 0: 0 USER_ATTRIBUTES, 1 EXECUTE_TASK_BY_NAME,
+    //           2 CLUSTER_STATES, 3 CLUSTER_GROUP_GET_NODES_ENDPOINTS,
+    //           4 CLUSTER_GROUPS, 5 SERVICE_INVOKE
+    //   byte 1: 8 BINARY_CONFIGURATION, 9 GET_SERVICE_DESCRIPTORS,
+    //           10 SERVICE_INVOKE_CALLCTX, 11 HEARTBEAT,
+    //           12 DATA_REPLICATION_OPERATIONS, 13 ALL_AFFINITY_MAPPINGS,
+    //           14 INDEX_QUERY, 15 INDEX_QUERY_LIMIT
+    //   byte 2: 17 CACHE_INVOKE, 19 FORCE_DEACTIVATION_FLAG, 22 DC_AWARE
     let mut features = vec![0u8; 3];
-    features[0] |= 1 << 0;
-    features[0] |= 1 << 3;
-    features[1] |= 1 << 3;
-    features[2] |= 1 << 6;
+    features[0] |= 1 << 0; // USER_ATTRIBUTES
+    features[0] |= 1 << 1; // EXECUTE_TASK_BY_NAME
+    features[0] |= 1 << 2; // CLUSTER_STATES
+    features[0] |= 1 << 3; // CLUSTER_GROUP_GET_NODES_ENDPOINTS
+    features[0] |= 1 << 4; // CLUSTER_GROUPS
+    features[0] |= 1 << 5; // SERVICE_INVOKE
+    features[1] |= 1 << 0; // BINARY_CONFIGURATION (byte 1, bit 0 = overall bit 8)
+    features[1] |= 1 << 1; // GET_SERVICE_DESCRIPTORS
+    features[1] |= 1 << 2; // SERVICE_INVOKE_CALLCTX
+    features[1] |= 1 << 3; // HEARTBEAT
+    features[1] |= 1 << 4; // DATA_REPLICATION_OPERATIONS
+    // bit 13 ALL_AFFINITY_MAPPINGS intentionally NOT advertised: the mock
+    // `encode_cache_partitions_response` encoder doesn't emit the trailing
+    // `bool defaultAffinity` field that Java writes when the bit is set, so
+    // enabling it here causes Rust's `read_with_flags(_, _, all=true)` to
+    // mis-align against the mock payload. Tests that need this bit supply a
+    // custom encoder.
+    features[1] |= 1 << 6; // INDEX_QUERY
+    features[1] |= 1 << 7; // INDEX_QUERY_LIMIT
+    features[2] |= 1 << 1; // CACHE_INVOKE (byte 2, bit 1 = overall bit 17)
+    features[2] |= 1 << 3; // FORCE_DEACTIVATION_FLAG (byte 2, bit 3 = overall bit 19)
+    features[2] |= 1 << 6; // DC_AWARE (Gridgain downstream, overall bit 22)
     features
 }
 
