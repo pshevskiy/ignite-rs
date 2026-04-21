@@ -59,6 +59,10 @@ name = "hot_path"
 harness = false
 
 [[bench]]
+name = "hot_path_ct"
+harness = false
+
+[[bench]]
 name = "concurrent_put"
 harness = false
 
