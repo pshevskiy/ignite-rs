@@ -7,6 +7,9 @@
 //! Run:
 //!   IGNITE_ADDR=127.0.0.1:10800 cargo bench --bench hot_path -- --save-baseline phase6_baseline
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::time::Duration;
 
 use criterion::async_executor::AsyncExecutor;
