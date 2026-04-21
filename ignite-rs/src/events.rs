@@ -21,6 +21,18 @@ impl EventSubscriptions {
     }
 }
 
+/// Client-side **observability** events. Not to be confused with Java's
+/// `ClientNotificationType` (`ClientNotificationType.java@2.17.0`), which
+/// enumerates server-initiated push notifications
+/// (`CONTINUOUS_QUERY_EVENT`, `COMPUTE_TASK_FINISHED`). Those server pushes
+/// are handled separately via
+/// `transport.rs::register_notification_listener` and surface through
+/// per-API channels (continuous query, compute task result) — see
+/// `NotificationFrame` in `connection_async.rs`.
+///
+/// The variants here are transport/lifecycle signals the client emits
+/// about its own state (connects, retries, request outcomes) for
+/// monitoring, not wire-level events from the server. See FND-063.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientEvent {
     Connection(ConnectionEvent),
