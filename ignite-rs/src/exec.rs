@@ -170,6 +170,10 @@ impl TokioExec {
         self.transport.supports_get_service_descriptors().await
     }
 
+    pub(crate) async fn supports_binary_configuration(&self) -> bool {
+        self.transport.supports_binary_configuration().await
+    }
+
     pub(crate) fn register_cache_listener_name(
         &self,
         cache_id: i32,

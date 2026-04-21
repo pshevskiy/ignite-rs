@@ -472,6 +472,10 @@ impl Channel {
         self.metadata.capabilities.service_invoke
     }
 
+    fn supports_binary_configuration(&self) -> bool {
+        self.metadata.capabilities.binary_configuration
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2111,6 +2115,15 @@ impl ChannelManager {
         self.default_channel()
             .await
             .supports_get_service_descriptors()
+    }
+
+    /// True if the default channel negotiated `BINARY_CONFIGURATION` (bit 8).
+    /// Gates `GET_BINARY_CONFIGURATION`
+    /// (`TcpIgniteClient.java:555-558@2.17.0`).
+    pub(crate) async fn supports_binary_configuration(&self) -> bool {
+        self.default_channel()
+            .await
+            .supports_binary_configuration()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {

@@ -129,6 +129,13 @@ pub(crate) struct ConnectionCapabilities {
     /// uses `checkFeatureSupported(callAttrs != null ? SERVICE_INVOKE_CALLCTX
     /// : SERVICE_INVOKE)` (`ClientServicesImpl.java:363-364@2.17.0`).
     pub(crate) service_invoke: bool,
+    /// Java `ProtocolBitmaskFeature.BINARY_CONFIGURATION` (bit 8). Required to
+    /// send `GET_BINARY_CONFIGURATION`. Java's `TcpIgniteClient` silently
+    /// skips the call (returns null) when the bit is absent
+    /// (`TcpIgniteClient.java:555-558@2.17.0`); Rust surfaces a client-side
+    /// error instead since `get_configuration` returns `IgniteResult<_>` not
+    /// `Option<_>`.
+    pub(crate) binary_configuration: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -524,6 +531,10 @@ where
                     FEATURE_GET_SERVICE_DESCRIPTORS,
                 ),
                 service_invoke: feature_supported(&features, FEATURE_SERVICE_INVOKE),
+                binary_configuration: feature_supported(
+                    &features,
+                    FEATURE_BINARY_CONFIGURATION,
+                ),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

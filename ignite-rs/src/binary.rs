@@ -277,6 +277,16 @@ impl Binary {
     }
 
     pub async fn get_configuration(&self) -> IgniteResult<BinaryConfigurationInfo> {
+        // FND gate: Java `TcpIgniteClient` short-circuits this call to null
+        // when `BINARY_CONFIGURATION` (bit 8) is not negotiated
+        // (`TcpIgniteClient.java:555-558@2.17.0`). Rust surfaces an explicit
+        // client-side error since the return type is `IgniteResult<_>` rather
+        // than `Option<_>`.
+        if !self.exec.supports_binary_configuration().await {
+            return Err(IgniteError::from(
+                "BINARY_CONFIGURATION is not supported by the server",
+            ));
+        }
         self.exec
             .send_and_read(OpCode::GetBinaryConfiguration, EmptyReq)
             .await
