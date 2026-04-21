@@ -229,7 +229,8 @@ async fn should_serialize_binary_object_arguments_and_decode_binary_results() {
     let arg_count = ignite_rs::protocol::read_i32(&mut cursor).unwrap();
     let decoded_arg = BinaryObject::read(&mut cursor).unwrap().unwrap();
 
-    assert_eq!(flags & 0x01, 0x01);
+    // FND-025: invoke must not force keep_binary; this Cache was built without it.
+    assert_eq!(flags & 0x01, 0x00);
     assert_eq!(key, 1);
     assert_eq!(decoded_processor.type_name(), "BinaryObjectEntryProcessor");
     assert_eq!(platform, 1);

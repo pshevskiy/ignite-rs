@@ -23,7 +23,9 @@ pub(crate) struct InvokeRequest<'a, K> {
 
 impl<K: WritableType> WriteableReq for InvokeRequest<'_, K> {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
-        write_cache_info(writer, self.cache_info.with_keep_binary(true))?;
+        // FND-025: emit the caller's CacheInfo verbatim; do not force keep_binary.
+        // Java's CacheInvokeRequest uses whatever flags the cache is configured with.
+        write_cache_info(writer, self.cache_info)?;
         self.key.write(writer)?;
         self.processor.write(writer)?;
         crate::protocol::write_u8(writer, JAVA_CLIENT_PLATFORM)?;
@@ -35,7 +37,7 @@ impl<K: WritableType> WriteableReq for InvokeRequest<'_, K> {
     }
 
     fn size(&self) -> usize {
-        cache_info_size(self.cache_info.with_keep_binary(true))
+        cache_info_size(self.cache_info)
             + self.key.size()
             + self.processor.size()
             + 1
@@ -54,7 +56,8 @@ pub(crate) struct InvokeAllPreparedFirstRequest<'a, F, K> {
 
 impl<F: WritableType, K: WritableType> WriteableReq for InvokeAllPreparedFirstRequest<'_, F, K> {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
-        write_cache_info(writer, self.cache_info.with_keep_binary(true))?;
+        // FND-025: caller's cache_info is authoritative; do not force keep_binary.
+        write_cache_info(writer, self.cache_info)?;
         crate::protocol::write_i32(
             writer,
             (usize::from(self.first_key.is_some()) + self.remaining_keys.len()) as i32,
@@ -75,7 +78,7 @@ impl<F: WritableType, K: WritableType> WriteableReq for InvokeAllPreparedFirstRe
     }
 
     fn size(&self) -> usize {
-        cache_info_size(self.cache_info.with_keep_binary(true))
+        cache_info_size(self.cache_info)
             + 4
             + self.first_key.map(WritableType::size).unwrap_or(0)
             + self
@@ -111,5 +114,67 @@ impl<K: ReadableType, V: ReadableType> ReadableReq for InvokeAllResponse<K, V> {
         }
 
         Ok(Self { entries })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::key_value::KEEP_BINARY_FLAG_MASK;
+    use crate::binary::BinaryObjectBuilder;
+
+    /// FND-025: invoke must not force keep_binary=true; the caller's cache_info flag is authoritative
+    /// (Java CacheInvokeRequest propagates the cache flags as-is).
+    #[test]
+    fn should_honour_caller_keep_binary_flag_on_invoke() {
+        let processor = BinaryObjectBuilder::new("Proc").build();
+        let key: i32 = 1;
+        let args: Vec<IgniteValue> = Vec::new();
+
+        let req = InvokeRequest {
+            cache_info: CacheInfo::new(42), // keep_binary=false
+            key: &key,
+            processor: &processor,
+            args: &args,
+        };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // cache_id (4) then flags (1) — flags must be 0 when caller did not request keep_binary
+        assert_eq!(&buf[0..4], 42i32.to_le_bytes().as_slice());
+        assert_eq!(
+            buf[4] & KEEP_BINARY_FLAG_MASK,
+            0,
+            "invoke must not force KEEP_BINARY flag; caller's cache_info drives it"
+        );
+        assert_eq!(req.size(), buf.len());
+    }
+
+    #[test]
+    fn should_honour_caller_keep_binary_flag_on_invoke_all() {
+        let processor = BinaryObjectBuilder::new("Proc").build();
+        let remaining: [i32; 0] = [];
+        let args: Vec<IgniteValue> = Vec::new();
+        let first: i32 = 1;
+
+        let req = InvokeAllPreparedFirstRequest {
+            cache_info: CacheInfo::new(7),
+            first_key: Some(&first),
+            remaining_keys: &remaining[..],
+            processor: &processor,
+            args: &args,
+        };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        assert_eq!(&buf[0..4], 7i32.to_le_bytes().as_slice());
+        assert_eq!(
+            buf[4] & KEEP_BINARY_FLAG_MASK,
+            0,
+            "invoke_all must not force KEEP_BINARY flag; caller's cache_info drives it"
+        );
+        assert_eq!(req.size(), buf.len());
     }
 }
