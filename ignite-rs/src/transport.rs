@@ -1279,7 +1279,7 @@ impl ChannelManager {
     }
 
     async fn connect_any(&self, start_index: usize, reconnect: bool) -> IgniteResult<Arc<Channel>> {
-        let addresses = self.topology.endpoints().await;
+        let addresses = self.topology.endpoints_arc();
         let len = addresses.len();
         let mut errors = Vec::new();
 
@@ -1521,8 +1521,11 @@ impl ChannelManager {
             return current_dc_channels;
         }
 
+        // PFND-001: endpoints_arc() is lock-free and shares an Arc<Vec<String>>
+        // with the topology cache; no per-request allocation.
+        let endpoints = self.topology.endpoints_arc();
         let available = self
-            .available_channels_by_addresses(self.topology.endpoints().await)
+            .available_channels_by_addresses(endpoints.as_slice())
             .await;
         if !available.is_empty() {
             return available;
@@ -1556,9 +1559,9 @@ impl ChannelManager {
         self.available_channels_from_index(&addresses)
     }
 
-    async fn available_channels_by_addresses(&self, addresses: Vec<String>) -> Vec<Arc<Channel>> {
+    async fn available_channels_by_addresses(&self, addresses: &[String]) -> Vec<Arc<Channel>> {
         let active = self.active.read().await.clone();
-        let mut available = self.available_channels_from_index(&addresses);
+        let mut available = self.available_channels_from_index(addresses);
         let mut seen_active = false;
 
         for channel in &available {
@@ -1961,9 +1964,9 @@ impl ChannelManager {
     }
 
     async fn prime_discovered_channels(&self, active_address: &str) {
-        let endpoints = self.topology.endpoints().await;
+        let endpoints = self.topology.endpoints_arc();
 
-        for address in endpoints {
+        for address in endpoints.iter().cloned() {
             if address == active_address {
                 continue;
             }
@@ -2114,7 +2117,7 @@ impl ChannelManager {
         start_index: usize,
         reconnect: bool,
     ) -> IgniteResult<Arc<Channel>> {
-        let addresses = topology.endpoints().await;
+        let addresses = topology.endpoints_arc();
         let len = addresses.len();
         let mut errors = Vec::new();
 

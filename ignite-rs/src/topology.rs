@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,29 +47,53 @@ struct TopologyState {
 #[derive(Debug)]
 pub(crate) struct TopologyCache {
     state: RwLock<TopologyState>,
+    /// PFND-001: pre-computed merged endpoints. Invalidated on seed /
+    /// discovery mutations; rebuilt under the write lock. Hot-path readers
+    /// (one per request) clone this Arc instead of re-running dedupe +
+    /// HashSet + String cloning.
+    cached_endpoints: ArcSwap<Vec<String>>,
 }
 
 #[allow(dead_code)]
 impl TopologyCache {
     pub(crate) fn new(seed_endpoints: Vec<String>) -> Self {
+        let seed_endpoints = dedupe(seed_endpoints);
+        let initial_cache = Arc::new(seed_endpoints.clone());
         Self {
             state: RwLock::new(TopologyState {
-                seed_endpoints: dedupe(seed_endpoints),
+                seed_endpoints,
                 discovered_nodes: BTreeMap::new(),
                 active_endpoint: None,
                 node_ids: Vec::new(),
                 current_dc_node_ids: Vec::new(),
                 topology_version: None,
             }),
+            cached_endpoints: ArcSwap::new(initial_cache),
         }
     }
 
+    /// Returns a shared view of the merged seed + discovered endpoints.
+    ///
+    /// PFND-001: lock-free on the hot path. Callers typically iterate the
+    /// result and optionally clone individual strings.
+    pub(crate) fn endpoints_arc(&self) -> Arc<Vec<String>> {
+        self.cached_endpoints.load_full()
+    }
+
     pub(crate) async fn endpoints(&self) -> Vec<String> {
-        let state = self.state.read().await;
-        merged_endpoints(
+        // Back-compat shim: some code still wants an owned Vec<String>.
+        (*self.endpoints_arc()).clone()
+    }
+
+    fn rebuild_cache(state: &TopologyState) -> Arc<Vec<String>> {
+        Arc::new(merged_endpoints(
             &state.seed_endpoints,
             &flatten_discovered_nodes(&state.discovered_nodes),
-        )
+        ))
+    }
+
+    fn refresh_cache_from(&self, state: &TopologyState) {
+        self.cached_endpoints.store(Self::rebuild_cache(state));
     }
 
     pub(crate) async fn replace_seed_endpoints(&self, seed_endpoints: Vec<String>) -> Vec<String> {
@@ -79,6 +106,7 @@ impl TopologyCache {
             .cloned()
             .collect();
         state.seed_endpoints = next;
+        self.refresh_cache_from(&state);
         removed
     }
 
@@ -129,6 +157,7 @@ impl TopologyCache {
         if !endpoints.iter().any(|existing| existing == &endpoint) {
             endpoints.push(endpoint);
         }
+        self.refresh_cache_from(&state);
     }
 
     pub(crate) async fn topology_version(&self) -> Option<TopologyVersion> {
@@ -190,6 +219,7 @@ impl TopologyCache {
         }
 
         state.topology_version = Some(version);
+        self.refresh_cache_from(&state);
     }
 
     pub(crate) async fn snapshot(&self) -> TopologySnapshot {
