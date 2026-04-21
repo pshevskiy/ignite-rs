@@ -112,12 +112,29 @@ impl Services {
     }
 
     pub async fn service_descriptors(&self) -> IgniteResult<Vec<ServiceDescriptor>> {
+        // FND gate: Java `ClientServicesImpl.checkGetServiceDescriptorsSupported`
+        // throws `ClientFeatureNotSupportedByServerException` when
+        // `GET_SERVICE_DESCRIPTORS` (bit 9) is not negotiated
+        // (`ClientServicesImpl.java:414-418@2.17.0`).
+        if !self.exec.supports_get_service_descriptors().await {
+            return Err(IgniteError::from(
+                "GET_SERVICE_DESCRIPTORS is not supported by the server",
+            ));
+        }
         self.exec
             .send_and_read(OpCode::ServiceGetDescriptors, EmptyRequest)
             .await
     }
 
     pub async fn service_descriptor(&self, name: &str) -> IgniteResult<ServiceDescriptor> {
+        // FND gate: same as service_descriptors — Java shares
+        // `checkGetServiceDescriptorsSupported` for both descriptor APIs
+        // (`ClientServicesImpl.java:414-418@2.17.0`).
+        if !self.exec.supports_get_service_descriptors().await {
+            return Err(IgniteError::from(
+                "GET_SERVICE_DESCRIPTORS is not supported by the server",
+            ));
+        }
         self.exec
             .send_and_read(
                 OpCode::ServiceGetDescriptor,

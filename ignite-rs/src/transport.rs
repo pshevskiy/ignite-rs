@@ -464,6 +464,10 @@ impl Channel {
         self.metadata.capabilities.data_replication_operations
     }
 
+    fn supports_get_service_descriptors(&self) -> bool {
+        self.metadata.capabilities.get_service_descriptors
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2088,6 +2092,15 @@ impl ChannelManager {
         self.default_channel()
             .await
             .supports_data_replication_operations()
+    }
+
+    /// True if the default channel negotiated `GET_SERVICE_DESCRIPTORS`
+    /// (bit 9). Gates `SERVICE_GET_DESCRIPTORS` /
+    /// `SERVICE_GET_DESCRIPTOR` (`ClientServicesImpl.java:414-418@2.17.0`).
+    pub(crate) async fn supports_get_service_descriptors(&self) -> bool {
+        self.default_channel()
+            .await
+            .supports_get_service_descriptors()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {

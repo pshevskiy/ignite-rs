@@ -166,6 +166,10 @@ impl TokioExec {
         self.transport.supports_data_replication_operations().await
     }
 
+    pub(crate) async fn supports_get_service_descriptors(&self) -> bool {
+        self.transport.supports_get_service_descriptors().await
+    }
+
     pub(crate) fn register_cache_listener_name(
         &self,
         cache_id: i32,

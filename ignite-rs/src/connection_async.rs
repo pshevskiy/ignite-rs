@@ -118,6 +118,11 @@ pub(crate) struct ConnectionCapabilities {
     /// Java throws `ClientFeatureNotSupportedByServerException`
     /// (`TcpClientCache.java:1607-1611@2.17.0`).
     pub(crate) data_replication_operations: bool,
+    /// Java `ProtocolBitmaskFeature.GET_SERVICE_DESCRIPTORS` (bit 9). Required
+    /// to send `SERVICE_GET_DESCRIPTORS` / `SERVICE_GET_DESCRIPTOR`. Java
+    /// throws `ClientFeatureNotSupportedByServerException`
+    /// (`ClientServicesImpl.java:414-418@2.17.0`).
+    pub(crate) get_service_descriptors: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -507,6 +512,10 @@ where
                 data_replication_operations: feature_supported(
                     &features,
                     FEATURE_DATA_REPLICATION_OPERATIONS,
+                ),
+                get_service_descriptors: feature_supported(
+                    &features,
+                    FEATURE_GET_SERVICE_DESCRIPTORS,
                 ),
             };
             let server_node_id = if capabilities.partition_awareness {
