@@ -7,6 +7,7 @@ pub(crate) mod key_value;
 /// synthetic ops — stock 2.17.0 servers respond to them with
 /// `INVALID_OP_CODE(2)`. Used by FND-003 / FND-004 parity guards to
 /// distinguish extension ops from pure Java 2.17.0 ops.
+#[cfg(test)]
 pub(crate) const JAVA_2_17_0_OPCODES: &[i16] = &[
     0, // RESOURCE_CLOSE
     1, // HEARTBEAT
@@ -27,6 +28,7 @@ pub(crate) const JAVA_2_17_0_OPCODES: &[i16] = &[
 ];
 
 #[derive(Debug, Copy, Clone)]
+#[allow(dead_code)] // Some variants (e.g. OpStopWarmup) exist for Java 2.17.0 opcode-table parity.
 pub(crate) enum OpCode {
     Heartbeat = 1,
     GetIdleTimeout = 2,
