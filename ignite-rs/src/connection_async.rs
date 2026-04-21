@@ -87,6 +87,11 @@ pub(crate) struct ConnectionCapabilities {
     /// (Java §9, FND-056). When not negotiated, the field is omitted and
     /// `forceDeactivation=false` is unsupported server-side.
     pub(crate) force_deactivation_flag: bool,
+    /// Java `ProtocolBitmaskFeature.CACHE_INVOKE` (bit 17). Required to send
+    /// `CACHE_INVOKE`/`CACHE_INVOKE_ALL`. Java throws
+    /// `ClientFeatureNotSupportedByServerException` if absent
+    /// (`TcpClientCache.java:964-965@2.17.0`).
+    pub(crate) cache_invoke: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -465,6 +470,7 @@ where
                     &features,
                     FEATURE_FORCE_DEACTIVATION_FLAG,
                 ),
+                cache_invoke: feature_supported(&features, FEATURE_CACHE_INVOKE),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

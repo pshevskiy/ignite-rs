@@ -1513,6 +1513,14 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         args: &[IgniteValue],
     ) -> IgniteResult<Option<R>> {
         self.ensure_tx_cache_ops_allowed().await?;
+        // FND gate: Java `TcpClientCache.writeEntryProcessor` throws
+        // `ClientFeatureNotSupportedByServerException` when `CACHE_INVOKE`
+        // (bit 17) is not negotiated (`TcpClientCache.java:964-965@2.17.0`).
+        if !self.exec.supports_cache_invoke().await {
+            return Err(IgniteError::from(
+                "CACHE_INVOKE is not supported by the server",
+            ));
+        }
         let (prepared_key, route) = self.prepare_key_route(key, true).await?;
         let resp: CacheDataObjectResp<R> = self
             .map_tx_err(
@@ -1540,6 +1548,14 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         args: &[IgniteValue],
     ) -> IgniteResult<Vec<(Option<K>, InvokeAllResult<R>)>> {
         self.ensure_tx_cache_ops_allowed().await?;
+        // FND gate: Java `TcpClientCache.writeEntryProcessor` throws
+        // `ClientFeatureNotSupportedByServerException` when `CACHE_INVOKE`
+        // (bit 17) is not negotiated (`TcpClientCache.java:964-965@2.17.0`).
+        if !self.exec.supports_cache_invoke().await {
+            return Err(IgniteError::from(
+                "CACHE_INVOKE is not supported by the server",
+            ));
+        }
         let (first_key, remaining_keys) = match keys.split_first() {
             Some((first, remaining)) => (Some(PreparedKey::new(first)?), remaining),
             None => (None, &[][..]),

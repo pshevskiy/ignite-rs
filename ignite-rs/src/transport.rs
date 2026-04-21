@@ -440,6 +440,10 @@ impl Channel {
         self.metadata.capabilities.force_deactivation_flag
     }
 
+    fn supports_cache_invoke(&self) -> bool {
+        self.metadata.capabilities.cache_invoke
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2020,6 +2024,13 @@ impl ChannelManager {
         self.default_channel()
             .await
             .supports_force_deactivation_flag()
+    }
+
+    /// True if the default channel negotiated `CACHE_INVOKE` (bit 17). Required
+    /// to send `CACHE_INVOKE`/`CACHE_INVOKE_ALL`
+    /// (`TcpClientCache.java:964-965@2.17.0`).
+    pub(crate) async fn supports_cache_invoke(&self) -> bool {
+        self.default_channel().await.supports_cache_invoke()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {
