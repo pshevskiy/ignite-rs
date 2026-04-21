@@ -1033,3 +1033,143 @@ fn read_set_items<T: ReadableType>(reader: &mut impl Read) -> IgniteResult<Vec<T
     }
     Ok(items)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(req: &dyn WriteableReq) -> Vec<u8> {
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+        buf
+    }
+
+    /// FND-050 — `ATOMIC_LONG_CREATE` wire layout matches
+    /// `TcpIgniteClient#atomicLong@2.17.0:428-441`:
+    ///   writeString(name)                             // typed String
+    ///   writeLong(initialValue)                        // i64
+    ///   writeBoolean(cfg != null)                      // bool
+    ///   if cfg != null {
+    ///       writeInt(reserveSize)                      // i32
+    ///       writeByte(CacheMode.toCode(cacheMode))     // i8
+    ///       writeInt(backups)                          // i32
+    ///       writeString(groupName)                     // typed String | NULL
+    ///   }
+    /// The audit's alternative "writeName then initialValue;create" applies
+    /// to the other AtomicLong ops (§8.1 `writeName` helper), not CREATE —
+    /// CREATE has the config payload inlined per Java.
+    #[test]
+    fn atomic_long_create_request_matches_java_without_config() {
+        let req = AtomicLongCreateRequest {
+            name: "counter".to_string(),
+            initial_value: 42,
+            config: None,
+        };
+        let mut expected = Vec::new();
+        // name: typed String (TypeCode::String=9, i32 len=7, bytes)
+        expected.push(9);
+        expected.extend_from_slice(&7i32.to_le_bytes());
+        expected.extend_from_slice(b"counter");
+        // initialValue
+        expected.extend_from_slice(&42i64.to_le_bytes());
+        // cfg == null marker
+        expected.push(0);
+        assert_eq!(encode(&req), expected);
+        assert_eq!(req.size(), expected.len());
+    }
+
+    /// FND-050 — CREATE with a non-null `AtomicConfiguration` writes the
+    /// config fields (reserveSize, cacheMode, backups, groupName) inline,
+    /// matching the Java client exactly. `groupName` is a typed String that
+    /// may be NULL (TypeCode 101) when `ClientAtomicConfiguration.groupName`
+    /// is null.
+    #[test]
+    fn atomic_long_create_request_matches_java_with_config_and_group() {
+        let req = AtomicLongCreateRequest {
+            name: "c".to_string(),
+            initial_value: 7,
+            config: Some(AtomicConfiguration {
+                reserve_size: 64,
+                cache_mode: CacheMode::Partitioned,
+                backups: 2,
+                group_name: Some("grp".to_string()),
+            }),
+        };
+        let mut expected = Vec::new();
+        // name
+        expected.push(9);
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.push(b'c');
+        // initialValue
+        expected.extend_from_slice(&7i64.to_le_bytes());
+        // cfg != null marker
+        expected.push(1);
+        // reserveSize / cacheMode / backups
+        expected.extend_from_slice(&64i32.to_le_bytes());
+        expected.push(2); // CacheMode::Partitioned == 2 (matches Java CacheMode.toCode)
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        // groupName as typed String
+        expected.push(9);
+        expected.extend_from_slice(&3i32.to_le_bytes());
+        expected.extend_from_slice(b"grp");
+        assert_eq!(encode(&req), expected);
+        assert_eq!(req.size(), expected.len());
+    }
+
+    /// FND-050 — CREATE with a config that has a null `group_name` must
+    /// write `groupName` as typed-string NULL (TypeCode 101), matching
+    /// `BinaryWriterEx.writeString(null)` in Java.
+    #[test]
+    fn atomic_long_create_request_encodes_null_group_name_as_typed_null() {
+        let req = AtomicLongCreateRequest {
+            name: "n".to_string(),
+            initial_value: 0,
+            config: Some(AtomicConfiguration {
+                reserve_size: 1,
+                cache_mode: CacheMode::Replicated,
+                backups: 0,
+                group_name: None,
+            }),
+        };
+        let bytes = encode(&req);
+        // Last byte is the typed-string NULL marker for groupName.
+        assert_eq!(*bytes.last().unwrap(), 101);
+        assert_eq!(req.size(), bytes.len());
+    }
+
+    /// FND-050 — The non-CREATE AtomicLong ops use Java's `writeName`
+    /// helper (`ClientAtomicLongImpl#writeName@2.17.0:136-141`):
+    ///   writeString(name); writeString(groupName)
+    /// `AtomicLongIdentityRequest` pins that layout.
+    #[test]
+    fn atomic_long_identity_request_matches_java_write_name() {
+        let req = AtomicLongIdentityRequest::new("counter", Some("grp".to_string()));
+        let mut expected = Vec::new();
+        // name
+        expected.push(9);
+        expected.extend_from_slice(&7i32.to_le_bytes());
+        expected.extend_from_slice(b"counter");
+        // groupName as typed String
+        expected.push(9);
+        expected.extend_from_slice(&3i32.to_le_bytes());
+        expected.extend_from_slice(b"grp");
+        assert_eq!(encode(&req), expected);
+        assert_eq!(req.size(), expected.len());
+    }
+
+    /// FND-050 — `writeName` with a null groupName must emit typed-string
+    /// NULL (TypeCode 101), matching `w.writeString(groupName)` in Java
+    /// when `groupName == null`.
+    #[test]
+    fn atomic_long_identity_request_encodes_null_group_name_as_typed_null() {
+        let req = AtomicLongIdentityRequest::new("counter", None);
+        let bytes = encode(&req);
+        let mut expected = Vec::new();
+        expected.push(9);
+        expected.extend_from_slice(&7i32.to_le_bytes());
+        expected.extend_from_slice(b"counter");
+        expected.push(101); // typed-string NULL
+        assert_eq!(bytes, expected);
+        assert_eq!(req.size(), expected.len());
+    }
+}
