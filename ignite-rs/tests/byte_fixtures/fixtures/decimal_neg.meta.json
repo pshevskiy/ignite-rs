@@ -1,0 +1,6 @@
+{
+  "name" : "decimal_neg",
+  "kind" : "decimal",
+  "value" : "scale=0,mag=[255,206]",
+  "bytes_len" : 11
+}

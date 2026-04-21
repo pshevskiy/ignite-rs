@@ -1,0 +1,6 @@
+{
+  "name" : "arr_i32_mixed",
+  "kind" : "arr_i32",
+  "value" : "[-1,0,1,2147483647]",
+  "bytes_len" : 21
+}

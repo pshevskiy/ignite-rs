@@ -1,0 +1,6 @@
+{
+  "name" : "arr_i64_small",
+  "kind" : "arr_i64",
+  "value" : "[-1,0,42]",
+  "bytes_len" : 29
+}

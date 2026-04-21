@@ -1,0 +1,6 @@
+{
+  "name" : "timestamp_ms",
+  "kind" : "timestamp",
+  "value" : "1700000000000,123456789",
+  "bytes_len" : 13
+}

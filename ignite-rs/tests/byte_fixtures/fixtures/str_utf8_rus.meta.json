@@ -1,0 +1,6 @@
+{
+  "name" : "str_utf8_rus",
+  "kind" : "str",
+  "value" : "Привет",
+  "bytes_len" : 17
+}

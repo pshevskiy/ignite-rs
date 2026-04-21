@@ -1,0 +1,6 @@
+{
+  "name" : "decimal_123_45",
+  "kind" : "decimal",
+  "value" : "scale=2,mag=[48,57]",
+  "bytes_len" : 11
+}

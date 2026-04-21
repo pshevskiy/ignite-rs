@@ -1,0 +1,6 @@
+{
+  "name" : "i32_max",
+  "kind" : "i32",
+  "value" : "2147483647",
+  "bytes_len" : 5
+}

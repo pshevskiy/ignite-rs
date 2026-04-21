@@ -1,0 +1,6 @@
+{
+  "name" : "list_of_str",
+  "kind" : "list_str",
+  "value" : "[a,b,c]",
+  "bytes_len" : 24
+}

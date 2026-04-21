@@ -1,0 +1,6 @@
+{
+  "name" : "arr_byte_small",
+  "kind" : "arr_byte",
+  "value" : "[1,2,3]",
+  "bytes_len" : 8
+}

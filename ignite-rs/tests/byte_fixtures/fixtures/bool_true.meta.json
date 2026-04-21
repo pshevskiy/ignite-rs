@@ -1,0 +1,6 @@
+{
+  "name" : "bool_true",
+  "kind" : "bool",
+  "value" : "true",
+  "bytes_len" : 2
+}

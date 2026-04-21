@@ -1,0 +1,6 @@
+{
+  "name" : "str_ascii",
+  "kind" : "str",
+  "value" : "hello",
+  "bytes_len" : 10
+}

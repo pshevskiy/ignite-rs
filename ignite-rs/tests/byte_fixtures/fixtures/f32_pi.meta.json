@@ -1,0 +1,6 @@
+{
+  "name" : "f32_pi",
+  "kind" : "f32",
+  "value" : "3.14159",
+  "bytes_len" : 5
+}

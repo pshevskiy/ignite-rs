@@ -1,0 +1,6 @@
+{
+  "name" : "opaque_blob",
+  "kind" : "opaque",
+  "value" : "[172,237,0,5]",
+  "bytes_len" : 9
+}

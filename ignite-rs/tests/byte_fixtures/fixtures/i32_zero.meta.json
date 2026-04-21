@@ -1,0 +1,6 @@
+{
+  "name" : "i32_zero",
+  "kind" : "i32",
+  "value" : "0",
+  "bytes_len" : 5
+}
