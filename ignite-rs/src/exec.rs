@@ -127,6 +127,10 @@ impl TokioExec {
         self.transport.sql_fields_capabilities().await
     }
 
+    pub(crate) async fn supports_transactions(&self) -> bool {
+        self.transport.supports_transactions().await
+    }
+
     pub(crate) fn register_cache_listener_name(
         &self,
         cache_id: i32,

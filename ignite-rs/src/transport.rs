@@ -274,6 +274,10 @@ impl Channel {
         self.metadata.capabilities.query_initiator_id
     }
 
+    fn supports_transactions(&self) -> bool {
+        self.metadata.capabilities.transactions
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -1585,6 +1589,12 @@ impl ChannelManager {
             partitions_batch_size: channel.supports_query_partitions_batch_size(),
             query_initiator_id: channel.supports_query_initiator_id(),
         }
+    }
+
+    /// True if the default channel negotiated the TRANSACTIONS protocol-version feature
+    /// (Java `ProtocolVersionFeature.TRANSACTIONS`, V1_5_0+).
+    pub(crate) async fn supports_transactions(&self) -> bool {
+        self.default_channel().await.supports_transactions()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {

@@ -54,6 +54,9 @@ const FEATURE_QRY_INITIATOR_ID: usize = 23;
 const STATUS_SECURITY_VIOLATION: i32 = 1012;
 const STATUS_AUTH_FAILED: i32 = 2000;
 const PARTITION_AWARENESS_VERSION: (i16, i16, i16) = (1, 4, 0);
+// Java `ProtocolVersionFeature.TRANSACTIONS = V1_5_0`. See
+// modules/core/src/main/java/org/apache/ignite/internal/client/thin/ProtocolVersionFeature.java@2.17.0
+const TRANSACTIONS_VERSION: (i16, i16, i16) = (1, 5, 0);
 const BITMAP_FEATURES_VERSION: (i16, i16, i16) = (1, 7, 0);
 
 #[derive(Clone, Debug, Default)]
@@ -64,6 +67,8 @@ pub(crate) struct ConnectionCapabilities {
     pub(crate) dc_aware: bool,
     pub(crate) query_partitions_batch_size: bool,
     pub(crate) query_initiator_id: bool,
+    /// Java `ProtocolVersionFeature.TRANSACTIONS` (V1_5_0+). Gate for tx_start.
+    pub(crate) transactions: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -416,6 +421,7 @@ where
                     FEATURE_QRY_PARTITIONS_BATCH_SIZE,
                 ),
                 query_initiator_id: feature_supported(&features, FEATURE_QRY_INITIATOR_ID),
+                transactions: version_supports_transactions(V_MAJOR, V_MINOR, V_PATCH),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)
@@ -573,6 +579,10 @@ fn version_supports_partition_awareness(major: i16, minor: i16, patch: i16) -> b
     (major, minor, patch) >= PARTITION_AWARENESS_VERSION
 }
 
+fn version_supports_transactions(major: i16, minor: i16, patch: i16) -> bool {
+    (major, minor, patch) >= TRANSACTIONS_VERSION
+}
+
 fn version_supports_bitmap_features(major: i16, minor: i16, patch: i16) -> bool {
     (major, minor, patch) >= BITMAP_FEATURES_VERSION
 }
@@ -680,8 +690,8 @@ pub(crate) fn read_uuid_string(reader: &mut impl io::Read) -> IgniteResult<Strin
 mod tests {
     use super::{
         build_handshake_request, classify_handshake_error, read_response_error_string,
-        write_requests, CLIENT_CODE, HANDSHAKE_OP_CODE, STATUS_AUTH_FAILED,
-        STATUS_SECURITY_VIOLATION, V_MAJOR, V_MINOR, V_PATCH,
+        version_supports_transactions, write_requests, CLIENT_CODE, HANDSHAKE_OP_CODE,
+        STATUS_AUTH_FAILED, STATUS_SECURITY_VIOLATION, V_MAJOR, V_MINOR, V_PATCH,
     };
     use crate::error::ErrorKind;
     use crate::protocol::{write_i32, write_string, TypeCode};
@@ -829,6 +839,20 @@ mod tests {
             0,
             "QRY_INITIATOR_ID (bit 23) must be claimed"
         );
+    }
+
+    /// FND-028: Java `ProtocolVersionFeature.TRANSACTIONS` requires V1_5_0+.
+    /// See modules/core/.../client/thin/ProtocolVersionFeature.java@2.17.0.
+    #[test]
+    fn transactions_feature_gated_on_v1_5_0() {
+        assert!(!version_supports_transactions(1, 4, 0));
+        assert!(!version_supports_transactions(1, 4, 9));
+        assert!(version_supports_transactions(1, 5, 0));
+        assert!(version_supports_transactions(1, 6, 0));
+        assert!(version_supports_transactions(1, 7, 0));
+        assert!(version_supports_transactions(2, 0, 0));
+        // Rust's hard-coded handshake version must satisfy the gate.
+        assert!(version_supports_transactions(V_MAJOR, V_MINOR, V_PATCH));
     }
 
     #[test]

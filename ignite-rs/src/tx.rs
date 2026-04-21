@@ -78,6 +78,16 @@ impl Transactions {
     }
 
     pub async fn tx_start(&self, options: TransactionOptions) -> IgniteResult<Transaction> {
+        // Java `TcpClientTransactions.txStart0` (TcpClientTransactions.java:97@2.17.0)
+        // refuses to send TX_START when the negotiated protocol version is < V1_5_0,
+        // throwing `ClientFeatureNotSupportedByServerException`. Mirror that client-side
+        // precondition so retry classification matches Java (FND-028).
+        if !self.exec.supports_transactions().await {
+            return Err(IgniteError::from(
+                "Transactions are not supported by the server's protocol version, required version 1.5.0",
+            ));
+        }
+
         let (tx_id, meta) = self
             .exec
             .send_and_read_with_meta::<TxStartResponse>(
