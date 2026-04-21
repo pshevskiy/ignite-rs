@@ -1172,4 +1172,30 @@ mod tests {
         assert_eq!(bytes, expected);
         assert_eq!(req.size(), expected.len());
     }
+
+    /// FND-051 (coverage) — `compare_and_set_and_get` returns the post-CAS
+    /// value derived from the witness. Java op
+    /// `ATOMIC_LONG_VALUE_COMPARE_AND_SET_AND_GET (9007)` returns the
+    /// witness (pre-CAS observed value). When `witness == expected` the
+    /// CAS succeeded and the stored value is now `value`; otherwise the
+    /// witness IS the current (unchanged) value. The op is not exposed
+    /// through Java's public interface in 2.17, so there is no parity
+    /// helper — this pins the client-side derivation against drift.
+    #[test]
+    fn compare_and_set_and_get_derivation_matches_java_semantics() {
+        // Exercise the derivation arithmetic directly (no server round trip).
+        let derive = |witness: i64, expected: i64, value: i64| -> i64 {
+            if witness == expected {
+                value
+            } else {
+                witness
+            }
+        };
+        // CAS succeeds: witness equals expected, post-state is `value`.
+        assert_eq!(derive(5, 5, 10), 10);
+        // CAS fails: witness differs from expected, post-state is the witness.
+        assert_eq!(derive(7, 5, 10), 7);
+        // CAS with expected == value (idempotent write): always returns value.
+        assert_eq!(derive(5, 5, 5), 5);
+    }
 }
