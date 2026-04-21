@@ -1431,6 +1431,15 @@ impl ChannelManager {
         address: &str,
         err: &IgniteError,
     ) -> IgniteResult<bool> {
+        // FND-061: Java only retries `ClientConnectionException`;
+        // `ClientServerError` is terminal (`ReliableChannelImpl.java:974-993,
+        // 876-887, 934-935@2.17.0`). Rust happened to match this only
+        // because the round-trip loop never surfaces server-error flags —
+        // make it explicit so a future refactor can't silently re-enable
+        // retry of terminal failures.
+        if !err.is_connection_related() {
+            return Ok(false);
+        }
         match &self.conf.retry_policy {
             RetryPolicy::Default => Ok(true),
             RetryPolicy::Never => Ok(false),
@@ -2431,5 +2440,54 @@ mod tests {
         ];
 
         assert_eq!(lowest_port_indices(&addresses), vec![1, 2]);
+    }
+
+    /// FND-061: Server-status errors (wire `FLAG_ERROR` responses that Java
+    /// maps to `ClientServerError`) must be terminal regardless of retry
+    /// policy. Java only retries `ClientConnectionException`
+    /// (`ReliableChannelImpl.java:274-278, 876-887, 974-993@2.17.0`);
+    /// `ClientServerError` short-circuits the whole retry loop.
+    ///
+    /// The contract is enforced in `IgniteError::is_connection_related()`:
+    /// any error carrying a `server_status` is terminal. `should_retry()`
+    /// consults this before any policy lookup.
+    #[test]
+    fn fnd_061_server_status_errors_are_terminal() {
+        use crate::error::IgniteError;
+        for status in [
+            1,    // FAILED
+            2,    // INVALID_OP_CODE
+            10,   // INVALID_NODE_STATE
+            11,   // NODE_IN_RECOVERY_MODE
+            1000, // CACHE_DOES_NOT_EXIST
+            1001, // CACHE_EXISTS
+            1011, // RESOURCE_DOES_NOT_EXIST
+            1012, // SECURITY_VIOLATION
+            1020, // TX_LIMIT_EXCEEDED
+            1021, // TX_NOT_FOUND
+            1040, // ENTRY_PROCESSOR_EXCEPTION
+        ] {
+            // Use a message that would otherwise match the substring
+            // heuristic (`connection`, `reset`, …) — status presence must
+            // win.
+            let err = IgniteError::from_server_status(status, "connection reset by peer");
+            assert!(
+                !err.is_connection_related(),
+                "server status {status} must be terminal (Java ClientServerError); \
+                 should_retry() relies on is_connection_related() == false"
+            );
+        }
+    }
+
+    /// FND-061 counterpart: I/O-level errors (no server status) remain
+    /// retryable by `RetryPolicy::Default`. Java's `ClientConnectionException`
+    /// branch (`ReliableChannelImpl.java:274-300@2.17.0`).
+    #[test]
+    fn fnd_061_connection_errors_remain_retryable() {
+        use crate::error::IgniteError;
+
+        let conn_err = IgniteError::connection("connection reset by peer");
+        assert!(conn_err.is_connection_related());
+        assert_eq!(conn_err.server_status(), None);
     }
 }
