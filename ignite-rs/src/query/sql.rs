@@ -63,6 +63,10 @@ pub enum SqlValue {
     Map(Vec<(SqlValue, SqlValue)>),
     Enum(Enum),
     ComplexObject(ComplexObject),
+    /// `OptimizedMarshaller` (TypeCode 0xFE) opaque payload — JDK-serialized Java
+    /// object. The thin client cannot deserialize it, but Java's client exposes
+    /// the raw bytes; returning `Null` here silently drops data. See FND-039.
+    OpaqueMarshal(Vec<u8>),
 }
 
 pub trait SqlField: Sized {
@@ -972,14 +976,19 @@ pub(crate) fn read_sql_value_unwrapped(
                 .ok_or_else(|| IgniteError::from("Expected complex object value"))?,
         )),
         TypeCode::OptimizedMarshaller => {
-            // JDK-serialized Java object — opaque to the thin client.
+            // FND-039: JDK-serialized Java object — opaque to the thin client,
+            // but Java's client exposes the raw bytes. Previously we read and
+            // discarded them, silently dropping user data.
             // Format: length(4) + data(length).
             let len = read_i32(reader).map_err(IgniteError::from)?;
-            if len > 0 {
+            let buf = if len > 0 {
                 let mut buf = vec![0u8; len as usize];
                 reader.read_exact(&mut buf).map_err(IgniteError::from)?;
-            }
-            Ok(SqlValue::Null)
+                buf
+            } else {
+                Vec::new()
+            };
+            Ok(SqlValue::OpaqueMarshal(buf))
         }
         unsupported => Err(IgniteError::new(format!(
             "Unsupported SQL field type code: {:?}",
@@ -1097,6 +1106,37 @@ mod tests {
         // After decoding, a Null follows.
         let next = read_sql_value(&mut cur).unwrap();
         assert_eq!(next, SqlValue::Null);
+    }
+
+    /// FND-039: an `OptimizedMarshaller` (0xFE) payload in a SQL result must be
+    /// preserved as `SqlValue::OpaqueMarshal`, not silently dropped as `Null`.
+    #[test]
+    fn should_preserve_optimized_marshaller_payload() {
+        let payload: Vec<u8> = vec![0xAC, 0xED, 0x00, 0x05, 0xDE, 0xAD, 0xBE, 0xEF];
+        let mut bytes = Vec::new();
+        write_u8(&mut bytes, TypeCode::OptimizedMarshaller as u8).unwrap();
+        write_i32(&mut bytes, payload.len() as i32).unwrap();
+        bytes.extend_from_slice(&payload);
+        // Trailing sentinel — ensures the reader consumed exactly the right bytes.
+        write_u8(&mut bytes, TypeCode::Null as u8).unwrap();
+
+        let mut cur = Cursor::new(bytes);
+        let value = read_sql_value(&mut cur).unwrap();
+        assert_eq!(value, SqlValue::OpaqueMarshal(payload));
+        let next = read_sql_value(&mut cur).unwrap();
+        assert_eq!(next, SqlValue::Null);
+    }
+
+    /// FND-039: an empty `OptimizedMarshaller` payload (len=0) is still
+    /// preserved as an empty `OpaqueMarshal`.
+    #[test]
+    fn should_preserve_empty_optimized_marshaller_payload() {
+        let mut bytes = Vec::new();
+        write_u8(&mut bytes, TypeCode::OptimizedMarshaller as u8).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+
+        let value = read_sql_value(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(value, SqlValue::OpaqueMarshal(Vec::new()));
     }
 
     #[test]
