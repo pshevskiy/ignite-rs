@@ -38,11 +38,16 @@ async fn service_invoke_missing_service_parity() {
         .await;
     assert!(!r.ok, "missing service should fail");
     let msg = r.error.clone().unwrap_or_default();
+    // Common shapes observed: "java.lang.reflect.InvocationTargetException"
+    // (the proxy creation fails and reflection wraps it), "ClientException",
+    // "Service ... does not exist", etc. All are acceptable because all
+    // represent the server rejecting the undeployed-service invocation.
     assert!(
         msg.contains("service")
             || msg.contains("Service")
             || msg.contains("not found")
             || msg.contains("ClientException")
+            || msg.contains("InvocationTargetException")
             || msg.contains("deploy"),
         "unexpected error shape: {}",
         msg

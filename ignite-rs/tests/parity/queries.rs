@@ -29,7 +29,7 @@ async fn sql_scan_count_cross_client() {
     let sql_cache = format!("SQL_PUBLIC_{}", table);
 
     let _ = rs
-        .sql_fields::<i32>(
+        .sql_fields::<i64>(
             SqlFieldsQuery::new(format!("DROP TABLE IF EXISTS {}", table).as_str())
                 .with_schema("PUBLIC")
                 .with_page_size(32),
@@ -40,7 +40,7 @@ async fn sql_scan_count_cross_client() {
     // — Ignite resolves the target table via the schema).
     let _ = bootstrap_cache; // retain to keep the cache alive
     rs
-        .sql_fields::<i32>(
+        .sql_fields::<i64>(
             SqlFieldsQuery::new(
                 format!("CREATE TABLE {} (id INT PRIMARY KEY, v VARCHAR)", table).as_str(),
             )
@@ -52,7 +52,7 @@ async fn sql_scan_count_cross_client() {
 
     for i in 1..=3 {
         rs
-            .sql_fields::<i32>(
+            .sql_fields::<i64>(
                 SqlFieldsQuery::new(
                     format!("INSERT INTO {} (id, v) VALUES ({}, 'r{}')", table, i, i).as_str(),
                 )
@@ -84,7 +84,7 @@ async fn sql_scan_count_cross_client() {
 
     // Query via Rust, assert same count.
     let rs_rows = rs
-        .sql_fields::<i32>(
+        .sql_fields::<i64>(
             SqlFieldsQuery::new(format!("SELECT COUNT(*) FROM {}", table).as_str())
                 .with_schema("PUBLIC")
                 .with_page_size(32),
@@ -98,7 +98,7 @@ async fn sql_scan_count_cross_client() {
 
     // Cleanup.
     let _ = rs
-        .sql_fields::<i32>(
+        .sql_fields::<i64>(
             SqlFieldsQuery::new(format!("DROP TABLE {}", table).as_str())
                 .with_schema("PUBLIC")
                 .with_page_size(32),
