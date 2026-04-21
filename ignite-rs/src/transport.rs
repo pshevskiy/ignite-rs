@@ -560,13 +560,13 @@ fn resolve_response(
     }
 }
 
-fn classify_server_error(message: &str) -> IgniteError {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("auth") || lower.contains("credential") {
-        IgniteError::authentication(message)
-    } else {
-        IgniteError::server(message)
-    }
+/// Build an `IgniteError` from a server response `FLAG_ERROR` frame. The
+/// `status` i32 is read from the wire (Java `ClientStatus.java@2.17.0`) and
+/// drives the `ErrorKind` mapping per §11. We avoid substring heuristics so
+/// the caller can discriminate e.g. `SECURITY_VIOLATION (1012)` from
+/// `ENTRY_PROCESSOR_EXCEPTION (1040)` by `ErrorKind` alone. See FND-058.
+fn classify_server_error(status: i32, message: &str) -> IgniteError {
+    IgniteError::from_server_status(status, message)
 }
 
 fn aggregate_connect_errors(errors: Vec<IgniteError>) -> IgniteError {
@@ -883,7 +883,7 @@ impl ChannelManager {
             .await?;
         match flag {
             Success => Ok(()),
-            Failure { err_msg } => Err(classify_server_error(&err_msg)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
         }
     }
 
@@ -912,7 +912,7 @@ impl ChannelManager {
                 let mut cur = Cursor::new(&body[payload_offset..]);
                 Ok(T::read(&mut cur)?)
             }
-            Failure { err_msg } => Err(classify_server_error(&err_msg)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
         }
     }
 
@@ -932,7 +932,7 @@ impl ChannelManager {
                 let mut cur = Cursor::new(&body[payload_offset..]);
                 Ok((T::read(&mut cur)?, meta))
             }
-            Failure { err_msg } => Err(classify_server_error(&err_msg)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
         }
     }
 
@@ -953,7 +953,7 @@ impl ChannelManager {
         let frame = channel.request(corr_id, request).await?;
         match frame.flag {
             Success => Ok(()),
-            Failure { err_msg } => Err(classify_server_error(&err_msg)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
         }
     }
 
@@ -977,7 +977,7 @@ impl ChannelManager {
                 let mut cur = Cursor::new(&frame.body[frame.payload_offset..]);
                 T::read(&mut cur)
             }
-            Failure { err_msg } => Err(classify_server_error(&err_msg)),
+            Failure { status, err_msg } => Err(classify_server_error(status, &err_msg)),
         }
     }
 
@@ -1073,7 +1073,7 @@ impl ChannelManager {
                                 address,
                                 None,
                             ),
-                            Failure { err_msg } => self.event_bus.emit_request(
+                            Failure { err_msg, .. } => self.event_bus.emit_request(
                                 RequestEventKind::Failed,
                                 op_code,
                                 corr_id,
@@ -1213,7 +1213,7 @@ impl ChannelManager {
                             addr.clone(),
                             None,
                         ),
-                        Failure { err_msg } => self.event_bus.emit_request(
+                        Failure { err_msg, .. } => self.event_bus.emit_request(
                             RequestEventKind::Failed,
                             op_code,
                             corr_id,

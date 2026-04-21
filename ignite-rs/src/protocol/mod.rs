@@ -132,7 +132,12 @@ impl TryFrom<u8> for TypeCode {
 #[derive(Clone, Debug)]
 pub(crate) enum Flag {
     Success,
-    Failure { err_msg: String },
+    /// A non-zero server status code was set on the response. `status`
+    /// is the i32 code from `ClientStatus.java@2.17.0` (e.g. `1012` for
+    /// `SECURITY_VIOLATION`, `1040` for `ENTRY_PROCESSOR_EXCEPTION`).
+    /// `err_msg` is the attached message string. Callers classify the
+    /// error via `IgniteError::from_server_status(status, err_msg)`.
+    Failure { status: i32, err_msg: String },
 }
 
 fn read_object(reader: &mut impl Read) -> IgniteResult<Option<()>> {

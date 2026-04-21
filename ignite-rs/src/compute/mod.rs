@@ -188,7 +188,12 @@ impl<R: ReadableType> ComputeTask<R> {
             return Ok(());
         }
 
-        self.exec
+        // Java `ClientComputeImpl.cancel()` swallows `RESOURCE_DOES_NOT_EXIST
+        // (1011)` because the task can race to completion server-side after
+        // we observe cancelled state. See `ClientComputeImpl.java:414-420@2.17.0`.
+        const RESOURCE_DOES_NOT_EXIST: i32 = 1011;
+        match self
+            .exec
             .send_with_route(
                 OpCode::ResourceClose,
                 ResourceCloseRequest {
@@ -196,7 +201,12 @@ impl<R: ReadableType> ComputeTask<R> {
                 },
                 RequestRoute::pinned(self.address.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.server_status() == Some(RESOURCE_DOES_NOT_EXIST) => {}
+            Err(err) => return Err(err),
+        }
         self.exec
             .remove_notification_listener(
                 &self.address,
@@ -240,7 +250,7 @@ impl<R: ReadableType> ComputeTask<R> {
                 let mut cursor = Cursor::new(&frame.body[frame.payload_offset..]);
                 R::read(&mut cursor)
             }
-            Flag::Failure { err_msg } => Err(IgniteError::server(err_msg)),
+            Flag::Failure { status, err_msg } => Err(IgniteError::from_server_status(status, err_msg)),
         }
     }
 }

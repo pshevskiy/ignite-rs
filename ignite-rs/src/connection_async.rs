@@ -325,18 +325,18 @@ pub(crate) async fn read_incoming_frame(
         }
 
         if (flags & FLAG_ERROR) != 0 {
-            let _status = read_i32(&mut rdr)?;
+            let status = read_i32(&mut rdr)?;
             let err_msg = read_response_error_string(&mut rdr).map_err(IgniteError::from)?;
-            Failure { err_msg }
+            Failure { status, err_msg }
         } else {
             Success
         }
     } else {
         match read_i32(&mut rdr)? {
             0 => Success,
-            _ => {
+            status => {
                 let err_msg = read_response_error_string(&mut rdr).map_err(IgniteError::from)?;
-                Failure { err_msg }
+                Failure { status, err_msg }
             }
         }
     };
