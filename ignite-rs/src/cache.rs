@@ -795,6 +795,14 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
     async fn index_query_impl(&self, query: IndexQuery) -> IgniteResult<EntryCursor<K, V>> {
         self.ensure_tx_cache_ops_allowed().await?;
         let capabilities = self.exec.index_query_capabilities().await;
+        // FND gate: Java `TcpClientCache.indexQuery` throws
+        // `ClientFeatureNotSupportedByServerException` when `INDEX_QUERY`
+        // (bit 14) is not negotiated (`TcpClientCache.java:1244-1245@2.17.0`).
+        if !capabilities.index_query {
+            return Err(IgniteError::from(
+                "QUERY_INDEX is not supported by the server",
+            ));
+        }
         // FND-034: Java throws `ClientFeatureNotSupportedByServerException` rather
         // than emit `limit` without the bit.
         if !capabilities.index_query_limit && query.limit().is_some_and(|v| v > 0) {

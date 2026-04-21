@@ -444,6 +444,10 @@ impl Channel {
         self.metadata.capabilities.cache_invoke
     }
 
+    fn supports_index_query(&self) -> bool {
+        self.metadata.capabilities.index_query
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -878,6 +882,9 @@ pub(crate) struct SqlFieldsCapabilities {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IndexQueryCapabilities {
+    /// Server advertises `INDEX_QUERY` (bit 14). Required to send
+    /// `QUERY_INDEX` at all (`TcpClientCache.java:1244-1245@2.17.0`).
+    pub(crate) index_query: bool,
     /// Server advertises `INDEX_QUERY_LIMIT` (bit 15). When false, the writer
     /// must omit the `limit` field — Java `TcpClientCache.indexQuery` gates on
     /// this bit and throws rather than emit it.
@@ -2000,6 +2007,7 @@ impl ChannelManager {
     pub(crate) async fn index_query_capabilities(&self) -> IndexQueryCapabilities {
         let channel = self.default_channel().await;
         IndexQueryCapabilities {
+            index_query: channel.supports_index_query(),
             index_query_limit: channel.supports_index_query_limit(),
         }
     }

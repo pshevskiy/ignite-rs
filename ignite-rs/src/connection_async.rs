@@ -92,6 +92,11 @@ pub(crate) struct ConnectionCapabilities {
     /// `ClientFeatureNotSupportedByServerException` if absent
     /// (`TcpClientCache.java:964-965@2.17.0`).
     pub(crate) cache_invoke: bool,
+    /// Java `ProtocolBitmaskFeature.INDEX_QUERY` (bit 14). Required to send
+    /// `QUERY_INDEX` (`TcpClientCache.java:1244-1245@2.17.0`). Separate from
+    /// INDEX_QUERY_LIMIT (bit 15), which controls whether the trailing
+    /// `limit` field is emitted.
+    pub(crate) index_query: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -471,6 +476,7 @@ where
                     FEATURE_FORCE_DEACTIVATION_FLAG,
                 ),
                 cache_invoke: feature_supported(&features, FEATURE_CACHE_INVOKE),
+                index_query: feature_supported(&features, FEATURE_INDEX_QUERY),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

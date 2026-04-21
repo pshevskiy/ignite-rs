@@ -357,12 +357,14 @@ mod tests {
 
     fn caps_with_limit() -> IndexQueryCapabilities {
         IndexQueryCapabilities {
+            index_query: true,
             index_query_limit: true,
         }
     }
 
     fn caps_no_limit() -> IndexQueryCapabilities {
         IndexQueryCapabilities {
+            index_query: true,
             index_query_limit: false,
         }
     }
