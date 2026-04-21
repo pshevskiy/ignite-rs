@@ -74,6 +74,63 @@ async fn should_execute_compute_task_and_wait_for_notification_result() {
     assert_eq!(decoded.arg, Some(1));
 }
 
+/// FND-041 — the compute-task flags byte must never set bit 0x04. Java
+/// `ClientComputeImpl` only defines `NO_FAILOVER_FLAG_MASK = 0x01` and
+/// `NO_RESULT_CACHE_FLAG_MASK = 0x02`. Bit 0x04 is a server-only marker
+/// (`ClientComputeTask.KEEP_BINARY_FLAG_MASK`) — if the Rust thin client
+/// sets it the wire form diverges from Java byte-for-byte (I8).
+#[tokio::test]
+async fn compute_task_execute_flags_exclude_bit_0x04() {
+    let node = MockUuid::new(9003, 3);
+    let task_id = 99i64;
+    let server = spawn_mock_thin_server(MockThinServerConfig {
+        opcode_responses: Some(opcode_responses(vec![
+            (
+                OP_CLUSTER_GROUP_GET_NODE_IDS,
+                vec![MockResponse::success(encode_node_ids_response(node))],
+            ),
+            (
+                OP_CLUSTER_GROUP_GET_NODE_INFO,
+                vec![MockResponse::success(encode_node_info_payload(&[
+                    MockNodeInfo::simple(node),
+                ]))],
+            ),
+            (
+                OP_COMPUTE_TASK_EXECUTE,
+                vec![MockResponse::success_with_notifications(
+                    task_id.to_le_bytes().to_vec(),
+                    vec![MockNotification::success(
+                        OP_COMPUTE_TASK_FINISHED,
+                        task_id,
+                        encode_typed_payload(&0i32),
+                    )],
+                )],
+            ),
+        ])),
+        ..Default::default()
+    });
+
+    let client = new_client(ClientConfig::new(server.addr())).await.unwrap();
+    let _ = client
+        .compute()
+        .with_no_failover()
+        .with_no_result_cache()
+        .execute::<i32, i32>("TestTask", Some(&1))
+        .await
+        .unwrap();
+
+    let payloads = server.recorded_opcode_payloads(OP_COMPUTE_TASK_EXECUTE);
+    assert_eq!(payloads.len(), 1);
+    let decoded = decode_compute_execute_payload(&payloads[0]);
+    assert_eq!(
+        decoded.flags & 0x04,
+        0,
+        "bit 0x04 (KEEP_BINARY) must never be set on COMPUTE_TASK_EXECUTE — Java \
+         thin client only defines bits 0x01 and 0x02"
+    );
+    assert_eq!(decoded.flags, 0x03);
+}
+
 /// Migrated from Apache Ignite `ComputeTaskTest.testExecuteTaskAsync2` cancellation path:
 /// Java source: org.apache.ignite.internal.client.thin.ComputeTaskTest
 #[tokio::test]
@@ -169,7 +226,10 @@ fn decode_compute_execute_payload(payload: &[u8]) -> DecodedComputeRequest {
     }
     let flags = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
     let timeout_ms = ignite_rs::protocol::read_i64(&mut cursor).unwrap();
-    let task_name = ignite_rs::protocol::read_string(&mut cursor).unwrap();
+    // Compute request writes `task_name` as a typed string (TypeCode::String
+    // prefix + length + UTF-8 bytes) per FND-042 / REG-2. Use `String::read`
+    // which consumes the leading type code.
+    let task_name = String::read(&mut cursor).unwrap().unwrap();
     let arg = i32::read(&mut cursor).unwrap();
 
     DecodedComputeRequest {

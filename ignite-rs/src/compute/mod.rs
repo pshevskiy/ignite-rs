@@ -14,13 +14,13 @@ use tokio::sync::{mpsc, Mutex};
 
 pub mod bulk_put;
 
+// Java `ClientComputeImpl` only defines these two flags (2.17.0). Bit 0x04
+// exists on the server as `ClientComputeTask.KEEP_BINARY_FLAG_MASK` but the
+// Java thin client never sets it — keep-binary behaviour is achieved by
+// wrapping the argument in a `BINARY_OBJ` (WrappedData) envelope instead
+// (see `bulk_put.rs::encode_wrapped_binary_object`).
 const FLAG_NO_FAILOVER: u8 = 0x01;
 const FLAG_NO_RESULT_CACHE: u8 = 0x02;
-/// Keep the compute task argument as a `BinaryObject` on the server — skips
-/// the `arg.deserialize()` call in `ClientExecuteTaskRequest.process()`, which
-/// would otherwise require the server to have the POJO class on its classpath.
-/// Matches Java's `ClientComputeTask.KEEP_BINARY_FLAG_MASK`.
-const FLAG_KEEP_BINARY: u8 = 0x04;
 
 #[derive(Clone)]
 pub struct Compute {
@@ -121,20 +121,6 @@ impl Compute {
             exec: self.exec.clone(),
             cluster_group: self.cluster_group.clone(),
             flags: self.flags | FLAG_NO_RESULT_CACHE,
-            timeout_ms: self.timeout_ms,
-        }
-    }
-
-    /// Keep the compute-task argument as a `BinaryObject` on the server (does
-    /// not deserialize into a POJO). Required when the POJO class is not
-    /// available on the server's classpath — the task implementation must use
-    /// `BinaryObject` accessors (e.g. `param.getObject()` returns a
-    /// `BinaryObject`) regardless of this flag.
-    pub fn with_keep_binary(&self) -> Self {
-        Self {
-            exec: self.exec.clone(),
-            cluster_group: self.cluster_group.clone(),
-            flags: self.flags | FLAG_KEEP_BINARY,
             timeout_ms: self.timeout_ms,
         }
     }
