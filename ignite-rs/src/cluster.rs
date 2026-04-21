@@ -119,6 +119,14 @@ impl Cluster {
         state: ClusterState,
         force_deactivation: bool,
     ) -> IgniteResult<()> {
+        // FND gate: Java `ClientClusterImpl.state` rejects any state with
+        // ordinal > 1 (i.e. `ACTIVE_READ_ONLY`) when `CLUSTER_STATES` (bit 2)
+        // is not negotiated (`ClientClusterImpl.java:78-81@2.17.0`).
+        if (state as u8) > 1 && !self.core.exec.supports_cluster_states().await {
+            return Err(IgniteError::from(
+                "Cluster state is not supported by the server",
+            ));
+        }
         let supports_force_deactivation_flag = self.core.exec.supports_force_deactivation_flag().await;
         // Java 2.17.0 rejects `forceDeactivation=false` when the bit is absent
         // (`ClientClusterImpl.java:87-91`). Preserve the same semantics so

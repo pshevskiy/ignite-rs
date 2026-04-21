@@ -158,6 +158,10 @@ impl TokioExec {
         self.transport.supports_cluster_groups().await
     }
 
+    pub(crate) async fn supports_cluster_states(&self) -> bool {
+        self.transport.supports_cluster_states().await
+    }
+
     pub(crate) fn register_cache_listener_name(
         &self,
         cache_id: i32,

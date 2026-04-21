@@ -107,6 +107,12 @@ pub(crate) struct ConnectionCapabilities {
     /// throws `ClientFeatureNotSupportedByServerException` when absent
     /// (`ClientClusterGroupImpl.java:306-307, 384-385@2.17.0`).
     pub(crate) cluster_groups: bool,
+    /// Java `ProtocolBitmaskFeature.CLUSTER_STATES` (bit 2). Required to pass
+    /// any `ClusterState` beyond ACTIVE/INACTIVE (ordinal > 1, e.g.
+    /// `ACTIVE_READ_ONLY`) to `CLUSTER_CHANGE_STATE`. Java throws
+    /// `ClientFeatureNotSupportedByServerException` when absent
+    /// (`ClientClusterImpl.java:78-81@2.17.0`).
+    pub(crate) cluster_states: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -492,6 +498,7 @@ where
                     FEATURE_EXECUTE_TASK_BY_NAME,
                 ),
                 cluster_groups: feature_supported(&features, FEATURE_CLUSTER_GROUPS),
+                cluster_states: feature_supported(&features, FEATURE_CLUSTER_STATES),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

@@ -456,6 +456,10 @@ impl Channel {
         self.metadata.capabilities.cluster_groups
     }
 
+    fn supports_cluster_states(&self) -> bool {
+        self.metadata.capabilities.cluster_states
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2064,6 +2068,13 @@ impl ChannelManager {
     /// 384@2.17.0`).
     pub(crate) async fn supports_cluster_groups(&self) -> bool {
         self.default_channel().await.supports_cluster_groups()
+    }
+
+    /// True if the default channel negotiated `CLUSTER_STATES` (bit 2).
+    /// Gates `CLUSTER_CHANGE_STATE` requests whose state ordinal > 1
+    /// (`ClientClusterImpl.java:78-81@2.17.0`).
+    pub(crate) async fn supports_cluster_states(&self) -> bool {
+        self.default_channel().await.supports_cluster_states()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {
