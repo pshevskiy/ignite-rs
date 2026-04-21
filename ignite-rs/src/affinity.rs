@@ -457,11 +457,16 @@ fn rendezvous_partition(key_hash: i32, partition_count: i32) -> i32 {
     if mask >= 0 {
         (key_hash ^ ((key_hash as u32 >> 16) as i32)) & mask
     } else {
-        let part = (key_hash % partition_count).abs();
-        if part > 0 {
-            part
-        } else {
+        // Java's `U.safeAbs`: `i = Math.abs(i); return i < 0 ? 0 : i;`
+        // `Math.abs(Integer.MIN_VALUE)` returns `Integer.MIN_VALUE` (still
+        // negative) — then safeAbs folds it to 0. Rust `i32::abs()` panics on
+        // `i32::MIN` in debug builds, so use `wrapping_abs()` to mirror Java's
+        // two-complement result, then fold the remaining negative case to 0.
+        let abs = (key_hash % partition_count).wrapping_abs();
+        if abs < 0 {
             0
+        } else {
+            abs
         }
     }
 }
@@ -751,6 +756,25 @@ mod tests {
     fn should_compute_rendezvous_partition() {
         assert_eq!(rendezvous_partition(42, 16), (42 ^ (42 >> 16)) & 15);
         assert_eq!(rendezvous_partition(-5, 10), 5);
+    }
+
+    /// FND-055 — non-power-of-2 partition counts use Java's
+    /// `U.safeAbs(hash % parts)`: `Math.abs` is computed, and any residual
+    /// negative result (only possible when the modulo yields `Integer.MIN_VALUE`)
+    /// is folded to 0. Rust must not panic for any i32 key hash.
+    #[test]
+    fn rendezvous_partition_matches_java_safe_abs_on_edge_cases() {
+        // Non-pow2 path: safeAbs(-5 % 3) = 2
+        assert_eq!(rendezvous_partition(-5, 3), 2);
+        // i32::MIN % 3 = -2 → abs = 2
+        assert_eq!(rendezvous_partition(i32::MIN, 3), 2);
+        // i32::MIN % 1 = 0 → 0
+        assert_eq!(rendezvous_partition(i32::MIN, 1), 0);
+        // Never panics on any i32 key hash for prime parts
+        for parts in [3i32, 5, 7, 11, 13, 17, 500, 999] {
+            let _ = rendezvous_partition(i32::MIN, parts);
+            let _ = rendezvous_partition(i32::MAX, parts);
+        }
     }
 
     #[test]
