@@ -1740,15 +1740,20 @@ impl ChannelManager {
             }
         };
 
-        let dc_aware = self
-            .channel_for_address(&meta.address)
-            .await
+        let response_channel = self.channel_for_address(&meta.address).await;
+        let dc_aware = response_channel
+            .as_ref()
             .map(|channel| channel.supports_dc_aware())
             .unwrap_or(false);
+        let response_all_affinity_mappings = response_channel
+            .as_ref()
+            .map(|channel| channel.supports_all_affinity_mappings())
+            .unwrap_or(all_affinity_mappings);
 
-        let response = match CachePartitionsResponse::read_with_dc_aware(
+        let response = match CachePartitionsResponse::read_with_flags(
             &mut Cursor::new(&raw.body),
             dc_aware,
+            response_all_affinity_mappings,
         ) {
             Ok(response) => response,
             Err(err) => {

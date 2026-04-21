@@ -265,6 +265,35 @@ pub(crate) struct CachePartitionsResponse {
 
 impl CachePartitionsResponse {
     pub(crate) fn read_with_dc_aware(reader: &mut impl Read, dc_aware: bool) -> IgniteResult<Self> {
+        Self::read_with_flags(reader, dc_aware, false)
+    }
+
+    /// Decode a `CACHE_PARTITIONS` response, mirroring Java 2.17.0's
+    /// `ClientCacheAffinityMapping.readResponse`:
+    ///
+    /// ```text
+    /// i64 topVerMajor, i32 topVerMinor
+    /// i32 mappingCount
+    /// mappingCount × (
+    ///   bool applicable, i32 cachesInGroup,
+    ///   [if applicable]:
+    ///     cachesInGroup × (i32 cacheId, i32 keyCfgCount, keyCfgCount × (i32, i32))
+    ///     nodeCount + partition map                                // primary
+    ///     [if DC_AWARE (gridgain bit 22)]: nodeCount + partition map // dc
+    ///     [if ALL_AFFINITY_MAPPINGS (bit 13)]: bool defaultAffinity
+    ///   [else]: cachesInGroup × i32 cacheId
+    /// )
+    /// ```
+    ///
+    /// The `bool defaultAffinity` after the partition maps tells the client
+    /// whether to use Rendezvous or a user-supplied
+    /// `ClientPartitionAwarenessMapperFactory`. Rust only supports Rendezvous,
+    /// so the value is read and dropped.
+    pub(crate) fn read_with_flags(
+        reader: &mut impl Read,
+        dc_aware: bool,
+        all_affinity_mappings: bool,
+    ) -> IgniteResult<Self> {
         let topology_version = TopologyVersion::new(read_i64(reader)?, read_i32(reader)?);
         let mappings_count = read_i32(reader)?;
         if mappings_count < 0 {
@@ -316,6 +345,12 @@ impl CachePartitionsResponse {
                 } else {
                     primary_partition_to_node.clone()
                 };
+
+                if all_affinity_mappings {
+                    // `defaultAffinity` — Rust only supports Rendezvous, so the
+                    // flag is read and discarded (Java §9.1, FND-054).
+                    let _default_affinity = read_bool(reader)?;
+                }
 
                 for cache_id in cache_ids {
                     caches.insert(
@@ -598,6 +633,74 @@ mod tests {
 
         assert_eq!(buf, expected);
         assert_eq!(req.size(), buf.len());
+    }
+
+    /// FND-054 — When ALL_AFFINITY_MAPPINGS is negotiated, Java's
+    /// `ClientCacheAffinityMapping.readResponse@2.17.0:231-232` reads a
+    /// trailing `bool defaultAffinity` after the partition map. Rust was
+    /// never consuming this byte, so subsequent mapping groups over-read
+    /// into the next applicable-bool. This test pins the trailing-bool
+    /// semantics.
+    #[test]
+    fn should_decode_cache_partitions_response_with_default_affinity_bool() {
+        let node_a = (1i64, 2i64);
+        let mut bytes = Vec::new();
+        // topology version
+        write_i64(&mut bytes, 5).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+        // mapping count = 1
+        write_i32(&mut bytes, 1).unwrap();
+        // applicable = true
+        write_bool(&mut bytes, true).unwrap();
+        // cachesInGroup = 1
+        write_i32(&mut bytes, 1).unwrap();
+        // cacheId=42, keyCfgCount=0
+        write_i32(&mut bytes, 42).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+        // primary partition map — 1 node, 1 partition (part 0 → node_a)
+        write_i32(&mut bytes, 1).unwrap();
+        write_i64(&mut bytes, node_a.0).unwrap();
+        write_i64(&mut bytes, node_a.1).unwrap();
+        write_i32(&mut bytes, 1).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+        // ALL_AFFINITY_MAPPINGS trailing: defaultAffinity = true
+        write_bool(&mut bytes, true).unwrap();
+
+        let mut cursor = Cursor::new(bytes);
+        let response =
+            CachePartitionsResponse::read_with_flags(&mut cursor, false, true).unwrap();
+
+        let cache = response.caches.get(&42).unwrap();
+        assert_eq!(cache.primary_partition_to_node.len(), 1);
+        // Cursor must be fully consumed — no leftover bytes.
+        assert_eq!(cursor.position() as usize, cursor.get_ref().len());
+    }
+
+    /// Without ALL_AFFINITY_MAPPINGS, no trailing bool is expected.
+    #[test]
+    fn should_decode_cache_partitions_response_without_default_affinity_bool() {
+        let node_a = (1i64, 2i64);
+        let mut bytes = Vec::new();
+        write_i64(&mut bytes, 5).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+        write_i32(&mut bytes, 1).unwrap();
+        write_bool(&mut bytes, true).unwrap();
+        write_i32(&mut bytes, 1).unwrap();
+        write_i32(&mut bytes, 42).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+        write_i32(&mut bytes, 1).unwrap();
+        write_i64(&mut bytes, node_a.0).unwrap();
+        write_i64(&mut bytes, node_a.1).unwrap();
+        write_i32(&mut bytes, 1).unwrap();
+        write_i32(&mut bytes, 0).unwrap();
+
+        let mut cursor = Cursor::new(bytes);
+        let response =
+            CachePartitionsResponse::read_with_flags(&mut cursor, false, false).unwrap();
+
+        let cache = response.caches.get(&42).unwrap();
+        assert_eq!(cache.primary_partition_to_node.len(), 1);
+        assert_eq!(cursor.position() as usize, cursor.get_ref().len());
     }
 
     /// Gridgain-downstream DC_AWARE extension (bit 22, not in Java 2.17.0):
