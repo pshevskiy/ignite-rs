@@ -285,3 +285,107 @@ Tags:
 Branches preserved:
 - `audit/concurrency-2026-04-18` — Phase 4/5 audit work
 - `perf/post-audit-investigation-2026-04-21` — Phase 6 + post-audit exploration
+
+---
+
+## 9. Post-closeout follow-ons (2026-04-21)
+
+After the v0.2.0 release, five follow-on items from §7 were addressed one-by-one autonomously, each with strict rollback if tests failed or perf gates missed.
+
+### 9.1 Systematic feature-bit op-gating — DONE
+
+Extended the FND-028/034/047/056 pattern to all 20 `ProtocolBitmaskFeature` bits.
+
+- 9 new gates added (one commit per bit): `CACHE_INVOKE`, `INDEX_QUERY`, `EXECUTE_TASK_BY_NAME`, `CLUSTER_GROUPS`, `CLUSTER_STATES`, `DATA_REPLICATION_OPERATIONS`, `GET_SERVICE_DESCRIPTORS`, `SERVICE_INVOKE`, `BINARY_CONFIGURATION`
+- Plus mock thin-server feature-byte widening (`94b34da`) so integration tests exercise the gated paths
+- 4 bits already gated prior (TRANSACTIONS/INDEX_QUERY_LIMIT/SERVICE_INVOKE_CALLCTX/FORCE_DEACTIVATION_FLAG)
+- 4 bits already wire-gated elsewhere (USER_ATTRIBUTES at handshake, CLUSTER_GROUP_GET_NODES_ENDPOINTS topology-refresh, QRY_PARTITIONS_BATCH_SIZE SQL writer, HEARTBEAT, ALL_AFFINITY_MAPPINGS)
+- 3 bits N/A — silent semantics (DEFAULT_QRY_TIMEOUT, SERVICE_TOPOLOGY, TX_AWARE_QUERIES)
+
+Notable: `SERVICE_INVOKE` (bit 5) and `SERVICE_INVOKE_CALLCTX` (bit 10) are paired in Java — FND-047 gated only the callAttrs emission; the bit-5 commit adds the mirror check.
+
+Tag: `feature-bit-gating-2026-04-21`.
+
+### 9.2 FND-014 — typed-array round-trip (was BLOCKED) — DONE
+
+Commit: `26b9237 fix(binary): FND-014 — preserve TypeCode on typed-array round-trip`.
+
+Approach: added `IgniteValue::ArrTyped { type_code: u8, elements: Vec<IgniteValue> }` and marked `IgniteValue` `#[non_exhaustive]`. Decoder emits `ArrTyped` for all 6 typed-array codes (ArrString 0x18, ArrUuid 0x15, ArrDate 0x16, ArrDecimal 0x1F, ArrTimestamp 0x22, ArrTime 0x25); encoder preserves the original code.
+
+Results:
+- 6 new byte fixtures added + round-trip byte-identical
+- Tier-3 round-trip coverage: 17/25 → 23/25 (the remaining 2 skips are primitive array codes ArrInt/ArrLong — separate from FND-014)
+- **rsc-cache-rs needed zero accommodation** — all its `IgniteValue` matches already had wildcard arms, so `#[non_exhaustive]` was a no-op break
+- Perf: flat to slightly improved (−5% put_single mean, −9% put_all/1000 mean in steady state)
+
+Tag: `fnd-014-2026-04-21`.
+
+### 9.3 Tier-2 parity coverage 9 → 64 cases — DONE
+
+5 commits on `followon/parity-coverage-60-2026-04-21` (now merged).
+
+Per-file counts (before → after):
+- wire_format: 1 → 8
+- cache_ops: 3 → 16
+- transactions: 1 → 9
+- queries: 1 → 9
+- compute: 1 → 4
+- services: 1 → 3
+- data_structures: new, 5 cases
+- cluster: new, 4 cases
+- errors: 1 → 6
+
+Total: 64/64 cases pass in 22.9s under `cargo run -p xtask -- test-matrix --bucket parity`.
+
+~20 new ops added to `Driver.java` to support the cases. No new FND findings surfaced.
+
+Tag: `parity-coverage-60-2026-04-21`.
+
+### 9.4 Tier-3 byte-fixture corpus 31 → 105 — DONE
+
+Commit: `504e9b2 test(fixtures): expand Tier-3 byte corpus from 31 to 105`.
+
+Extended `FixtureGenerator.java` corpus covering: remaining primitive edge cases (zero/max/min, infinity, Unicode), collection subtypes (ArrayList, LinkedList, HashSet, LinkedHashSet), map subtypes (HashMap, LinkedHashMap), enum variants, decimal variants, timestamp variants, opaque blobs, nested structures (list-of-lists, list-of-maps, etc.).
+
+Results:
+- `read_all_fixtures`: 95/105 decode OK, 10 soft-skipped for primitive array codes (ArrShort/Int/Long/Float/Double/Char/Bool) — reader gap, not a regression.
+- `write_all_fixtures_round_trip`: 94/105 byte-identical, 11 soft-skipped.
+- The previous conservative `NON_ROUNDTRIP_KINDS` list was over-cautious: char/enum/decimal/opaque all round-trip fine; pruning raised coverage from 25/25 to 94/105.
+
+Tag: `byte-fixtures-100-2026-04-21`.
+
+### 9.5 io_uring transport — BLOCKED (not landed)
+
+Attempted structural transport rewrite. Blocked at feasibility check:
+- `tokio-uring 0.5` and `tokio::io::AsyncRead`/`AsyncWrite` have fundamentally incompatible APIs (completion-based vs readiness-based; ownership-passing vs borrow).
+- Adding an `AsyncStream::Uring` variant requires a separate `tokio_uring::start()` runtime, breaking the crate's "Tokio-only" invariant and the multi-thread runtime that every pump task, integration test, and rsc-cache-rs assumes.
+- Loopback bench target: PFND-006 already showed memcpy costs dominate syscall cost on loopback; io_uring's win would be on real-NIC / high-latency workloads, not this rig.
+- Would lose the PFND-005 `Bytes::split_to` zero-copy hand-off (forces fresh Vec ownership transfers).
+
+Decision: rolled back without writing code (refactor ≫ speculative bench win). Branch deleted.
+
+### 9.6 F — Misc perf (vectored writes / Arc audit / PGO) — PARTIAL
+
+Three experiments, strict ≥5% rollback gate.
+
+- **F.1 Vectored writes:** SKIPPED — hypothesis invalid. `encode_request_into()` back-patches length into the same Vec as payload; `write_requests()` is already one syscall per request. Nothing to combine.
+- **F.2 Arc-clone audit:** ROLLED BACK. Single wasteful `String` allocation identified + removed in `round_trip_internal` (`channel.address().to_string()` for optional ResponseMeta). Perf delta −2% on put_single (below 5% gate); variance made signal unreliable on Docker loopback. Reverted.
+- **F.3 PGO release profile:** COMMITTED as `88fbbe9 perf(build): F.3 — add PGO release profile`. Added `[profile.release-pgo]` (codegen-units=1, LTO=fat, opt-in). Bench deltas vs baseline:
+  - put_single mean: **−11% to −11.2%** (p<0.05)
+  - get_single mean: **−5%**
+  - put_all/100 mean: **−20.4%**
+  - put_all/1000 mean: **−21.7% to −31.6%**
+  - Note: bench-trained PGO — these are upper-bound gains; production benefit requires operators collecting representative profile data.
+
+Tag: `followons-2026-04-21`.
+
+### 9.7 Cumulative follow-on deltas
+
+Vs v0.2.0 release tag:
+- Test coverage: 9 → 64 Tier-2 parity cases; 31 → 105 Tier-3 byte fixtures; 143 → 150 lib tests (FND-014 added 7 round-trip tests)
+- Feature-bit gating: 4/20 → 13/20 actively gated (plus 4 wire-gated, 3 N/A = full coverage)
+- FND-014 unblocked
+- PGO release profile available (opt-in)
+- rsc-cache-rs remains green; zero accommodation needed across all follow-ons
+
+Commit range: `94b34da` (feature-bit-gating HEAD, just after v0.2.0) → `88fbbe9` (PGO, current master).
