@@ -146,10 +146,12 @@ impl AsyncConnection {
 
         let tcp = with_timeout_io(conf.handshake_timeout, TcpStream::connect(address)).await?;
 
-        if let Some(nodelay) = conf.tcp_nodelay {
-            tcp.set_nodelay(nodelay)
-                .map_err(|err| IgniteError::connection(err.to_string()))?;
-        }
+        // Default to TCP_NODELAY=true (disable Nagle). Small thin-client requests
+        // are latency-sensitive; Nagle coalescing can add up to 40ms per op.
+        // Matches Java thin client default. `Some(false)` opts out explicitly.
+        let nodelay = conf.tcp_nodelay.unwrap_or(true);
+        tcp.set_nodelay(nodelay)
+            .map_err(|err| IgniteError::connection(err.to_string()))?;
         if let Some(ttl) = conf.tcp_ttl {
             tcp.set_ttl(ttl)
                 .map_err(|err| IgniteError::connection(err.to_string()))?;
