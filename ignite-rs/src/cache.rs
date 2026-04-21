@@ -794,6 +794,14 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
 
     async fn index_query_impl(&self, query: IndexQuery) -> IgniteResult<EntryCursor<K, V>> {
         self.ensure_tx_cache_ops_allowed().await?;
+        let capabilities = self.exec.index_query_capabilities().await;
+        // FND-034: Java throws `ClientFeatureNotSupportedByServerException` rather
+        // than emit `limit` without the bit.
+        if !capabilities.index_query_limit && query.limit().is_some_and(|v| v > 0) {
+            return Err(IgniteError::from(
+                "IndexQuery.limit > 0 requires server feature INDEX_QUERY_LIMIT",
+            ));
+        }
         let route = match query.partition() {
             Some(partition) => self.route_for_partition(partition, false).await?,
             None => self.tx_route().await?,
@@ -806,6 +814,7 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
                         IndexQueryRequest {
                             cache_info: self.cache_info(true)?,
                             query: &query,
+                            capabilities,
                         },
                         route.unwrap_or_default(),
                     )

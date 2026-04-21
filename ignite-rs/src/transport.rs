@@ -274,6 +274,10 @@ impl Channel {
         self.metadata.capabilities.query_initiator_id
     }
 
+    fn supports_index_query_limit(&self) -> bool {
+        self.metadata.capabilities.index_query_limit
+    }
+
     fn supports_transactions(&self) -> bool {
         self.metadata.capabilities.transactions
     }
@@ -649,6 +653,14 @@ pub(crate) struct ResponseMeta {
 pub(crate) struct SqlFieldsCapabilities {
     pub(crate) partitions_batch_size: bool,
     pub(crate) query_initiator_id: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct IndexQueryCapabilities {
+    /// Server advertises `INDEX_QUERY_LIMIT` (bit 15). When false, the writer
+    /// must omit the `limit` field — Java `TcpClientCache.indexQuery` gates on
+    /// this bit and throws rather than emit it.
+    pub(crate) index_query_limit: bool,
 }
 
 impl ChannelManager {
@@ -1588,6 +1600,13 @@ impl ChannelManager {
         SqlFieldsCapabilities {
             partitions_batch_size: channel.supports_query_partitions_batch_size(),
             query_initiator_id: channel.supports_query_initiator_id(),
+        }
+    }
+
+    pub(crate) async fn index_query_capabilities(&self) -> IndexQueryCapabilities {
+        let channel = self.default_channel().await;
+        IndexQueryCapabilities {
+            index_query_limit: channel.supports_index_query_limit(),
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::api::key_value::{cache_info_size, write_cache_info, CacheInfo};
 use crate::protocol::complex_obj::IgniteValue;
 use crate::protocol::{write_bool, write_i32, write_null, write_string_type_code};
+use crate::transport::IndexQueryCapabilities;
 use crate::{WritableType, WriteableReq};
 use std::io::{self, Write};
 
@@ -244,11 +245,16 @@ impl IndexQuery {
     pub fn local(&self) -> bool {
         self.local
     }
+
+    pub fn limit(&self) -> Option<i32> {
+        self.limit
+    }
 }
 
 pub(crate) struct IndexQueryRequest<'a> {
     pub(crate) cache_info: CacheInfo,
     pub(crate) query: &'a IndexQuery,
+    pub(crate) capabilities: IndexQueryCapabilities,
 }
 
 impl<'a> WriteableReq for IndexQueryRequest<'a> {
@@ -258,8 +264,13 @@ impl<'a> WriteableReq for IndexQueryRequest<'a> {
         write_bool(writer, self.query.local)?;
         write_i32(writer, self.query.partition.unwrap_or(-1))?;
 
-        // limit (optional, written unconditionally for simplicity — server ignores if unsupported)
-        write_i32(writer, self.query.limit.unwrap_or(0))?;
+        // FND-034: Java gates `limit` on the INDEX_QUERY_LIMIT bit. Against a
+        // server that doesn't advertise the bit, including the 4-byte limit
+        // misaligns every subsequent field. Java throws rather than emit it
+        // (`TcpClientCache.indexQuery:1308-1313`).
+        if self.capabilities.index_query_limit {
+            write_i32(writer, self.query.limit.unwrap_or(0))?;
+        }
 
         // FND-033: Java writes `valueType` via `BinaryWriterExImpl.writeString`,
         // which emits `[STRING_CODE=9, i32 len, bytes]`. The server decodes the
@@ -296,7 +307,12 @@ impl<'a> WriteableReq for IndexQueryRequest<'a> {
         let page_size_sz = 4; // page_size
         let local_sz = 1; // local
         let partition_sz = 4; // partition
-        let limit_sz = 4; // limit
+        // FND-034: limit byte budget matches the gated write above.
+        let limit_sz = if self.capabilities.index_query_limit {
+            4
+        } else {
+            0
+        };
 
         // Typed string: 1-byte type code + i32 length + bytes.
         let value_type_sz = 1 + 4 + self.query.value_type.len();
@@ -339,6 +355,18 @@ mod tests {
     /// Java `GridBinaryMarshaller.ARR_LIST` collection sub-id.
     const ARR_LIST: u8 = 1;
 
+    fn caps_with_limit() -> IndexQueryCapabilities {
+        IndexQueryCapabilities {
+            index_query_limit: true,
+        }
+    }
+
+    fn caps_no_limit() -> IndexQueryCapabilities {
+        IndexQueryCapabilities {
+            index_query_limit: false,
+        }
+    }
+
     /// FND-033: Java `w.writeString(valueType)` emits `[STRING_CODE, i32 len, bytes]`.
     #[test]
     fn value_type_is_typed_string() {
@@ -346,6 +374,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
@@ -365,6 +394,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
@@ -386,6 +416,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
@@ -406,6 +437,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
@@ -431,6 +463,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
@@ -447,12 +480,71 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
 
         let offset = 18 + 1 + 4 + "Person".len();
         assert_eq!(buf[offset], TYPE_CODE_NULL);
+    }
+
+    /// FND-034: when INDEX_QUERY_LIMIT is NOT negotiated, the `limit` field is
+    /// omitted entirely — otherwise the server reads 4 bytes of `limit` as the
+    /// leading byte of `valueType`.
+    #[test]
+    fn limit_is_omitted_when_feature_bit_not_negotiated() {
+        let query = IndexQuery::new("Person");
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+            capabilities: caps_no_limit(),
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+        assert_eq!(req.size(), buf.len());
+
+        // cache_info (5) + page_size (4) + local (1) + partition (4) = 14
+        // valueType typed string follows at 14.
+        assert_eq!(buf[14], TYPE_CODE_STRING);
+    }
+
+    /// With no criteria, payload ends with two NULL bytes (criteria + filter).
+    #[test]
+    fn empty_criteria_writes_null() {
+        let query = IndexQuery::new("Person");
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+            capabilities: caps_with_limit(),
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // At offset 30 the criteria byte is NULL (no criteria).
+        assert_eq!(buf[30], TYPE_CODE_NULL);
+        // Then filter NULL at 31.
+        assert_eq!(buf[31], TYPE_CODE_NULL);
+        assert_eq!(buf.len(), 32);
+    }
+
+    /// FND-034: when the bit IS negotiated, `limit` lives between partition and valueType.
+    #[test]
+    fn limit_is_present_when_feature_bit_negotiated() {
+        let query = IndexQuery::new("Person").with_limit(42);
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+            capabilities: caps_with_limit(),
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // cache_info (5) + page_size (4) + local (1) + partition (4) = 14
+        // limit at offset 14, valueType at 18.
+        let limit = i32::from_le_bytes(buf[14..18].try_into().unwrap());
+        assert_eq!(limit, 42);
+        assert_eq!(buf[18], TYPE_CODE_STRING);
     }
 
     #[test]
@@ -465,6 +557,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(42),
             query: &query,
+            capabilities: caps_with_limit(),
         };
 
         let mut buf = Vec::new();
@@ -485,6 +578,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(7),
             query: &query,
+            capabilities: caps_with_limit(),
         };
 
         let mut buf = Vec::new();
@@ -505,6 +599,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(7),
             query: &query,
+            capabilities: caps_with_limit(),
         };
 
         let mut buf = Vec::new();
@@ -519,6 +614,7 @@ mod tests {
         let req = IndexQueryRequest {
             cache_info: CacheInfo::new(1),
             query: &query,
+            capabilities: caps_with_limit(),
         };
 
         let mut buf = Vec::new();

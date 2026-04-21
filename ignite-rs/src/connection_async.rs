@@ -67,6 +67,9 @@ pub(crate) struct ConnectionCapabilities {
     pub(crate) dc_aware: bool,
     pub(crate) query_partitions_batch_size: bool,
     pub(crate) query_initiator_id: bool,
+    /// Java `ProtocolBitmaskFeature.INDEX_QUERY_LIMIT` (bit 15). Gates emission
+    /// of `IndexQuery.limit` in the `QUERY_INDEX` request (§5.4).
+    pub(crate) index_query_limit: bool,
     /// Java `ProtocolVersionFeature.TRANSACTIONS` (V1_5_0+). Gate for tx_start.
     pub(crate) transactions: bool,
 }
@@ -421,6 +424,7 @@ where
                     FEATURE_QRY_PARTITIONS_BATCH_SIZE,
                 ),
                 query_initiator_id: feature_supported(&features, FEATURE_QRY_INITIATOR_ID),
+                index_query_limit: feature_supported(&features, FEATURE_INDEX_QUERY_LIMIT),
                 transactions: version_supports_transactions(V_MAJOR, V_MINOR, V_PATCH),
             };
             let server_node_id = if capabilities.partition_awareness {

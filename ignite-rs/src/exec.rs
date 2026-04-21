@@ -2,7 +2,9 @@ use crate::api::OpCode;
 use crate::error::IgniteResult;
 use crate::query::continuous::CacheListenerRegistry;
 use crate::topology::TopologySnapshot;
-use crate::transport::{ChannelManager, RequestRoute, ResponseMeta, SqlFieldsCapabilities};
+use crate::transport::{
+    ChannelManager, IndexQueryCapabilities, RequestRoute, ResponseMeta, SqlFieldsCapabilities,
+};
 use crate::{ReadableReq, WriteableReq};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -125,6 +127,10 @@ impl TokioExec {
 
     pub(crate) async fn sql_fields_capabilities(&self) -> SqlFieldsCapabilities {
         self.transport.sql_fields_capabilities().await
+    }
+
+    pub(crate) async fn index_query_capabilities(&self) -> IndexQueryCapabilities {
+        self.transport.index_query_capabilities().await
     }
 
     pub(crate) async fn supports_transactions(&self) -> bool {
