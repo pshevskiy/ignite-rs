@@ -14,6 +14,10 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Java `ClientServicesImpl.FLAG_PARAMETER_TYPES_MASK` (`ClientServicesImpl.java:368@2.17.0`).
+/// Always set on 2.17 — parameter type IDs follow each arg (see FND-045).
+const FLAG_PARAMETER_TYPES_MASK: u8 = 0x02;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServicePlatform {
     Java,
@@ -259,7 +263,12 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
         // Raw strings caused the server's `BinaryReaderEx.readString()` to
         // read the length prefix as the type-code byte.
         write_string_type_code(writer, &self.service_name)?;
-        write_u8(writer, 0)?;
+        // FND-044: Java always sets FLAG_PARAMETER_TYPES_MASK on 2.17
+        // (`ClientServicesImpl.java:368@2.17.0`). With the mask set, the
+        // server expects each arg to be prefixed with an i32 paramTypeId
+        // (see FND-045); without it, the server falls back to name-only
+        // overload matching, so the emitted flag must match Java.
+        write_u8(writer, FLAG_PARAMETER_TYPES_MASK)?;
         write_i64(writer, self.timeout_ms)?;
         write_i32(writer, self.cluster_node_ids.len() as i32)?;
         for node_id in &self.cluster_node_ids {
@@ -442,5 +451,21 @@ mod tests {
         let mut buf = Vec::new();
         req.write(&mut buf).unwrap();
         assert_eq!(req.size(), buf.len());
+    }
+
+    /// FND-044: Java always sets `FLAG_PARAMETER_TYPES_MASK = 0x02` on 2.17
+    /// (`ClientServicesImpl.java:368@2.17.0`). The flags byte sits at offset
+    /// 1+4+name_len (after the typed service-name header).
+    #[test]
+    fn flags_byte_is_parameter_types_mask() {
+        let req = build_request(&[], None);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let flags_offset = 1 + 4 + "svc".len();
+        assert_eq!(
+            buf[flags_offset], FLAG_PARAMETER_TYPES_MASK,
+            "flags byte must be 0x02 (FLAG_PARAMETER_TYPES_MASK)"
+        );
     }
 }

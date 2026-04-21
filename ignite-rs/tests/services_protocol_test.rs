@@ -242,7 +242,9 @@ fn decode_service_invoke_payload(payload: &[u8]) -> DecodedInvokePayload {
     let svc_code = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
     assert_eq!(svc_code, ignite_rs::protocol::TypeCode::String as u8);
     let service_name = ignite_rs::protocol::read_string(&mut cursor).unwrap();
-    let _flags = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
+    // FND-044: flags byte is FLAG_PARAMETER_TYPES_MASK = 0x02.
+    let flags = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
+    assert_eq!(flags, 0x02, "flags must be FLAG_PARAMETER_TYPES_MASK");
     let timeout_ms = ignite_rs::protocol::read_i64(&mut cursor).unwrap();
     let node_count = ignite_rs::protocol::read_i32(&mut cursor).unwrap();
     let mut node_ids = Vec::new();
