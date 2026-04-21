@@ -1032,6 +1032,18 @@ mod tests {
         );
         assert_eq!(security_violation.kind(), ErrorKind::Authentication);
     }
+
+    /// FND-057 — The `AFFINITY_TOPOLOGY_CHANGED` response flag bit must match
+    /// Java's `ClientFlag.AFFINITY_TOPOLOGY_CHANGED = 1 << 1` so the transport
+    /// layer sees the same refresh signal Java clients see. Java:
+    /// `ClientFlag.java@2.17.0`. The bit position is the wire invariant; any
+    /// drift would cause Rust to miss topology refresh events.
+    #[test]
+    fn response_flag_bit_positions_match_java() {
+        assert_eq!(super::FLAG_ERROR, 1 << 0);
+        assert_eq!(super::FLAG_AFFINITY_TOPOLOGY_CHANGED, 1 << 1);
+        assert_eq!(super::FLAG_NOTIFICATION, 1 << 2);
+    }
 }
 
 async fn with_timeout_io<T, F>(timeout_dur: Option<Duration>, fut: F) -> IgniteResult<T>
