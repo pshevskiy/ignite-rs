@@ -8,6 +8,12 @@ use std::io::{self, Write};
 const CRITERION_TYPE_RANGE: u8 = 0;
 const CRITERION_TYPE_IN: u8 = 1;
 
+/// Java `GridBinaryMarshaller.ARR_LIST` collection sub-id used by
+/// `TcpClientCache.indexQuery` (§5.4). NOT the same as `TypeCode::Collection (24)`
+/// — the server-side decoder at `ClientCacheIndexQueryRequest.java:78` tests
+/// against ARR_LIST directly.
+const COLLECTION_ARR_LIST: u8 = 1;
+
 /// An index query criterion — either a range bound or an IN-list.
 #[derive(Clone, Debug)]
 pub enum IndexQueryCriterion {
@@ -271,8 +277,8 @@ impl<'a> WriteableReq for IndexQueryRequest<'a> {
         if self.query.criteria.is_empty() {
             write_null(writer)?;
         } else {
-            // Write as collection type marker + array
-            crate::protocol::write_u8(writer, crate::protocol::TypeCode::Collection as u8)?;
+            // FND-035: Java writes the ARR_LIST sub-id (1), not `TypeCode::Collection` (24).
+            crate::protocol::write_u8(writer, COLLECTION_ARR_LIST)?;
             write_i32(writer, self.query.criteria.len() as i32)?;
             for criterion in &self.query.criteria {
                 criterion.write_criterion(writer)?;
@@ -330,6 +336,8 @@ mod tests {
 
     const TYPE_CODE_STRING: u8 = TypeCode::String as u8;
     const TYPE_CODE_NULL: u8 = TypeCode::Null as u8;
+    /// Java `GridBinaryMarshaller.ARR_LIST` collection sub-id.
+    const ARR_LIST: u8 = 1;
 
     /// FND-033: Java `w.writeString(valueType)` emits `[STRING_CODE, i32 len, bytes]`.
     #[test]
@@ -366,6 +374,26 @@ mod tests {
         assert_eq!(buf[offset], TYPE_CODE_STRING);
         let len = i32::from_le_bytes(buf[offset + 1..offset + 5].try_into().unwrap());
         assert_eq!(len as usize, "idx_name".len());
+    }
+
+    /// FND-035: criteria collection marker is ARR_LIST (0x01), not TypeCode::Collection (0x18).
+    #[test]
+    fn criteria_collection_marker_is_arr_list() {
+        let query = IndexQuery::new("Person").with_criterion(IndexQueryCriterion::eq(
+            "age",
+            IgniteValue::Int(42),
+        ));
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // cache_info(5) + page_size(4) + local(1) + partition(4) + limit(4) = 18
+        // + typed valueType (1+4+6) = 29, + indexName NULL (1) = 30
+        // → byte at offset 30 must be ARR_LIST (1), NOT 0x18.
+        assert_eq!(buf[30], ARR_LIST);
     }
 
     /// FND-036: Range criterion `field_name` is a typed string.
