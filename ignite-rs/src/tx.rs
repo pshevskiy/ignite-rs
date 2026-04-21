@@ -244,19 +244,23 @@ impl TransactionInner {
     }
 
     async fn end(&self, committed: bool) -> IgniteResult<()> {
-        {
-            let state = self.state.lock().await;
-            match *state {
-                TransactionState::Committed | TransactionState::RolledBack => {
-                    return Err(IgniteError::from("The transaction is already closed"));
-                }
-                TransactionState::Lost => {
-                    return Err(IgniteError::from(
-                        "Transaction context has been lost due to connection errors",
-                    ));
-                }
-                TransactionState::Active => {}
+        // FND-030: Java ties tx to a thread (ThreadLocal<Long> threadLocTxUid),
+        // so only one caller can end a given tx. Rust's handle-based model lets
+        // multiple tasks hold the same `Transaction`; without serialisation two
+        // concurrent `commit()`s would both observe `Active` and emit duplicate
+        // TX_END frames. Hold the state lock across the whole operation so
+        // exactly one end request reaches the server.
+        let mut state = self.state.lock().await;
+        match *state {
+            TransactionState::Committed | TransactionState::RolledBack => {
+                return Err(IgniteError::from("The transaction is already closed"));
             }
+            TransactionState::Lost => {
+                return Err(IgniteError::from(
+                    "Transaction context has been lost due to connection errors",
+                ));
+            }
+            TransactionState::Active => {}
         }
 
         let result = self
@@ -271,12 +275,12 @@ impl TransactionInner {
             )
             .await;
 
-        let mut state = self.state.lock().await;
         *state = if committed {
             TransactionState::Committed
         } else {
             TransactionState::RolledBack
         };
+        drop(state);
 
         result.map_err(|err| {
             IgniteError::from(
