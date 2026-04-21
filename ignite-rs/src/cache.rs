@@ -935,7 +935,7 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
         self.map_tx_err(
             self.exec
                 .send_with_route(
-                    OpCode::QueryClose,
+                    OpCode::ResourceClose,
                     CacheReq::CursorClose::<K, V>(cursor_id),
                     self.tx_route().await?.unwrap_or_default(),
                 )

@@ -96,7 +96,7 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> EntryCursor
 
         self.exec
             .send_with_route(
-                OpCode::QueryClose,
+                OpCode::ResourceClose,
                 CacheReq::CursorClose::<K, V>(self.cursor_id),
                 self.route.clone(),
             )
@@ -131,7 +131,7 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> Drop for En
             handle.spawn(async move {
                 let _ = exec
                     .send_with_route(
-                        OpCode::QueryClose,
+                        OpCode::ResourceClose,
                         CacheReq::CursorClose::<i32, i32>(cursor_id),
                         route,
                     )
@@ -239,7 +239,7 @@ impl<Row: SqlRow> SqlFieldsCursor<Row> {
 
         self.exec
             .send_with_route(
-                OpCode::QueryClose,
+                OpCode::ResourceClose,
                 CacheReq::CursorClose::<i32, i32>(self.cursor_id),
                 self.route.clone(),
             )
@@ -262,7 +262,7 @@ impl<Row> Drop for SqlFieldsCursor<Row> {
             handle.spawn(async move {
                 let _ = exec
                     .send_with_route(
-                        OpCode::QueryClose,
+                        OpCode::ResourceClose,
                         CacheReq::CursorClose::<i32, i32>(cursor_id),
                         route,
                     )

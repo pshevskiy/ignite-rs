@@ -623,7 +623,7 @@ impl<T: ReadableType> SetCursor<T> {
         if let Some(resource_id) = self.resource_id.take() {
             self.exec
                 .send(
-                    OpCode::QueryClose,
+                    OpCode::ResourceClose,
                     CacheReq::CursorClose::<i32, i32>(resource_id),
                 )
                 .await?;
@@ -644,7 +644,7 @@ impl<T> Drop for SetCursor<T> {
                 handle.spawn(async move {
                     let _ = exec
                         .send(
-                            OpCode::QueryClose,
+                            OpCode::ResourceClose,
                             CacheReq::CursorClose::<i32, i32>(resource_id),
                         )
                         .await;

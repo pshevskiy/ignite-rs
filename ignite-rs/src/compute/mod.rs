@@ -204,7 +204,7 @@ impl<R: ReadableType> ComputeTask<R> {
 
         self.exec
             .send_with_route(
-                OpCode::QueryClose,
+                OpCode::ResourceClose,
                 ResourceCloseRequest {
                     resource_id: self.task_id,
                 },

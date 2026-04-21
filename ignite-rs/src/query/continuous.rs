@@ -182,7 +182,7 @@ impl<K: ReadableType, V: ReadableType> ContinuousQueryCursor<K, V> {
             .await;
         self.exec
             .send(
-                OpCode::QueryClose,
+                OpCode::ResourceClose,
                 CacheReq::CursorClose::<i32, i32>(self.resource_id),
             )
             .await?;
@@ -210,7 +210,7 @@ impl<K: ReadableType, V: ReadableType> Drop for ContinuousQueryCursor<K, V> {
                 .await;
                 let _ = exec
                     .send(
-                        OpCode::QueryClose,
+                        OpCode::ResourceClose,
                         CacheReq::CursorClose::<i32, i32>(resource_id),
                     )
                     .await;

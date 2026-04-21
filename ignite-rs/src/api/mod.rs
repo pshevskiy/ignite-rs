@@ -45,7 +45,9 @@ pub(crate) enum OpCode {
     QueryScanCursorGetPage = 2001,
     QuerySql = 2002,
     QuerySqlCursorGetPage = 2003,
-    QueryClose = 0,
+    /// Java `ClientOperation.RESOURCE_CLOSE=0@2.17.0` — closes any resource
+    /// by id (cursor, compute task, continuous query, set iterator).
+    ResourceClose = 0,
     // SQL fields query
     QuerySqlFields = 2004,
     QuerySqlFieldsCursorGetPage = 2005,
@@ -104,4 +106,21 @@ impl Into<i16> for OpCode {
     fn into(self) -> i16 {
         self as i16
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FND-001: Op 0 is `RESOURCE_CLOSE` in Java 2.17.0
+    /// (`ClientOperation.RESOURCE_CLOSE=0`), not a query-specific close.
+    /// The Rust name must match Java's `RESOURCE_CLOSE` to prevent downstream
+    /// mis-usage (cursor close, compute task cancel, continuous query close,
+    /// set iterator close all use this op).
+    #[test]
+    fn opcode_resource_close_matches_java_2_17_0() {
+        let code: i16 = OpCode::ResourceClose.into();
+        assert_eq!(code, 0, "Java RESOURCE_CLOSE=0");
+    }
+
 }
