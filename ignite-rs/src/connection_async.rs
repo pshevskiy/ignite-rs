@@ -25,10 +25,30 @@ const V_PATCH: i16 = 0;
 const FLAG_ERROR: i16 = 1;
 const FLAG_AFFINITY_TOPOLOGY_CHANGED: i16 = 1 << 1;
 const FLAG_NOTIFICATION: i16 = 1 << 2;
+// Java 2.17.0 ProtocolBitmaskFeature bits (0-19). See
+// modules/core/src/main/java/org/apache/ignite/internal/client/thin/ProtocolBitmaskFeature.java@2.17.0
 const FEATURE_USER_ATTRIBUTES: usize = 0;
+const FEATURE_EXECUTE_TASK_BY_NAME: usize = 1;
+const FEATURE_CLUSTER_STATES: usize = 2;
 const FEATURE_NODE_ENDPOINTS: usize = 3;
+const FEATURE_CLUSTER_GROUPS: usize = 4;
+const FEATURE_SERVICE_INVOKE: usize = 5;
+const FEATURE_DEFAULT_QRY_TIMEOUT: usize = 6;
 const FEATURE_QRY_PARTITIONS_BATCH_SIZE: usize = 7;
+const FEATURE_BINARY_CONFIGURATION: usize = 8;
+const FEATURE_GET_SERVICE_DESCRIPTORS: usize = 9;
+const FEATURE_SERVICE_INVOKE_CALLCTX: usize = 10;
 const FEATURE_HEARTBEAT: usize = 11;
+const FEATURE_DATA_REPLICATION_OPERATIONS: usize = 12;
+const FEATURE_ALL_AFFINITY_MAPPINGS: usize = 13;
+const FEATURE_INDEX_QUERY: usize = 14;
+const FEATURE_INDEX_QUERY_LIMIT: usize = 15;
+const FEATURE_SERVICE_TOPOLOGY: usize = 16;
+const FEATURE_CACHE_INVOKE: usize = 17;
+const FEATURE_TX_AWARE_QUERIES: usize = 18;
+const FEATURE_FORCE_DEACTIVATION_FLAG: usize = 19;
+// Gridgain-downstream extensions (not in Java 2.17.0), claimed only when
+// the user opts into DC-aware routing via IGNITE_DATA_CENTER_ID. See FND-005.
 const FEATURE_DC_AWARE: usize = 22;
 const FEATURE_QRY_INITIATOR_ID: usize = 23;
 const STATUS_SECURITY_VIOLATION: i32 = 1012;
@@ -486,9 +506,27 @@ fn handshake_features(conf: &ClientConfig) -> Vec<u8> {
     if !conf.user_attributes.is_empty() {
         set_feature_bit(&mut features, FEATURE_USER_ATTRIBUTES);
     }
+    // FND-006: advertise all 20 Java 2.17.0 ProtocolBitmaskFeature bits so
+    // the negotiated feature set matches Java's allFeaturesAsEnumSet().
+    set_feature_bit(&mut features, FEATURE_EXECUTE_TASK_BY_NAME);
+    set_feature_bit(&mut features, FEATURE_CLUSTER_STATES);
     set_feature_bit(&mut features, FEATURE_NODE_ENDPOINTS);
+    set_feature_bit(&mut features, FEATURE_CLUSTER_GROUPS);
+    set_feature_bit(&mut features, FEATURE_SERVICE_INVOKE);
+    set_feature_bit(&mut features, FEATURE_DEFAULT_QRY_TIMEOUT);
     set_feature_bit(&mut features, FEATURE_QRY_PARTITIONS_BATCH_SIZE);
+    set_feature_bit(&mut features, FEATURE_BINARY_CONFIGURATION);
+    set_feature_bit(&mut features, FEATURE_GET_SERVICE_DESCRIPTORS);
+    set_feature_bit(&mut features, FEATURE_SERVICE_INVOKE_CALLCTX);
     set_feature_bit(&mut features, FEATURE_HEARTBEAT);
+    set_feature_bit(&mut features, FEATURE_DATA_REPLICATION_OPERATIONS);
+    set_feature_bit(&mut features, FEATURE_ALL_AFFINITY_MAPPINGS);
+    set_feature_bit(&mut features, FEATURE_INDEX_QUERY);
+    set_feature_bit(&mut features, FEATURE_INDEX_QUERY_LIMIT);
+    set_feature_bit(&mut features, FEATURE_SERVICE_TOPOLOGY);
+    set_feature_bit(&mut features, FEATURE_CACHE_INVOKE);
+    set_feature_bit(&mut features, FEATURE_TX_AWARE_QUERIES);
+    set_feature_bit(&mut features, FEATURE_FORCE_DEACTIVATION_FLAG);
     // FND-005: bits 22, 23 (DC_AWARE, QRY_INITIATOR_ID) are Gridgain-downstream
     // extensions not present in Java 2.17.0 (which stops at bit 19). Against a
     // pure 2.17.0 server the server's `BitSet.valueOf(bytes)` discards these
@@ -675,13 +713,14 @@ mod tests {
             0,
             "QRY_PARTITIONS_BATCH_SIZE feature bit should be set"
         );
-        // FND-005: DC_AWARE (bit 22) and QRY_INITIATOR_ID (bit 23) are beyond
-        // Java 2.17.0's 0-19 range. Without IGNITE_DATA_CENTER_ID in
-        // user_attributes, Rust must NOT claim those bits, so the features
-        // bitmap only covers bits 0-11 (fits in 2 bytes).
+        // FND-006: Rust advertises all Java 2.17.0 bits (0-19).
+        // FND-005: DC_AWARE (bit 22) and QRY_INITIATOR_ID (bit 23) are
+        // Gridgain-downstream extensions that must NOT be claimed without
+        // IGNITE_DATA_CENTER_ID user_attribute — so the bitmap is exactly
+        // 3 bytes (covers bits 0-19).
         assert_eq!(
-            features_len, 2,
-            "without DC_ID config, features bitmap stops at bit 11 (HEARTBEAT)"
+            features_len, 3,
+            "Rust should advertise all Java 2.17.0 bits (0-19) — 3 bytes"
         );
 
         let username_pos = 17 + features_len as usize;
@@ -706,13 +745,70 @@ mod tests {
         let conf = ClientConfig::new("127.0.0.1:10800");
         let req = build_handshake_request(&conf).expect("serialize");
         let features_len = i32::from_le_bytes([req[13], req[14], req[15], req[16]]) as usize;
-        // Bits 22, 23 live in byte index 2 of the features bitmap, bits 6 and 7.
-        // Without DC_ID config they must be zero; byte 2 should not even be present.
         assert!(
-            features_len <= 2,
-            "features should be <=2 bytes (bit 11 is the highest real Java 2.17.0 bit ignite-rs claims), got {}",
+            features_len <= 3,
+            "features should be <=3 bytes (bit 19 is the highest Java 2.17.0 bit), got {}",
             features_len
         );
+        // Byte 2 covers bits 16-23. Bit 22 (= byte 2, bit 6) and bit 23
+        // (= byte 2, bit 7) must be zero when DC_ID is not configured.
+        if features_len >= 3 {
+            assert_eq!(req[19] & (1 << 6), 0, "DC_AWARE (bit 22) must be unset");
+            assert_eq!(
+                req[19] & (1 << 7),
+                0,
+                "QRY_INITIATOR_ID (bit 23) must be unset"
+            );
+        }
+    }
+
+    /// FND-006: Java 2.17.0 client advertises all 20 bits (0-19) on handshake.
+    /// Rust must claim the same 20 bits so the negotiated feature set is
+    /// identical. Per ProtocolBitmaskFeature.java:29-90@2.17.0.
+    #[test]
+    fn handshake_features_advertises_all_java_2_17_0_bits() {
+        let conf = ClientConfig::new("127.0.0.1:10800");
+        let req = build_handshake_request(&conf).expect("serialize");
+        let features_len = i32::from_le_bytes([req[13], req[14], req[15], req[16]]) as usize;
+        assert!(
+            features_len >= 3,
+            "need 3 bytes to cover bit 19 (FORCE_DEACTIVATION_FLAG), got {}",
+            features_len
+        );
+        let bitmap = &req[17..17 + features_len];
+
+        // Java 2.17.0 ProtocolBitmaskFeature enum values:
+        //  0 USER_ATTRIBUTES (claimed only when attributes are set — see
+        //    existing test for that path)
+        //  1 EXECUTE_TASK_BY_NAME
+        //  2 CLUSTER_STATES
+        //  3 CLUSTER_GROUP_GET_NODES_ENDPOINTS
+        //  4 CLUSTER_GROUPS
+        //  5 SERVICE_INVOKE
+        //  6 DEFAULT_QRY_TIMEOUT
+        //  7 QRY_PARTITIONS_BATCH_SIZE
+        //  8 BINARY_CONFIGURATION
+        //  9 GET_SERVICE_DESCRIPTORS
+        // 10 SERVICE_INVOKE_CALLCTX
+        // 11 HEARTBEAT
+        // 12 DATA_REPLICATION_OPERATIONS
+        // 13 ALL_AFFINITY_MAPPINGS
+        // 14 INDEX_QUERY
+        // 15 INDEX_QUERY_LIMIT
+        // 16 SERVICE_TOPOLOGY
+        // 17 CACHE_INVOKE
+        // 18 TX_AWARE_QUERIES
+        // 19 FORCE_DEACTIVATION_FLAG
+        for bit in 1..=19usize {
+            let byte_idx = bit / 8;
+            let bit_idx = bit % 8;
+            assert_ne!(
+                bitmap[byte_idx] & (1 << bit_idx),
+                0,
+                "bit {} must be claimed (Java 2.17.0 ProtocolBitmaskFeature)",
+                bit
+            );
+        }
     }
 
     /// FND-005: when the user sets `IGNITE_DATA_CENTER_ID` user attribute,
