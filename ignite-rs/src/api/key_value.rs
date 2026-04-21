@@ -648,6 +648,26 @@ mod tests {
         assert_eq!(resp.rows, vec![10, 20]);
         assert!(!resp.has_more);
     }
+
+    /// FND-022: CACHE_PUT_IF_ABSENT response is a single `bool` — true when the
+    /// entry was inserted, false when a value already existed. Decoder must round-trip
+    /// both values from a typed-bool response (no type-code prefix; the server emits a
+    /// raw bool octet per §3.3).
+    #[test]
+    fn should_decode_put_if_absent_bool_response() {
+        let mut inserted = Vec::new();
+        write_bool(&mut inserted, true).unwrap();
+        let resp = CacheBoolResp::read(&mut Cursor::new(inserted)).unwrap();
+        assert!(resp.flag, "first put_if_absent must decode as inserted=true");
+
+        let mut already_present = Vec::new();
+        write_bool(&mut already_present, false).unwrap();
+        let resp = CacheBoolResp::read(&mut Cursor::new(already_present)).unwrap();
+        assert!(
+            !resp.flag,
+            "second put_if_absent on existing key must decode as inserted=false"
+        );
+    }
 }
 
 pub(crate) struct CacheSizeResp {
