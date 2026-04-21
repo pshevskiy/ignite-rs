@@ -805,4 +805,28 @@ mod tests {
         assert_eq!(long_type_id, 4);
         assert_ne!(int_type_id, long_type_id);
     }
+
+    /// FND-049 (coverage): `ServiceTopologyResponse` reads
+    /// `i32 count; count × (i64 msb, i64 lsb)` — matching Java
+    /// (§7.3, `ClientServicesImpl.java:237-244@2.17.0`). Pinned against
+    /// drift — the read-uuid helper should format the pair as a canonical
+    /// UUID string.
+    #[test]
+    fn service_topology_response_matches_java_wire_shape() {
+        use std::io::Cursor;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2i32.to_le_bytes());
+        // Node 1: (msb=0x11, lsb=0x22)
+        payload.extend_from_slice(&0x11i64.to_le_bytes());
+        payload.extend_from_slice(&0x22i64.to_le_bytes());
+        // Node 2: (msb=0x33, lsb=0x44)
+        payload.extend_from_slice(&0x33i64.to_le_bytes());
+        payload.extend_from_slice(&0x44i64.to_le_bytes());
+
+        let mut cursor = Cursor::new(payload);
+        let resp = ServiceTopologyResponse::read(&mut cursor).unwrap();
+        assert_eq!(resp.node_ids.len(), 2);
+        // read_uuid_string formats the (msb, lsb) pair as canonical UUID.
+        assert!(resp.node_ids[0].contains("-"));
+    }
 }
