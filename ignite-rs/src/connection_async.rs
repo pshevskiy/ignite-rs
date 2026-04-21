@@ -1044,6 +1044,79 @@ mod tests {
         assert_eq!(super::FLAG_AFFINITY_TOPOLOGY_CHANGED, 1 << 1);
         assert_eq!(super::FLAG_NOTIFICATION, 1 << 2);
     }
+
+    /// FND-058 — `read_incoming_frame` must preserve the server status code
+    /// from a `FLAG_ERROR` response (partition-awareness path) into
+    /// `Flag::Failure { status, .. }`. Java `TcpClientChannel.java:561, 577-581@2.17.0`
+    /// reads `int status` then the error string; Rust was dropping the status.
+    ///
+    /// We drive `read_incoming_frame` via a `tokio::io::duplex` pipe with a
+    /// synthetic response body containing `corr_id | flags=ERROR | status | String`.
+    #[tokio::test]
+    async fn read_incoming_frame_carries_server_status_for_error_flag() {
+        use crate::connection_async::{
+            read_incoming_frame, AsyncStream, ConnectionCapabilities, ConnectionMetadata,
+        };
+        use crate::protocol::{write_i16, write_i64};
+        use tokio::io::AsyncWriteExt;
+
+        // Build the body: corr_id i64 | flags i16 (ERROR bit) | status i32 | typed-String
+        let mut body = Vec::new();
+        write_i64(&mut body, 42).unwrap();
+        write_i16(&mut body, super::FLAG_ERROR).unwrap();
+        write_i32(&mut body, 1012).unwrap(); // SECURITY_VIOLATION
+        body.push(TypeCode::String as u8);
+        write_string(&mut body, "denied").unwrap();
+
+        // Frame prefix: i32 body length.
+        let mut frame = Vec::new();
+        write_i32(&mut frame, body.len() as i32).unwrap();
+        frame.extend_from_slice(&body);
+
+        // Write into a duplex socket, read from the AsyncStream::Plain side.
+        // We reuse AsyncStream::Plain(TcpStream) via a tiny localhost loopback
+        // fixture: spawn a listener, connect, shove bytes, read on the other side.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer_fut = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&frame).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = AsyncStream::Plain(client);
+        let (mut reader, _writer, _) = {
+            use tokio::io as tokio_io;
+            let (r, w) = tokio_io::split(stream);
+            (r, w, ())
+        };
+
+        let meta = ConnectionMetadata {
+            capabilities: ConnectionCapabilities {
+                partition_awareness: true,
+                ..Default::default()
+            },
+            server_node_id: None,
+        };
+        let frame = read_incoming_frame(&mut reader, &meta).await.unwrap();
+
+        writer_fut.await.unwrap();
+
+        match frame {
+            super::IncomingFrame::Response(resp) => {
+                assert_eq!(resp.correlation_id, 42);
+                match resp.flag {
+                    super::Flag::Failure { status, err_msg } => {
+                        assert_eq!(status, 1012, "FND-058: status must reach caller");
+                        assert_eq!(err_msg, "denied");
+                    }
+                    other => panic!("expected Failure, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Response, got Notification"),
+        }
+    }
 }
 
 async fn with_timeout_io<T, F>(timeout_dur: Option<Duration>, fut: F) -> IgniteResult<T>
