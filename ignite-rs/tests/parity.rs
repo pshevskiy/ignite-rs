@@ -27,3 +27,7 @@ mod compute;
 mod services;
 #[path = "parity/errors.rs"]
 mod errors;
+#[path = "parity/data_structures.rs"]
+mod data_structures;
+#[path = "parity/cluster.rs"]
+mod cluster;
