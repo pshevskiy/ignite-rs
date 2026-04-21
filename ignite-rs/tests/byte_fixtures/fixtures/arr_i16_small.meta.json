@@ -1,0 +1,6 @@
+{
+  "name" : "arr_i16_small",
+  "kind" : "arr_i16",
+  "value" : "[-1,0,1,32767]",
+  "bytes_len" : 13
+}

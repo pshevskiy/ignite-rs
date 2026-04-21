@@ -1,0 +1,6 @@
+{
+  "name" : "arr_timestamp_empty",
+  "kind" : "arr_timestamp",
+  "value" : "[]",
+  "bytes_len" : 5
+}

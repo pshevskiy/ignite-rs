@@ -1,0 +1,6 @@
+{
+  "name" : "date_negative",
+  "kind" : "date",
+  "value" : "-86400000",
+  "bytes_len" : 9
+}

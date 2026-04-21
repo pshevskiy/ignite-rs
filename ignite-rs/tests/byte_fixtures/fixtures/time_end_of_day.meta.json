@@ -1,0 +1,6 @@
+{
+  "name" : "time_end_of_day",
+  "kind" : "time",
+  "value" : "86399999",
+  "bytes_len" : 9
+}

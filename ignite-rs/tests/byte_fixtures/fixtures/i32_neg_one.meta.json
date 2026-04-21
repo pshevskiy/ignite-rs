@@ -1,0 +1,6 @@
+{
+  "name" : "i32_neg_one",
+  "kind" : "i32",
+  "value" : "-1",
+  "bytes_len" : 5
+}

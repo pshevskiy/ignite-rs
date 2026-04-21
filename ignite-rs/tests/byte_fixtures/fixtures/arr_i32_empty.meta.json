@@ -1,0 +1,6 @@
+{
+  "name" : "arr_i32_empty",
+  "kind" : "arr_i32",
+  "value" : "[]",
+  "bytes_len" : 5
+}

@@ -1,0 +1,6 @@
+{
+  "name" : "str_whitespace",
+  "kind" : "str",
+  "value" : " \t\n\r ",
+  "bytes_len" : 10
+}

@@ -1,0 +1,6 @@
+{
+  "name" : "map_of_lists",
+  "kind" : "map_of_lists",
+  "value" : "{xs=[10,20],ys=[]}",
+  "bytes_len" : 42
+}

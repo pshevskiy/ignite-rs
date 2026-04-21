@@ -1,0 +1,6 @@
+{
+  "name" : "f64_neg",
+  "kind" : "f64",
+  "value" : "-1.5",
+  "bytes_len" : 9
+}

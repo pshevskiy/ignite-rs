@@ -1,0 +1,6 @@
+{
+  "name" : "i64_neg_one",
+  "kind" : "i64",
+  "value" : "-1",
+  "bytes_len" : 9
+}

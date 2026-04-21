@@ -1,0 +1,6 @@
+{
+  "name" : "str_long_ascii",
+  "kind" : "str",
+  "value" : "The quick brown fox jumps over the lazy dog 01234567890",
+  "bytes_len" : 60
+}

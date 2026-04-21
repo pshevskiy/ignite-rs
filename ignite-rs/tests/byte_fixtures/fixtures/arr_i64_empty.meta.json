@@ -1,0 +1,6 @@
+{
+  "name" : "arr_i64_empty",
+  "kind" : "arr_i64",
+  "value" : "[]",
+  "bytes_len" : 5
+}

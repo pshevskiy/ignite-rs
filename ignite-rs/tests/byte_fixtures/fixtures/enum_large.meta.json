@@ -1,0 +1,6 @@
+{
+  "name" : "enum_large",
+  "kind" : "enum",
+  "value" : "type=2147483647,ord=1000",
+  "bytes_len" : 9
+}

@@ -1,0 +1,6 @@
+{
+  "name" : "map_single_entry",
+  "kind" : "map_str_i32",
+  "value" : "only=42",
+  "bytes_len" : 20
+}

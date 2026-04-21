@@ -1,0 +1,6 @@
+{
+  "name" : "timestamp_zero",
+  "kind" : "timestamp",
+  "value" : "0,0",
+  "bytes_len" : 13
+}

@@ -1,0 +1,6 @@
+{
+  "name" : "opaque_empty",
+  "kind" : "opaque",
+  "value" : "[]",
+  "bytes_len" : 5
+}

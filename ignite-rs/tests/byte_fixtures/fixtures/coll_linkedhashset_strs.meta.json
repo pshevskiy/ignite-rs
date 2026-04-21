@@ -1,0 +1,6 @@
+{
+  "name" : "coll_linkedhashset_strs",
+  "kind" : "coll_str",
+  "value" : "subtype=linkedhashset;items=[one,two,three]",
+  "bytes_len" : 32
+}

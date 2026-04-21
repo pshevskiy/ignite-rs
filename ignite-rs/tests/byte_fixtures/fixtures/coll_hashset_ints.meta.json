@@ -1,0 +1,6 @@
+{
+  "name" : "coll_hashset_ints",
+  "kind" : "coll_i32",
+  "value" : "subtype=hashset;items=[10,20,30]",
+  "bytes_len" : 21
+}

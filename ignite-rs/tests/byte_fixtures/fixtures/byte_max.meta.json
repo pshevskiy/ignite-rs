@@ -1,0 +1,6 @@
+{
+  "name" : "byte_max",
+  "kind" : "byte",
+  "value" : "255",
+  "bytes_len" : 2
+}

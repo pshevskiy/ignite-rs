@@ -1,0 +1,6 @@
+{
+  "name" : "decimal_high_scale",
+  "kind" : "decimal",
+  "value" : "scale=10,mag=[0,255]",
+  "bytes_len" : 11
+}

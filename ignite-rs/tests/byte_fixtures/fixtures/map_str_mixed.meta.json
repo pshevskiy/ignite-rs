@@ -1,0 +1,6 @@
+{
+  "name" : "map_str_mixed",
+  "kind" : "map_str_mixed",
+  "value" : "subtype=1;k1=i32(7);k2=str(v2);k3=bool(true)",
+  "bytes_len" : 41
+}

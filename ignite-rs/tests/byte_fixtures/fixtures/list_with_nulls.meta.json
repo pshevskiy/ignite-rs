@@ -1,0 +1,6 @@
+{
+  "name" : "list_with_nulls",
+  "kind" : "list_with_nulls",
+  "value" : "[first,null,third]",
+  "bytes_len" : 27
+}

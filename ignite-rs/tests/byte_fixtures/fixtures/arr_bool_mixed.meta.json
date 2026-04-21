@@ -1,0 +1,6 @@
+{
+  "name" : "arr_bool_mixed",
+  "kind" : "arr_bool",
+  "value" : "[true,false,true,true]",
+  "bytes_len" : 9
+}

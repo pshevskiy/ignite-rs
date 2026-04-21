@@ -1,0 +1,6 @@
+{
+  "name" : "i32_billion",
+  "kind" : "i32",
+  "value" : "1000000000",
+  "bytes_len" : 5
+}

@@ -1,0 +1,6 @@
+{
+  "name" : "f32_zero",
+  "kind" : "f32",
+  "value" : "0",
+  "bytes_len" : 5
+}

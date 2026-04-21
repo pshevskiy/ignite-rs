@@ -1,0 +1,6 @@
+{
+  "name" : "arr_string_ascii",
+  "kind" : "arr_string",
+  "value" : "[a,b,c,d]",
+  "bytes_len" : 29
+}

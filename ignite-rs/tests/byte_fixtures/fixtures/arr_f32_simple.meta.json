@@ -1,0 +1,6 @@
+{
+  "name" : "arr_f32_simple",
+  "kind" : "arr_f32",
+  "value" : "[0.0,1.0,-1.5]",
+  "bytes_len" : 17
+}

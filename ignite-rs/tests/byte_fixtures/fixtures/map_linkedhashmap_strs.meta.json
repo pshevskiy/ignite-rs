@@ -1,0 +1,6 @@
+{
+  "name" : "map_linkedhashmap_strs",
+  "kind" : "map_str_str",
+  "value" : "subtype=2;k1=v1;k2=v2",
+  "bytes_len" : 34
+}

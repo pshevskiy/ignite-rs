@@ -1,0 +1,6 @@
+{
+  "name" : "f64_inf",
+  "kind" : "f64",
+  "value" : "inf",
+  "bytes_len" : 9
+}

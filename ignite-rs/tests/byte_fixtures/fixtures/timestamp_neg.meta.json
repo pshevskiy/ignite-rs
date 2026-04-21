@@ -1,0 +1,6 @@
+{
+  "name" : "timestamp_neg",
+  "kind" : "timestamp",
+  "value" : "-1,999999",
+  "bytes_len" : 13
+}

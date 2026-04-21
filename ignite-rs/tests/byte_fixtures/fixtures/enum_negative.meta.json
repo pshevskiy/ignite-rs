@@ -1,0 +1,6 @@
+{
+  "name" : "enum_negative",
+  "kind" : "enum",
+  "value" : "type=-42,ord=-1",
+  "bytes_len" : 9
+}

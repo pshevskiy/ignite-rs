@@ -1,0 +1,6 @@
+{
+  "name" : "i64_zero",
+  "kind" : "i64",
+  "value" : "0",
+  "bytes_len" : 9
+}

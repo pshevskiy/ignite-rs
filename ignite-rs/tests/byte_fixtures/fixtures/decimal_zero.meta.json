@@ -1,0 +1,6 @@
+{
+  "name" : "decimal_zero",
+  "kind" : "decimal",
+  "value" : "scale=0,mag=[0]",
+  "bytes_len" : 10
+}

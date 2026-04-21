@@ -1,0 +1,6 @@
+{
+  "name" : "enum_ord_zero",
+  "kind" : "enum",
+  "value" : "type=12345,ord=0",
+  "bytes_len" : 9
+}

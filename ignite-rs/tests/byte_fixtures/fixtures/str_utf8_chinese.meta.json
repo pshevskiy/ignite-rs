@@ -1,0 +1,6 @@
+{
+  "name" : "str_utf8_chinese",
+  "kind" : "str",
+  "value" : "你好世界",
+  "bytes_len" : 17
+}

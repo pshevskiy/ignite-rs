@@ -1,0 +1,6 @@
+{
+  "name" : "list_of_maps",
+  "kind" : "list_of_maps",
+  "value" : "[{a=1},{b=2,c=3}]",
+  "bytes_len" : 51
+}

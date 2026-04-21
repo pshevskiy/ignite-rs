@@ -1,0 +1,6 @@
+{
+  "name" : "i32_min",
+  "kind" : "i32",
+  "value" : "-2147483648",
+  "bytes_len" : 5
+}

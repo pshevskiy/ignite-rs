@@ -1,0 +1,6 @@
+{
+  "name" : "str_utf8_mixed",
+  "kind" : "str",
+  "value" : "a𝕏b日c",
+  "bytes_len" : 15
+}

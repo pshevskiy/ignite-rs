@@ -1,0 +1,6 @@
+{
+  "name" : "i16_min",
+  "kind" : "i16",
+  "value" : "-32768",
+  "bytes_len" : 3
+}

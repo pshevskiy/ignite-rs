@@ -1,0 +1,6 @@
+{
+  "name" : "f32_neg",
+  "kind" : "f32",
+  "value" : "-1.5",
+  "bytes_len" : 5
+}

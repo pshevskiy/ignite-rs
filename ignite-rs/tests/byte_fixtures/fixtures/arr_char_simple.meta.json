@@ -1,0 +1,6 @@
+{
+  "name" : "arr_char_simple",
+  "kind" : "arr_char",
+  "value" : "[65,66,67]",
+  "bytes_len" : 11
+}

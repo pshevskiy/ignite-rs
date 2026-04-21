@@ -1,0 +1,6 @@
+{
+  "name" : "coll_linkedlist_strs",
+  "kind" : "coll_str",
+  "value" : "subtype=linkedlist;items=[x,y]",
+  "bytes_len" : 18
+}

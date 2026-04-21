@@ -1,0 +1,6 @@
+{
+  "name" : "i16_max",
+  "kind" : "i16",
+  "value" : "32767",
+  "bytes_len" : 3
+}
