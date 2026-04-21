@@ -280,6 +280,49 @@ struct Channel {
     created_at: Instant,
     writer_pump: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     response_pump: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// PFND-007 — shared pool of reusable request-buffer `Vec<u8>`s. Shared
+    /// across all channels of the owning `ChannelManager` so retries that
+    /// land on a new channel still benefit from previously-recycled
+    /// allocations. Bounded; surplus buffers are dropped when the pool is
+    /// full (see `WRITE_BUF_POOL_CAP`). Channel's writer pump recycles each
+    /// drained Vec back here after the socket write completes; encoders pop
+    /// from here instead of allocating fresh.
+    write_buf_pool: Arc<StdMutex<Vec<Vec<u8>>>>,
+}
+
+/// Upper bound on pooled write buffers. The writer pump is a single task, so
+/// at steady state the number of concurrently-inflight encoded buffers is
+/// typically <= queue depth — 32 is comfortable headroom without pinning
+/// large memory when the queue is idle.
+const WRITE_BUF_POOL_CAP: usize = 32;
+
+/// PFND-007 — pop a recycled write buffer from the shared pool, or allocate
+/// a fresh one if the pool is empty. Returned buffer is empty (length 0)
+/// with at least `min_capacity` bytes of capacity.
+#[inline]
+fn take_write_buf(pool: &StdMutex<Vec<Vec<u8>>>, min_capacity: usize) -> Vec<u8> {
+    let mut pool = pool.lock().expect("write_buf_pool mutex poisoned");
+    let mut buf = pool.pop().unwrap_or_else(Vec::new);
+    drop(pool);
+    buf.clear();
+    if buf.capacity() < min_capacity {
+        buf.reserve(min_capacity - buf.capacity());
+    }
+    buf
+}
+
+/// PFND-007 — return a buffer to the shared pool for reuse. Drops the Vec
+/// if the pool is full.
+#[inline]
+fn recycle_write_buf(pool: &StdMutex<Vec<Vec<u8>>>, mut buf: Vec<u8>) {
+    if buf.capacity() == 0 {
+        return;
+    }
+    buf.clear();
+    let mut pool = pool.lock().expect("write_buf_pool mutex poisoned");
+    if pool.len() < WRITE_BUF_POOL_CAP {
+        pool.push(buf);
+    }
 }
 
 struct OutboundRequest {
@@ -292,6 +335,7 @@ impl Channel {
         request_timeout: Option<Duration>,
         metadata: ConnectionMetadata,
         writer_tx: mpsc::UnboundedSender<OutboundRequest>,
+        write_buf_pool: Arc<StdMutex<Vec<Vec<u8>>>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             address,
@@ -310,7 +354,17 @@ impl Channel {
             created_at: Instant::now(),
             writer_pump: StdMutex::new(None),
             response_pump: StdMutex::new(None),
+            write_buf_pool,
         })
+    }
+
+    /// PFND-007 — return a buffer to the shared pool for reuse. Called by
+    /// the writer pump after the buffer's bytes have been written to the
+    /// socket; also used when a request can't be enqueued (channel closed
+    /// or queue dropped).
+    #[inline]
+    fn recycle_write_buf(&self, buf: Vec<u8>) {
+        recycle_write_buf(&self.write_buf_pool, buf);
     }
 
     #[inline]
@@ -318,11 +372,21 @@ impl Channel {
         &self.inflight_shards[(corr_id as usize) % self.inflight_shards.len()]
     }
 
-    async fn connect(conf: &ClientConfig, address: String) -> IgniteResult<Arc<Self>> {
+    async fn connect(
+        conf: &ClientConfig,
+        address: String,
+        write_buf_pool: Arc<StdMutex<Vec<Vec<u8>>>>,
+    ) -> IgniteResult<Arc<Self>> {
         let connection = AsyncConnection::connect(conf, &address).await?;
         let (reader, writer, metadata) = connection.into_parts();
         let (writer_tx, writer_rx) = mpsc::unbounded_channel();
-        let channel = Self::new(address, conf.request_timeout, metadata, writer_tx);
+        let channel = Self::new(
+            address,
+            conf.request_timeout,
+            metadata,
+            writer_tx,
+            write_buf_pool,
+        );
         channel.attach_writer_pump(writer, writer_rx, channel_requires_flush(conf));
         channel.attach_response_pump(reader);
         Ok(channel)
@@ -391,8 +455,14 @@ impl Channel {
         self.last_send_at_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// PFND-007 — enqueue a pre-encoded request buffer for the writer pump.
+    /// The buffer is expected to come from this channel's `write_buf_pool`
+    /// (via `take_write_buf` + `encode_request_into`) or from the caller's
+    /// upstream pool (recycled back to `write_buf_pool` after the socket
+    /// write completes).
     async fn request(&self, corr_id: i64, request: Vec<u8>) -> IgniteResult<ResponseFrame> {
         if !self.is_available() {
+            self.recycle_write_buf(request);
             return Err(self.closed_error().await);
         }
 
@@ -406,11 +476,14 @@ impl Channel {
             .unwrap()
             .insert(corr_id, slot.clone());
 
-        if self.writer_tx.send(OutboundRequest { request }).is_err() {
+        if let Err(send_err) = self.writer_tx.send(OutboundRequest { request }) {
             self.inflight_shard(corr_id)
                 .lock()
                 .unwrap()
                 .remove(&corr_id);
+            // Return the dropped buffer to the pool so its capacity isn't
+            // lost when the writer pump is gone.
+            self.recycle_write_buf(send_err.0.request);
             return Err(self.closed_error().await);
         }
 
@@ -504,20 +577,36 @@ impl Channel {
     ) {
         let channel = self.clone();
         let handle = tokio::spawn(async move {
+            // PFND-007 — reusable per-batch staging: we keep `batch` across
+            // iterations so we don't re-allocate the `Vec<Vec<u8>>`. `slices`
+            // is built fresh each iteration (its borrow of `batch` must end
+            // before we drain `batch` back into the pool), but we pre-size
+            // its Vec to avoid grow reallocs.
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(8);
             while let Some(first) = receiver.recv().await {
-                let mut batch = vec![first.request];
+                batch.clear();
+                batch.push(first.request);
                 while let Ok(next) = receiver.try_recv() {
                     batch.push(next.request);
                 }
-                let slices = batch.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                if let Err(err) =
+                let write_result = {
+                    // Narrow scope: `slices` borrows `batch` only here, so
+                    // the borrow ends before we `drain` the batch below.
+                    let slices: Vec<&[u8]> =
+                        batch.iter().map(Vec::as_slice).collect::<Vec<_>>();
                     write_request_batch(&mut writer, &slices, channel.request_timeout, flush).await
-                {
+                };
+                if let Err(err) = write_result {
                     channel.mark_broken(err.to_string()).await;
                     channel.abort_response_pump();
                     break;
                 }
                 channel.mark_sent();
+                // PFND-007 — return buffers to the shared pool so the next
+                // request pops a capacity-retained Vec instead of allocating.
+                for buf in batch.drain(..) {
+                    channel.recycle_write_buf(buf);
+                }
             }
         });
         *self
@@ -734,6 +823,13 @@ pub(crate) struct ChannelManager {
     next_default_channel_index: AtomicI64,
     reconnect_attempts: StdMutex<VecDeque<Instant>>,
     shutdown: Arc<AtomicBool>,
+    /// PFND-007 — shared pool of reusable request-buffer `Vec<u8>`s.
+    /// `encode_request_pooled` pops from this pool instead of allocating a
+    /// fresh Vec per request; writer pumps recycle drained Vecs back here
+    /// after the socket write completes. Shared across all channels in this
+    /// client so retries on a new channel still benefit from recycled
+    /// allocations from the previous channel.
+    write_buf_pool: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -808,14 +904,25 @@ impl ChannelManager {
         let start_index = initial_start_index(&seed_endpoints);
         let affinity = AffinityCache::new();
         let topology = TopologyCache::new(seed_endpoints);
-        let active =
-            Self::connect_any_initial(&conf, &topology, &event_bus, start_index, false).await?;
+        // PFND-007 — create the shared write-buffer pool once and hand it to
+        // every Channel produced by this manager. Recycled buffers survive
+        // reconnects and channel pool expansion.
+        let write_buf_pool = Arc::new(StdMutex::new(Vec::with_capacity(WRITE_BUF_POOL_CAP)));
+        let active = Self::connect_any_initial(
+            &conf,
+            &topology,
+            &event_bus,
+            start_index,
+            false,
+            &write_buf_pool,
+        )
+        .await?;
         let address = active.address().to_string();
         let mut channels = HashMap::new();
         channels.insert(format!("{}#pool0", address), active.clone());
 
         for i in 1..conf.connection_pool_size {
-            match Channel::connect(&conf, address.clone()).await {
+            match Channel::connect(&conf, address.clone(), write_buf_pool.clone()).await {
                 Ok(ch) => {
                     channels.insert(format!("{}#pool{}", address, i), ch);
                 }
@@ -853,6 +960,7 @@ impl ChannelManager {
             next_default_channel_index: AtomicI64::new(0),
             reconnect_attempts: StdMutex::new(VecDeque::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            write_buf_pool,
         };
 
         manager.on_channel_connected(active).await;
@@ -860,6 +968,25 @@ impl ChannelManager {
             .event_bus
             .emit_lifecycle(LifecycleEventKind::Created, None);
         Ok(manager)
+    }
+
+    /// PFND-007 — pop a recycled buffer from the shared pool (or allocate a
+    /// fresh one if empty), then encode the request header + payload into it.
+    /// Flows through round_trip and lands in the writer pump, which recycles
+    /// the buffer back into this pool after the socket write.
+    fn encode_request_pooled(
+        &self,
+        op_code: i16,
+        corr_id: i64,
+        payload: &impl WriteableReq,
+    ) -> IgniteResult<Vec<u8>> {
+        let capacity_hint = payload.size() + (REQ_HEADER_SIZE_BYTES as usize);
+        let mut buf = take_write_buf(&self.write_buf_pool, capacity_hint);
+        if let Err(err) = encode_request_into(&mut buf, op_code, corr_id, payload) {
+            recycle_write_buf(&self.write_buf_pool, buf);
+            return Err(err);
+        }
+        Ok(buf)
     }
 
     pub(crate) fn spawn_background_tasks(self: &Arc<Self>) {
@@ -1009,7 +1136,7 @@ impl ChannelManager {
         route: RequestRoute,
     ) -> IgniteResult<()> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let (flag, _body, _offset) = self
             .round_trip_no_meta(op_code as i16, corr_id, request, true, route)
             .await?;
@@ -1035,7 +1162,7 @@ impl ChannelManager {
         route: RequestRoute,
     ) -> IgniteResult<T> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let (flag, body, payload_offset) = self
             .round_trip_no_meta(op_code as i16, corr_id, request, true, route)
             .await?;
@@ -1055,7 +1182,7 @@ impl ChannelManager {
         route: RequestRoute,
     ) -> IgniteResult<(T, ResponseMeta)> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let (flag, body, payload_offset, meta) = self
             .round_trip_with_route(op_code as i16, corr_id, request, true, route)
             .await?;
@@ -1081,7 +1208,7 @@ impl ChannelManager {
         data: impl WriteableReq,
     ) -> IgniteResult<()> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let frame = channel.request(corr_id, request).await?;
         match frame.flag {
             Success => Ok(()),
@@ -1102,7 +1229,7 @@ impl ChannelManager {
         data: impl WriteableReq,
     ) -> IgniteResult<T> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let frame = channel.request(corr_id, request).await?;
         match frame.flag {
             Success => {
@@ -1125,7 +1252,7 @@ impl ChannelManager {
         data: impl WriteableReq,
     ) -> IgniteResult<bytes::Bytes> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let frame = channel.request(corr_id, request).await?;
         match frame.flag {
             Success => Ok(frame.body.slice(frame.payload_offset..)),
@@ -1142,7 +1269,7 @@ impl ChannelManager {
         route: RequestRoute,
     ) -> IgniteResult<(bytes::Bytes, ResponseMeta)> {
         let corr_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
-        let request = Self::encode_request(op_code as i16, corr_id, &data)?;
+        let request = self.encode_request_pooled(op_code as i16, corr_id, &data)?;
         let (flag, body, payload_offset, meta) = self
             .round_trip_with_route(op_code as i16, corr_id, request, true, route)
             .await?;
@@ -1480,7 +1607,7 @@ impl ChannelManager {
                             None,
                         );
 
-                        match Channel::connect(&self.conf, address.clone()).await {
+                        match Channel::connect(&self.conf, address.clone(), self.write_buf_pool.clone()).await {
                             Ok(channel) => {
                                 self.insert_channel(channel.clone()).await;
                                 Ok((channel, true))
@@ -1499,7 +1626,7 @@ impl ChannelManager {
                         None,
                     );
 
-                    match Channel::connect(&self.conf, address.clone()).await {
+                    match Channel::connect(&self.conf, address.clone(), self.write_buf_pool.clone()).await {
                         Ok(channel) => {
                             self.insert_channel(channel.clone()).await;
                             Ok((channel, true))
@@ -1551,12 +1678,20 @@ impl ChannelManager {
         event_bus: &EventBus,
         start_index: usize,
         reconnect: bool,
+        write_buf_pool: &Arc<StdMutex<Vec<Vec<u8>>>>,
     ) -> IgniteResult<Arc<Channel>> {
         let mut errors = Vec::new();
 
         for _ in 0..=conf.retry_limit {
-            match Self::connect_any_initial_once(conf, topology, event_bus, start_index, reconnect)
-                .await
+            match Self::connect_any_initial_once(
+                conf,
+                topology,
+                event_bus,
+                start_index,
+                reconnect,
+                write_buf_pool,
+            )
+            .await
             {
                 Ok(channel) => return Ok(channel),
                 Err(err) => errors.push(err),
@@ -1901,7 +2036,7 @@ impl ChannelManager {
                 None,
             );
 
-            let channel = Channel::connect(&self.conf, address.clone()).await?;
+            let channel = Channel::connect(&self.conf, address.clone(), self.write_buf_pool.clone()).await?;
             self.insert_channel(channel.clone()).await;
             channel
         };
@@ -2217,7 +2352,7 @@ impl ChannelManager {
                     None,
                 );
 
-                match Channel::connect(&self.conf, address.clone()).await {
+                match Channel::connect(&self.conf, address.clone(), self.write_buf_pool.clone()).await {
                     Ok(channel) => {
                         self.insert_channel(channel.clone()).await;
                         Ok(channel)
@@ -2350,6 +2485,7 @@ impl ChannelManager {
         event_bus: &EventBus,
         start_index: usize,
         reconnect: bool,
+        write_buf_pool: &Arc<StdMutex<Vec<Vec<u8>>>>,
     ) -> IgniteResult<Arc<Channel>> {
         let addresses = topology.endpoints_arc();
         let len = addresses.len();
@@ -2369,7 +2505,7 @@ impl ChannelManager {
                 None,
             );
 
-            match Channel::connect(conf, address.clone()).await {
+            match Channel::connect(conf, address.clone(), write_buf_pool.clone()).await {
                 Ok(channel) => {
                     topology.mark_active(&address).await;
                     event_bus.emit_connection(
@@ -2408,21 +2544,42 @@ impl ChannelManager {
     // written bytes can't corrupt the length prefix. Rust now mirrors
     // Java: reserve 4 bytes up-front, write header and payload, then
     // patch `buf.len() - 4` back at offset 0.
+    //
+    // PFND-007: Runtime callers encode via `encode_request_pooled`, which
+    // draws buffers from the shared pool. This fresh-allocation variant is
+    // retained only for unit tests that verify the FND-007 back-patch
+    // invariant without wiring up a ChannelManager.
+    #[cfg(test)]
     pub(super) fn encode_request(
         op_code: i16,
         corr_id: i64,
         payload: &impl WriteableReq,
     ) -> IgniteResult<Vec<u8>> {
         let mut buf = Vec::with_capacity(payload.size() + (REQ_HEADER_SIZE_BYTES as usize));
-        // Reserve 4 bytes for length prefix (back-patched after write).
-        write_i32(&mut buf, 0)?;
-        write_i16(&mut buf, op_code)?;
-        write_i64(&mut buf, corr_id)?;
-        payload.write(&mut buf).map_err(IgniteError::from)?;
-        let payload_len = (buf.len() - 4) as i32;
-        buf[..4].copy_from_slice(&payload_len.to_le_bytes());
+        encode_request_into(&mut buf, op_code, corr_id, payload)?;
         Ok(buf)
     }
+}
+
+/// PFND-007 — write the frame header and payload into `buf` (which may be
+/// a pooled, reused buffer). The buffer is cleared before writing so callers
+/// can pass either a fresh or recycled Vec. The length prefix is back-patched
+/// after the payload is written (FND-007 correctness invariant preserved).
+fn encode_request_into<R: WriteableReq + ?Sized>(
+    buf: &mut Vec<u8>,
+    op_code: i16,
+    corr_id: i64,
+    payload: &R,
+) -> IgniteResult<()> {
+    buf.clear();
+    // Reserve 4 bytes for length prefix (back-patched after write).
+    write_i32(buf, 0)?;
+    write_i16(buf, op_code)?;
+    write_i64(buf, corr_id)?;
+    payload.write(buf).map_err(IgniteError::from)?;
+    let payload_len = (buf.len() - 4) as i32;
+    buf[..4].copy_from_slice(&payload_len.to_le_bytes());
+    Ok(())
 }
 
 impl Drop for ChannelManager {
