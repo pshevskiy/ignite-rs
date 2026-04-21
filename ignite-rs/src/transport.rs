@@ -682,6 +682,33 @@ fn build_channels_by_address(
     by_address
 }
 
+/// PFND-003: pre-computes the endpoint-ordered, deduplicated channel list
+/// used by `default_channel`. Avoids per-request Vec/HashSet allocation on
+/// the hot path — the result is stored behind `ArcSwap` and rebuilt only
+/// when the channel pool or topology endpoints change.
+///
+/// Availability is NOT filtered here: channels can transition to closed
+/// asynchronously via `mark_broken`. The reader filters `is_available()` at
+/// pick time while still avoiding the Vec allocation.
+fn build_default_candidates(
+    channels_by_address: &HashMap<Arc<str>, Vec<Arc<Channel>>>,
+    endpoints: &[String],
+) -> Vec<Arc<Channel>> {
+    let mut candidates: Vec<Arc<Channel>> = Vec::with_capacity(endpoints.len());
+    let mut seen: HashSet<usize> = HashSet::with_capacity(endpoints.len());
+    for address in endpoints {
+        if let Some(group) = channels_by_address.get(address.as_str()) {
+            for channel in group {
+                let ptr = Arc::as_ptr(channel) as usize;
+                if seen.insert(ptr) {
+                    candidates.push(channel.clone());
+                }
+            }
+        }
+    }
+    candidates
+}
+
 pub(crate) struct ChannelManager {
     conf: ClientConfig,
     affinity: AffinityCache,
@@ -689,6 +716,10 @@ pub(crate) struct ChannelManager {
     event_bus: EventBus,
     channels: RwLock<HashMap<String, Arc<Channel>>>,
     channels_by_address: ArcSwap<HashMap<Arc<str>, Vec<Arc<Channel>>>>,
+    /// PFND-003: pre-computed snapshot of `default_channel` candidates
+    /// (endpoint-ordered, deduped by Arc identity). Rebuilt on channel-pool
+    /// or endpoint changes; read lock-free on every request via ArcSwap.
+    default_candidates: ArcSwap<Vec<Arc<Channel>>>,
     /// Lock-free node_id → channel index for partition-aware routing.
     /// Uses ArcSwap for zero-cost reads (equivalent to Java volatile).
     node_channels: ArcSwap<HashMap<Arc<str>, Arc<Channel>>>,
@@ -795,6 +826,9 @@ impl ChannelManager {
             }
         }
         let channels_by_address = build_channels_by_address(&channels);
+        let initial_endpoints = topology.endpoints_arc();
+        let default_candidates =
+            build_default_candidates(&channels_by_address, initial_endpoints.as_slice());
         let next_channel_key = conf.connection_pool_size as i64;
 
         let (cached_active_tx, cached_active_rx) = tokio::sync::watch::channel(active.clone());
@@ -806,6 +840,7 @@ impl ChannelManager {
             event_bus,
             channels: RwLock::new(channels),
             channels_by_address: ArcSwap::from_pointee(channels_by_address),
+            default_candidates: ArcSwap::from_pointee(default_candidates),
             node_channels: ArcSwap::from_pointee(HashMap::new()),
             active: RwLock::new(active.clone()),
             cached_active_tx,
@@ -866,8 +901,27 @@ impl ChannelManager {
     }
 
     fn store_channels_by_address(&self, channels: &HashMap<String, Arc<Channel>>) {
-        self.channels_by_address
-            .store(Arc::new(build_channels_by_address(channels)));
+        let indexed = build_channels_by_address(channels);
+        // PFND-003: refresh the default-candidates snapshot alongside the
+        // address index. Both are rebuilt from the same HashMap snapshot so
+        // readers always see a consistent view.
+        let endpoints = self.topology.endpoints_arc();
+        let candidates = build_default_candidates(&indexed, endpoints.as_slice());
+        self.channels_by_address.store(Arc::new(indexed));
+        self.default_candidates.store(Arc::new(candidates));
+    }
+
+    /// PFND-003: rebuilds the default-candidates snapshot from the current
+    /// channel pool and the latest topology endpoints. Used when only the
+    /// endpoint ordering changed (e.g. after `topology.record_node_endpoint`
+    /// or `apply_discovery_update`) — the channel pool itself is unchanged
+    /// but the deduped ordered Vec needs to reflect the new endpoint list.
+    async fn refresh_default_candidates(&self) {
+        let channels = self.channels.read().await;
+        let indexed = build_channels_by_address(&channels);
+        let endpoints = self.topology.endpoints_arc();
+        let candidates = build_default_candidates(&indexed, endpoints.as_slice());
+        self.default_candidates.store(Arc::new(candidates));
     }
 
     async fn insert_channel(&self, channel: Arc<Channel>) {
@@ -1593,7 +1647,11 @@ impl ChannelManager {
         }
 
         let next = self.conf.normalized_addresses()?;
-        Ok(self.topology.replace_seed_endpoints(next).await)
+        let removed = self.topology.replace_seed_endpoints(next).await;
+        // PFND-003: seed endpoints list changed; rebuild the candidate snapshot
+        // so removed addresses no longer appear in the hot-path iteration.
+        self.refresh_default_candidates().await;
+        Ok(removed)
     }
 
     fn data_center_id(&self) -> Option<&str> {
@@ -1604,13 +1662,56 @@ impl ChannelManager {
     }
 
     async fn default_channel(&self) -> Arc<Channel> {
+        // PFND-003: DC-aware routing still allocates a candidate Vec; that
+        // path is only taken when `data_center_id` is configured. The
+        // non-DC hot path below is lock-free and allocation-free.
+        if self.conf.partition_awareness_enabled && self.data_center_id().is_some() {
+            return self.default_channel_dc_aware().await;
+        }
+
+        // Lock-free snapshot read (PFND-003).
+        let candidates = self.default_candidates.load();
+        let len = candidates.len();
+
+        if len == 0 {
+            return self.default_channel_fallback().await;
+        }
+
+        if len == 1 {
+            let ch = &candidates[0];
+            if ch.is_available() {
+                return ch.clone();
+            }
+            return self.default_channel_fallback().await;
+        }
+
+        // Multi-channel: round-robin starting index + scan for first available.
+        let start = self
+            .next_default_channel_index
+            .fetch_add(1, Ordering::Relaxed) as usize;
+        for step in 0..len {
+            let i = (start.wrapping_add(step)) % len;
+            let ch = &candidates[i];
+            if ch.is_available() {
+                return ch.clone();
+            }
+        }
+
+        self.default_channel_fallback().await
+    }
+
+    async fn default_channel_fallback(&self) -> Arc<Channel> {
+        let cached = self.cached_active_rx.borrow().clone();
+        if cached.is_available() {
+            return cached;
+        }
+        self.active.read().await.clone()
+    }
+
+    async fn default_channel_dc_aware(&self) -> Arc<Channel> {
         let candidates = self.default_channel_candidates().await;
         if candidates.is_empty() {
-            let cached = self.cached_active_rx.borrow().clone();
-            if cached.is_available() {
-                return cached;
-            }
-            return self.active.read().await.clone();
+            return self.default_channel_fallback().await;
         }
         if candidates.len() == 1 {
             return candidates[0].clone();
@@ -1950,6 +2051,9 @@ impl ChannelManager {
                 (**self.node_channels.load()).clone();
             new_map.insert(Arc::from(node_id), channel.clone());
             self.node_channels.store(new_map.into());
+            // PFND-003: endpoints list may have grown; rebuild the candidate
+            // snapshot so the new endpoint's channel is picked up on the hot path.
+            self.refresh_default_candidates().await;
         }
     }
 
@@ -2018,6 +2122,11 @@ impl ChannelManager {
                 .await;
             self.prune_removed_node_channels(&response.removed_node_ids)
                 .await;
+            // PFND-003: endpoints list changed; rebuild the candidate snapshot.
+            // `prune_removed_node_channels` already refreshes it if it removed
+            // channels, but newly-added endpoints that weren't yet connected
+            // also need a refresh so they're considered on the hot path.
+            self.refresh_default_candidates().await;
         }
         // prime_discovered_channels is called after releasing the guard to avoid
         // re-entrant deadlock: connecting to a discovered node triggers
