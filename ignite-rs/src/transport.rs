@@ -2319,21 +2319,39 @@ fn read_flexible_string(reader: &mut impl io::Read) -> IgniteResult<String> {
     }
 }
 
+/// Returns `true` for opcodes Java's `ClientRetryReadPolicy` considers
+/// read-only, plus a small set of Rust-side system / descriptor ops that
+/// are idempotent by construction. See
+/// `ClientRetryReadPolicy.java:29-44@2.17.0` for the canonical list.
+///
+/// FND-062: parity with Java required adding `QUERY_SCAN`,
+/// `QUERY_CONTINUOUS`, `CLUSTER_GROUP_GET_NODE_IDS`, and
+/// `CLUSTER_GROUP_GET_NODE_INFO`. Java's `ClientRetryReadPolicy` does
+/// *not* include `QUERY_SQL`, `QUERY_SQL_FIELDS`, `QUERY_INDEX`,
+/// atomic-long, or set read ops — they were incorrectly listed in the
+/// audit spec; do not add them here.
 fn is_read_only_op(op_code: i16) -> bool {
     matches!(
         op_code,
-        x if x == OpCode::GetIdleTimeout as i16
-            || x == OpCode::CacheGetNames as i16
-            || x == OpCode::CacheGetConfiguration as i16
+        // Java ClientRetryReadPolicy (ClientRetryReadPolicy.java:29-44@2.17.0)
+        x if x == OpCode::CacheGetNames as i16
             || x == OpCode::CacheGet as i16
-            || x == OpCode::CacheGetAll as i16
             || x == OpCode::CacheContainsKey as i16
             || x == OpCode::CacheContainsKeys as i16
+            || x == OpCode::CacheGetConfiguration as i16
             || x == OpCode::CacheGetSize as i16
+            || x == OpCode::CacheGetAll as i16
+            || x == OpCode::QueryScan as i16
+            || x == OpCode::QueryContinuous as i16
             || x == OpCode::ClusterGetState as i16
             || x == OpCode::ClusterGetWalState as i16
+            || x == OpCode::ClusterGroupGetNodeIds as i16
+            || x == OpCode::ClusterGroupGetNodeInfo as i16
             || x == OpCode::ServiceGetDescriptors as i16
             || x == OpCode::ServiceGetDescriptor as i16
+            // Rust-side additions (system/descriptor ops Java Ops doesn't map
+            // to a public ClientOperationType but are trivially idempotent).
+            || x == OpCode::GetIdleTimeout as i16
             || x == OpCode::ServiceGetTopology as i16
             || x == OpCode::GetBinaryTypeName as i16
             || x == OpCode::GetBinaryType as i16
@@ -2489,5 +2507,83 @@ mod tests {
         let conn_err = IgniteError::connection("connection reset by peer");
         assert!(conn_err.is_connection_related());
         assert_eq!(conn_err.server_status(), None);
+    }
+
+    /// FND-062: `RetryPolicy::ReadOnly` must include every op Java's
+    /// `ClientRetryReadPolicy.shouldRetry(...)` returns `true` for
+    /// (`ClientRetryReadPolicy.java:29-44@2.17.0`). The list below is
+    /// expressed in Rust opcode names and must stay in lockstep with
+    /// Java.
+    #[test]
+    fn fnd_062_readonly_policy_covers_java_read_policy_ops() {
+        use crate::api::OpCode;
+        use crate::transport::is_read_only_op;
+
+        // The Java ClientRetryReadPolicy ops, as i16 opcodes.
+        let java_read_policy_ops: &[OpCode] = &[
+            OpCode::CacheGetNames,          // CACHE_GET_NAMES
+            OpCode::CacheGet,               // CACHE_GET
+            OpCode::CacheContainsKey,       // CACHE_CONTAINS_KEY
+            OpCode::CacheContainsKeys,      // CACHE_CONTAINS_KEYS
+            OpCode::CacheGetConfiguration,  // CACHE_GET_CONFIGURATION
+            OpCode::CacheGetSize,           // CACHE_GET_SIZE
+            OpCode::CacheGetAll,            // CACHE_GET_ALL
+            OpCode::QueryScan,              // QUERY_SCAN
+            OpCode::QueryContinuous,        // QUERY_CONTINUOUS
+            OpCode::ClusterGetState,        // CLUSTER_GET_STATE
+            OpCode::ClusterGetWalState,     // CLUSTER_GET_WAL_STATE
+            OpCode::ClusterGroupGetNodeIds, // CLUSTER_GROUP_GET_NODE_IDS → CLUSTER_GROUP_GET_NODES
+            OpCode::ClusterGroupGetNodeInfo, // CLUSTER_GROUP_GET_NODE_INFO → CLUSTER_GROUP_GET_NODES
+            OpCode::ServiceGetDescriptors,  // SERVICE_GET_DESCRIPTORS
+            OpCode::ServiceGetDescriptor,   // SERVICE_GET_DESCRIPTOR
+        ];
+
+        for op in java_read_policy_ops {
+            let code: i16 = (*op) as i16;
+            assert!(
+                is_read_only_op(code),
+                "FND-062: op {op:?} ({code}) must be recognized as read-only \
+                 (Java ClientRetryReadPolicy)"
+            );
+        }
+    }
+
+    /// FND-062 counterpart: ops Java's `ClientRetryReadPolicy` explicitly
+    /// rejects (returns `false`) must not be retried under
+    /// `RetryPolicy::ReadOnly`. The audit spec suggested adding
+    /// `QUERY_SQL`, `QUERY_SQL_FIELDS`, `QUERY_INDEX`, atomic-long, and
+    /// set read ops — but they are NOT in `ClientRetryReadPolicy` and
+    /// must stay out of Rust's list for parity.
+    #[test]
+    fn fnd_062_readonly_policy_excludes_non_java_reads() {
+        use crate::api::OpCode;
+        use crate::transport::is_read_only_op;
+
+        // Ops Java's ClientRetryReadPolicy returns `false` for.
+        let not_in_read_policy: &[OpCode] = &[
+            OpCode::QuerySql,
+            OpCode::QuerySqlFields,
+            OpCode::QueryIndex,
+            OpCode::AtomicLongValueGet,
+            OpCode::AtomicLongExists,
+            OpCode::SetExists,
+            OpCode::SetSize,
+            OpCode::SetValueContains,
+            OpCode::SetValueContainsAll,
+            // Writes must of course never be marked read-only.
+            OpCode::CachePut,
+            OpCode::CachePutAll,
+            OpCode::CacheRemoveKey,
+            OpCode::CacheInvoke,
+        ];
+
+        for op in not_in_read_policy {
+            let code: i16 = (*op) as i16;
+            assert!(
+                !is_read_only_op(code),
+                "FND-062: op {op:?} ({code}) must NOT be marked read-only \
+                 (Java ClientRetryReadPolicy excludes it)"
+            );
+        }
     }
 }
