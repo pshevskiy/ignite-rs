@@ -239,6 +239,11 @@ impl ServiceProxy {
             .map(|s| RequestRoute::preferred_node(Arc::from(s.as_str())))
             .unwrap_or_default();
 
+        // FND-047: trailing callAttrs map is written only when the
+        // `SERVICE_INVOKE_CALLCTX` feature bit is negotiated (or an
+        // explicit ServiceCallContext was supplied).
+        let caps = self.services.exec.service_invoke_capabilities().await;
+
         let response: NullableValueResponse<R> = self
             .services
             .exec
@@ -251,6 +256,7 @@ impl ServiceProxy {
                     method_name: method.to_string(),
                     args,
                     call_context: self.call_context.as_ref(),
+                    callctx_feature_supported: caps.service_invoke_callctx,
                 },
                 route,
             )
@@ -393,6 +399,11 @@ struct ServiceInvokeRequest<'a> {
     method_name: String,
     args: &'a [(i32, &'a IgniteValue)],
     call_context: Option<&'a ServiceCallContext>,
+    /// Whether the server negotiated `SERVICE_INVOKE_CALLCTX` (bit 10).
+    /// Java `ClientServicesImpl.java:401-404@2.17.0` writes the trailing
+    /// `callAttrs` map only when either `callAttrs != null` or this bit
+    /// is supported — else the field is omitted entirely. FND-047.
+    callctx_feature_supported: bool,
 }
 
 impl WriteableReq for ServiceInvokeRequest<'_> {
@@ -427,11 +438,23 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
             write_i32(writer, *type_id)?;
             arg.write(writer)?;
         }
-        write_nullable_map(writer, self.call_context.map(|ctx| &ctx.values))?;
+        // FND-047: Only write the trailing `callAttrs` map when either
+        // `callAttrs != null` or the `SERVICE_INVOKE_CALLCTX` feature bit
+        // is negotiated (`ClientServicesImpl.java:401-404@2.17.0`).
+        // Otherwise the field is absent from the wire — writing 4 extra
+        // bytes would desynchronize the server's frame parser.
+        if self.call_context.is_some() || self.callctx_feature_supported {
+            write_nullable_map(writer, self.call_context.map(|ctx| &ctx.values))?;
+        }
         Ok(())
     }
 
     fn size(&self) -> usize {
+        let trailing = if self.call_context.is_some() || self.callctx_feature_supported {
+            nullable_map_size(self.call_context.map(|ctx| &ctx.values))
+        } else {
+            0
+        };
         // Typed strings add a 1-byte TypeCode::String prefix.
         1 + 4 + self.service_name.len()
             + 1
@@ -445,7 +468,7 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
                 .iter()
                 .map(|(_, arg)| 4 + arg.size())
                 .sum::<usize>()
-            + nullable_map_size(self.call_context.map(|ctx| &ctx.values))
+            + trailing
     }
 }
 
@@ -554,6 +577,14 @@ mod tests {
         args: &'a [(i32, &'a IgniteValue)],
         call_context: Option<&'a ServiceCallContext>,
     ) -> ServiceInvokeRequest<'a> {
+        build_request_with_caps(args, call_context, true)
+    }
+
+    fn build_request_with_caps<'a>(
+        args: &'a [(i32, &'a IgniteValue)],
+        call_context: Option<&'a ServiceCallContext>,
+        callctx_feature_supported: bool,
+    ) -> ServiceInvokeRequest<'a> {
         ServiceInvokeRequest {
             service_name: "svc".to_string(),
             timeout_ms: 0,
@@ -561,6 +592,7 @@ mod tests {
             method_name: "m".to_string(),
             args,
             call_context,
+            callctx_feature_supported,
         }
     }
 
@@ -680,6 +712,61 @@ mod tests {
         use crate::utils::string_to_java_hashcode;
         assert_eq!(param_type_id("int"), string_to_java_hashcode("int"));
         assert_eq!(param_type_id("long"), string_to_java_hashcode("long"));
+    }
+
+    /// FND-047: The trailing `callAttrs` map must NOT be written when
+    /// `callAttrs is None` AND the `SERVICE_INVOKE_CALLCTX` feature bit is
+    /// not negotiated. Java gates on `callAttrs != null ||
+    /// protocolCtx.isFeatureSupported(SERVICE_INVOKE_CALLCTX)`.
+    #[test]
+    fn callctx_field_is_omitted_when_feature_not_negotiated() {
+        let req = build_request_with_caps(&[], None, false);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // Layout: typed svc (8) + flags (1) + timeout (8) + nodeCount (4)
+        //       + typed method (6) + arg_count (4) = 31.
+        let expected_end = 1 + 4 + "svc".len() + 1 + 8 + 4 + 1 + 4 + "m".len() + 4;
+        assert_eq!(
+            buf.len(),
+            expected_end,
+            "no trailing bytes — callctx field omitted"
+        );
+        // size() must agree.
+        assert_eq!(req.size(), buf.len());
+    }
+
+    /// FND-047 paired: when the feature bit IS negotiated and callAttrs is
+    /// null, Java writes `writeMap(null)` which serializes a null sentinel.
+    /// The Rust implementation writes `i32 -1` — legacy behavior preserved.
+    /// What matters for this test is the field is PRESENT (not absent).
+    #[test]
+    fn callctx_field_is_present_when_feature_negotiated() {
+        let req = build_request_with_caps(&[], None, true);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let prefix_len = 1 + 4 + "svc".len() + 1 + 8 + 4 + 1 + 4 + "m".len() + 4;
+        assert!(
+            buf.len() > prefix_len,
+            "trailing callctx field must be present when SERVICE_INVOKE_CALLCTX negotiated"
+        );
+        assert_eq!(req.size(), buf.len());
+    }
+
+    /// FND-047: callAttrs explicitly supplied by the caller must be written
+    /// regardless of the feature bit — Java's `ClientServicesImpl.java:401`
+    /// writes the map whenever `callAttrs != null`.
+    #[test]
+    fn callctx_field_is_written_when_context_supplied() {
+        let ctx = ServiceCallContext::new().with_attribute("k", "v");
+        let req = build_request_with_caps(&[], Some(&ctx), false);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let prefix_len = 1 + 4 + "svc".len() + 1 + 8 + 4 + 1 + 4 + "m".len() + 4;
+        assert!(buf.len() > prefix_len, "call context map must be written");
+        assert_eq!(req.size(), buf.len());
     }
 
     /// FND-048 (overload dispatch): sending `process` with `Int(7)` should

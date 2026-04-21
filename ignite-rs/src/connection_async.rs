@@ -70,6 +70,10 @@ pub(crate) struct ConnectionCapabilities {
     /// Java `ProtocolBitmaskFeature.INDEX_QUERY_LIMIT` (bit 15). Gates emission
     /// of `IndexQuery.limit` in the `QUERY_INDEX` request (§5.4).
     pub(crate) index_query_limit: bool,
+    /// Java `ProtocolBitmaskFeature.SERVICE_INVOKE_CALLCTX` (bit 10). Gates
+    /// emission of the trailing `callAttrs` map in `SERVICE_INVOKE` (§7.1,
+    /// FND-047). When not negotiated, the map field is omitted entirely.
+    pub(crate) service_invoke_callctx: bool,
     /// Java `ProtocolVersionFeature.TRANSACTIONS` (V1_5_0+). Gate for tx_start.
     pub(crate) transactions: bool,
 }
@@ -425,6 +429,10 @@ where
                 ),
                 query_initiator_id: feature_supported(&features, FEATURE_QRY_INITIATOR_ID),
                 index_query_limit: feature_supported(&features, FEATURE_INDEX_QUERY_LIMIT),
+                service_invoke_callctx: feature_supported(
+                    &features,
+                    FEATURE_SERVICE_INVOKE_CALLCTX,
+                ),
                 transactions: version_supports_transactions(V_MAJOR, V_MINOR, V_PATCH),
             };
             let server_node_id = if capabilities.partition_awareness {

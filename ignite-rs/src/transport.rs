@@ -278,6 +278,10 @@ impl Channel {
         self.metadata.capabilities.index_query_limit
     }
 
+    fn supports_service_invoke_callctx(&self) -> bool {
+        self.metadata.capabilities.service_invoke_callctx
+    }
+
     fn supports_transactions(&self) -> bool {
         self.metadata.capabilities.transactions
     }
@@ -661,6 +665,14 @@ pub(crate) struct IndexQueryCapabilities {
     /// must omit the `limit` field — Java `TcpClientCache.indexQuery` gates on
     /// this bit and throws rather than emit it.
     pub(crate) index_query_limit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ServiceInvokeCapabilities {
+    /// Server advertises `SERVICE_INVOKE_CALLCTX` (bit 10). When false, the
+    /// `SERVICE_INVOKE` writer must omit the trailing `callAttrs` map field
+    /// entirely — see `ClientServicesImpl.java:401-404@2.17.0`. FND-047.
+    pub(crate) service_invoke_callctx: bool,
 }
 
 impl ChannelManager {
@@ -1607,6 +1619,13 @@ impl ChannelManager {
         let channel = self.default_channel().await;
         IndexQueryCapabilities {
             index_query_limit: channel.supports_index_query_limit(),
+        }
+    }
+
+    pub(crate) async fn service_invoke_capabilities(&self) -> ServiceInvokeCapabilities {
+        let channel = self.default_channel().await;
+        ServiceInvokeCapabilities {
+            service_invoke_callctx: channel.supports_service_invoke_callctx(),
         }
     }
 
