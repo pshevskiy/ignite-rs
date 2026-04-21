@@ -86,10 +86,10 @@ impl JavaDriver {
     }
 
     pub async fn shutdown(mut self) {
-        // Close stdin so the driver's read loop terminates naturally.
-        {
-            let _ = self.stdin.lock().await.shutdown().await;
-        }
+        // Kill the child — simpler than waiting for a clean stdin close.
+        // Tests don't need to measure driver shutdown cleanliness; they
+        // just need the subprocess to exit so the test can return.
+        let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
 }
