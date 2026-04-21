@@ -1,6 +1,6 @@
 use crate::api::key_value::{cache_info_size, write_cache_info, CacheInfo};
 use crate::protocol::complex_obj::IgniteValue;
-use crate::protocol::{write_bool, write_i32, write_null};
+use crate::protocol::{write_bool, write_i32, write_null, write_string_type_code};
 use crate::{WritableType, WriteableReq};
 use std::io::{self, Write};
 
@@ -252,12 +252,15 @@ impl<'a> WriteableReq for IndexQueryRequest<'a> {
         // limit (optional, written unconditionally for simplicity — server ignores if unsupported)
         write_i32(writer, self.query.limit.unwrap_or(0))?;
 
-        // value type name
-        crate::protocol::write_string(writer, &self.query.value_type)?;
+        // FND-033: Java writes `valueType` via `BinaryWriterExImpl.writeString`,
+        // which emits `[STRING_CODE=9, i32 len, bytes]`. The server decodes the
+        // leading byte as a TypeCode, so the raw-length form misaligns the frame.
+        write_string_type_code(writer, &self.query.value_type)?;
 
-        // index name (nullable)
+        // FND-033: `indexName` is nullable in Java; null → single NULL type-code
+        // byte, non-null → typed string.
         match &self.query.index_name {
-            Some(name) => crate::protocol::write_string(writer, name)?,
+            Some(name) => write_string_type_code(writer, name)?,
             None => write_null(writer)?,
         }
 
@@ -286,10 +289,11 @@ impl<'a> WriteableReq for IndexQueryRequest<'a> {
         let partition_sz = 4; // partition
         let limit_sz = 4; // limit
 
-        let value_type_sz = 4 + self.query.value_type.len();
+        // Typed string: 1-byte type code + i32 length + bytes.
+        let value_type_sz = 1 + 4 + self.query.value_type.len();
         let index_name_sz = match &self.query.index_name {
-            Some(name) => 4 + name.len(),
-            None => 1, // null
+            Some(name) => 1 + 4 + name.len(),
+            None => 1, // NULL type code
         };
 
         let criteria_sz = if self.query.criteria.is_empty() {
@@ -319,6 +323,62 @@ mod tests {
     use super::*;
     use crate::api::key_value::CacheInfo;
     use crate::protocol::complex_obj::IgniteValue;
+    use crate::protocol::TypeCode;
+
+    const TYPE_CODE_STRING: u8 = TypeCode::String as u8;
+    const TYPE_CODE_NULL: u8 = TypeCode::Null as u8;
+
+    /// FND-033: Java `w.writeString(valueType)` emits `[STRING_CODE, i32 len, bytes]`.
+    #[test]
+    fn value_type_is_typed_string() {
+        let query = IndexQuery::new("Person");
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // cache_info (4+1) + page_size (4) + local (1) + partition (4) + limit (4) = 18
+        let offset = 18;
+        assert_eq!(buf[offset], TYPE_CODE_STRING, "valueType missing STRING type code");
+        let len = i32::from_le_bytes(buf[offset + 1..offset + 5].try_into().unwrap());
+        assert_eq!(len as usize, "Person".len());
+        assert_eq!(&buf[offset + 5..offset + 5 + "Person".len()], b"Person");
+    }
+
+    /// FND-033: `indexName` when Some is a typed string.
+    #[test]
+    fn index_name_some_is_typed_string() {
+        let query = IndexQuery::new("Person").with_index_name("idx_name");
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // 18 + typed-string valueType (1+4+6) = 29
+        let offset = 18 + 1 + 4 + "Person".len();
+        assert_eq!(buf[offset], TYPE_CODE_STRING);
+        let len = i32::from_le_bytes(buf[offset + 1..offset + 5].try_into().unwrap());
+        assert_eq!(len as usize, "idx_name".len());
+    }
+
+    /// FND-033: `indexName` when None is a single NULL type code byte.
+    #[test]
+    fn index_name_none_is_null_type_code() {
+        let query = IndexQuery::new("Person");
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let offset = 18 + 1 + 4 + "Person".len();
+        assert_eq!(buf[offset], TYPE_CODE_NULL);
+    }
 
     #[test]
     fn should_encode_basic_index_query() {
