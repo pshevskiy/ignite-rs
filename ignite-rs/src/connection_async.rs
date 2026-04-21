@@ -702,18 +702,53 @@ fn read_typed_uuid_string(reader: &mut impl io::Read) -> IgniteResult<String> {
     }
 }
 
+/// PFND-002: manually format the 128-bit UUID into a pre-sized String
+/// buffer to avoid the two realloc-and-grow passes that `format!` performs
+/// for a 36-byte output. The result is always exactly 36 ASCII bytes.
 pub(crate) fn read_uuid_string(reader: &mut impl io::Read) -> IgniteResult<String> {
     let most = read_i64(reader)? as u64;
     let least = read_i64(reader)? as u64;
 
-    Ok(format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (most >> 32) as u32,
-        ((most >> 16) & 0xffff) as u16,
-        (most & 0xffff) as u16,
-        (least >> 48) as u16,
-        least & 0x0000_ffff_ffff_ffff,
-    ))
+    // Pre-size to the exact output length (36 = 8+1+4+1+4+1+4+1+12).
+    let mut s = String::with_capacity(36);
+    // SAFETY: we only append ASCII bytes through write_hex_u32/u16/u48.
+    unsafe {
+        let buf = s.as_mut_vec();
+        write_hex_u32(buf, (most >> 32) as u32);
+        buf.push(b'-');
+        write_hex_u16(buf, ((most >> 16) & 0xffff) as u16);
+        buf.push(b'-');
+        write_hex_u16(buf, (most & 0xffff) as u16);
+        buf.push(b'-');
+        write_hex_u16(buf, (least >> 48) as u16);
+        buf.push(b'-');
+        write_hex_u48(buf, least & 0x0000_ffff_ffff_ffff);
+    }
+    debug_assert_eq!(s.len(), 36);
+    Ok(s)
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+#[inline]
+fn write_hex_u32(buf: &mut Vec<u8>, v: u32) {
+    for shift in (0..32).step_by(4).rev() {
+        buf.push(HEX[((v >> shift) & 0xf) as usize]);
+    }
+}
+
+#[inline]
+fn write_hex_u16(buf: &mut Vec<u8>, v: u16) {
+    for shift in (0..16).step_by(4).rev() {
+        buf.push(HEX[((v >> shift) & 0xf) as usize]);
+    }
+}
+
+#[inline]
+fn write_hex_u48(buf: &mut Vec<u8>, v: u64) {
+    for shift in (0..48).step_by(4).rev() {
+        buf.push(HEX[((v >> shift) & 0xf) as usize]);
+    }
 }
 
 #[cfg(test)]
