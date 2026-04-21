@@ -776,6 +776,20 @@ impl ReadableType for ComplexObject {
                             }
                             IgniteValue::Array(items)
                         }
+                        TypeCode::ArrEnum => {
+                            // Java §2.1 ENUM_ARR: i32 componentTypeId; i32 length;
+                            // length × (code + body). Any element may be NULL.
+                            let _component_type_id = read_i32(&mut remainder)?;
+                            let len = read_i32(&mut remainder)?;
+                            let mut items = Vec::with_capacity(len.max(0) as usize);
+                            for _ in 0..len {
+                                let item = ComplexObject::read(&mut remainder)?
+                                    .map(flatten_complex_value)
+                                    .unwrap_or(IgniteValue::Null);
+                                items.push(item);
+                            }
+                            IgniteValue::Array(items)
+                        }
                         TypeCode::OptimizedMarshaller => {
                             // JDK-serialized opaque object — preserve as OpaqueMarshal so a
                             // subsequent write round-trips with the same TypeCode byte. Losing
@@ -1193,6 +1207,81 @@ mod tests {
     use super::*;
     use crate::protocol::complex_obj::ComplexObject;
     use std::convert::TryInto;
+
+    /// FND-013: Java §2.1 `ENUM_ARR = 29 (0x1D)` — `i32 componentTypeId; i32 length;
+    /// length × (code + body)`. Previously fell through to `Unknown type: ArrEnum`.
+    #[test]
+    fn arr_enum_field_decodes_as_array_of_enums() {
+        // ComplexObject with one field `e: Enum[]` containing two enums:
+        //   (typeId=0xAABBCCDD, ordinal=1), (typeId=0xAABBCCDD, ordinal=2)
+        // Wire layout for the field:
+        //   0x1D (ArrEnum) + componentTypeId(i32) + length(i32) + elements
+        //   element: 0x1C (Enum) + typeId(i32) + ordinal(i32)
+        let mut field_bytes: Vec<u8> = Vec::new();
+        field_bytes.push(TypeCode::ArrEnum as u8);
+        field_bytes.extend_from_slice(&0xAABBCCDDu32.to_le_bytes()); // componentTypeId
+        field_bytes.extend_from_slice(&2i32.to_le_bytes()); // length
+        // element 0
+        field_bytes.push(TypeCode::Enum as u8);
+        field_bytes.extend_from_slice(&0xAABBCCDDu32.to_le_bytes());
+        field_bytes.extend_from_slice(&1i32.to_le_bytes());
+        // element 1
+        field_bytes.push(TypeCode::Enum as u8);
+        field_bytes.extend_from_slice(&0xAABBCCDDu32.to_le_bytes());
+        field_bytes.extend_from_slice(&2i32.to_le_bytes());
+
+        // Wrap in a ComplexObject with 1 field. Build header + footer.
+        // Field data bytes, then schema: field_id(i32)=0xDEAD + offset(i32)=24.
+        let data_len = field_bytes.len() as i32;
+        let footer_start_abs = COMPLEX_OBJ_HEADER_LEN + data_len; // abs offset from type code
+        let schema_entry = {
+            let mut s = Vec::new();
+            s.extend_from_slice(&0x0000DEADi32.to_le_bytes()); // field_id
+            s.extend_from_slice(&(COMPLEX_OBJ_HEADER_LEN).to_le_bytes()); // offset within obj
+            s
+        };
+        let total_len = footer_start_abs + schema_entry.len() as i32;
+        let mut obj_bytes: Vec<u8> = Vec::new();
+        obj_bytes.push(TypeCode::ComplexObj as u8);
+        obj_bytes.push(1u8); // version
+        let flags: u16 = FLAG_HAS_SCHEMA | FLAG_USER_TYPE;
+        obj_bytes.extend_from_slice(&flags.to_le_bytes());
+        obj_bytes.extend_from_slice(&0x12345678i32.to_le_bytes()); // type_id
+        obj_bytes.extend_from_slice(&0i32.to_le_bytes()); // hash (arbitrary)
+        obj_bytes.extend_from_slice(&total_len.to_le_bytes());
+        obj_bytes.extend_from_slice(&0i32.to_le_bytes()); // schema_id (arbitrary)
+        obj_bytes.extend_from_slice(&footer_start_abs.to_le_bytes());
+        obj_bytes.extend_from_slice(&field_bytes);
+        obj_bytes.extend_from_slice(&schema_entry);
+
+        let mut cur = Cursor::new(obj_bytes);
+        let code = read_u8(&mut cur).unwrap();
+        let obj = ComplexObject::read_unwrapped(code.try_into().unwrap(), &mut cur)
+            .expect("ArrEnum must decode")
+            .unwrap();
+
+        assert_eq!(obj.values.len(), 1);
+        match &obj.values[0] {
+            IgniteValue::Array(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0],
+                    IgniteValue::Enum(Enum {
+                        type_id: 0xAABBCCDDu32 as i32,
+                        ordinal: 1
+                    })
+                );
+                assert_eq!(
+                    items[1],
+                    IgniteValue::Enum(Enum {
+                        type_id: 0xAABBCCDDu32 as i32,
+                        ordinal: 2
+                    })
+                );
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_round_trip() {
