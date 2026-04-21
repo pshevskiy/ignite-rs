@@ -94,6 +94,11 @@ pub(crate) enum OpCode {
     ClusterGroupGetNodeIds = 5100,
     ClusterGroupGetNodeInfo = 5101,
     ClusterGroupGetNodeEndpoints = 5102,
+    /// Gridgain-downstream extension (not in Java 2.17.0's cluster-group op
+    /// range 5100-5102). Issued only when the DC-aware feature bit (22) was
+    /// negotiated in the handshake — see FEATURE_DC_AWARE gating in
+    /// `transport.rs::refresh_dc_nodes` and `connection_async.rs` FND-005.
+    /// A stock 2.17.0 server responds with `INVALID_OP_CODE(2)`.
     ClusterGetDataCenterNodes = 5103,
     ComputeTaskExecute = 6000,
     ComputeTaskFinished = 6001,
@@ -179,6 +184,17 @@ mod tests {
         assert!(
             !JAVA_2_17_0_OPCODES.contains(&add_data),
             "DataStreamerAddData (8001) is a Gridgain-downstream extension, not Java 2.17.0"
+        );
+    }
+
+    /// FND-004: `ClusterGetDataCenterNodes` (5103) is a Gridgain-downstream
+    /// extension, not in Java 2.17.0 (cluster-group ops stop at 5102).
+    #[test]
+    fn opcode_cluster_get_dc_nodes_is_not_java_2_17_0() {
+        let code: i16 = OpCode::ClusterGetDataCenterNodes.into();
+        assert!(
+            !JAVA_2_17_0_OPCODES.contains(&code),
+            "ClusterGetDataCenterNodes (5103) is a Gridgain-downstream extension, not Java 2.17.0"
         );
     }
 
