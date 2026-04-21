@@ -452,6 +452,10 @@ impl Channel {
         self.metadata.capabilities.execute_task_by_name
     }
 
+    fn supports_cluster_groups(&self) -> bool {
+        self.metadata.capabilities.cluster_groups
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2052,6 +2056,14 @@ impl ChannelManager {
         self.default_channel()
             .await
             .supports_execute_task_by_name()
+    }
+
+    /// True if the default channel negotiated `CLUSTER_GROUPS` (bit 4).
+    /// Required to send `CLUSTER_GROUP_GET_NODE_IDS` /
+    /// `CLUSTER_GROUP_GET_NODE_INFO` (`ClientClusterGroupImpl.java:306,
+    /// 384@2.17.0`).
+    pub(crate) async fn supports_cluster_groups(&self) -> bool {
+        self.default_channel().await.supports_cluster_groups()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {

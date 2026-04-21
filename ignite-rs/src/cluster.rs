@@ -344,6 +344,15 @@ impl ClusterGroup {
 
 impl ClusterCore {
     async fn request_node_ids(&self) -> IgniteResult<Vec<String>> {
+        // FND gate: Java `ClientClusterGroupImpl.requestNodeIds` throws
+        // `ClientFeatureNotSupportedByServerException` when `CLUSTER_GROUPS`
+        // (bit 4) is not negotiated
+        // (`ClientClusterGroupImpl.java:306-307@2.17.0`).
+        if !self.exec.supports_cluster_groups().await {
+            return Err(IgniteError::from(
+                "CLUSTER_GROUPS is not supported by the server",
+            ));
+        }
         let cached_topology_version = self.cache.lock().await.topology_version.unwrap_or(0);
         let response: NodeIdsResponse = self
             .exec
@@ -379,6 +388,15 @@ impl ClusterCore {
         };
 
         if !missing_ids.is_empty() {
+            // FND gate: Java `ClientClusterGroupImpl.requestNodesByIds` throws
+            // `ClientFeatureNotSupportedByServerException` when `CLUSTER_GROUPS`
+            // (bit 4) is not negotiated
+            // (`ClientClusterGroupImpl.java:384-385@2.17.0`).
+            if !self.exec.supports_cluster_groups().await {
+                return Err(IgniteError::from(
+                    "CLUSTER_GROUPS is not supported by the server",
+                ));
+            }
             let response: NodeInfoResponse = self
                 .exec
                 .send_and_read(
