@@ -181,17 +181,34 @@ impl Drop for Transaction {
         }
 
         let inner = self.inner.clone();
+        // FND-031: If the Tokio runtime is gone we cannot spawn the async
+        // rollback. Without warning, the server-side tx silently leaks until
+        // timeout. Surface it so operators notice the orphaned tx.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // Best-effort non-blocking state read. If the lock is contended
+            // we cannot know whether rollback is needed, so warn anyway.
+            let was_active = inner
+                .state
+                .try_lock()
+                .map(|guard| matches!(*guard, TransactionState::Active))
+                .unwrap_or(true);
+            if was_active {
+                eprintln!(
+                    "ignite-rs: Transaction {} dropped outside a Tokio runtime; \
+                     server-side rollback skipped and tx will leak until timeout",
+                    inner.tx_id,
+                );
+            }
             return;
         };
 
         handle.spawn(async move {
-            let should_rollback = matches!(*inner.state.lock().await, TransactionState::Active);
-            if !should_rollback {
+            // Serialise with explicit commit/rollback so we don't double-emit.
+            let mut state = inner.state.lock().await;
+            if !matches!(*state, TransactionState::Active) {
                 return;
             }
-
-            *inner.state.lock().await = TransactionState::RolledBack;
+            *state = TransactionState::RolledBack;
             let _ = inner
                 .exec
                 .send_with_route(
