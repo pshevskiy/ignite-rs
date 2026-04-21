@@ -150,6 +150,10 @@ impl TokioExec {
         self.transport.supports_cache_invoke().await
     }
 
+    pub(crate) async fn supports_execute_task_by_name(&self) -> bool {
+        self.transport.supports_execute_task_by_name().await
+    }
+
     pub(crate) fn register_cache_listener_name(
         &self,
         cache_id: i32,

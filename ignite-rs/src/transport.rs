@@ -448,6 +448,10 @@ impl Channel {
         self.metadata.capabilities.index_query
     }
 
+    fn supports_execute_task_by_name(&self) -> bool {
+        self.metadata.capabilities.execute_task_by_name
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2039,6 +2043,15 @@ impl ChannelManager {
     /// (`TcpClientCache.java:964-965@2.17.0`).
     pub(crate) async fn supports_cache_invoke(&self) -> bool {
         self.default_channel().await.supports_cache_invoke()
+    }
+
+    /// True if the default channel negotiated `EXECUTE_TASK_BY_NAME` (bit 1).
+    /// Required to send `COMPUTE_TASK_EXECUTE`
+    /// (`ClientComputeImpl.java:284@2.17.0`).
+    pub(crate) async fn supports_execute_task_by_name(&self) -> bool {
+        self.default_channel()
+            .await
+            .supports_execute_task_by_name()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {

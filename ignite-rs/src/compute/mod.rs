@@ -138,6 +138,15 @@ impl Compute {
         task_name: &str,
         arg: Option<&A>,
     ) -> IgniteResult<ComputeTask<R>> {
+        // FND gate: Java `ClientComputeImpl.writeExecuteTaskRequest` throws
+        // `ClientFeatureNotSupportedByServerException` when
+        // `EXECUTE_TASK_BY_NAME` (bit 1) is not negotiated
+        // (`ClientComputeImpl.java:284-287@2.17.0`).
+        if !self.exec.supports_execute_task_by_name().await {
+            return Err(IgniteError::from(
+                "Compute grid functionality for thin client is not supported by the server",
+            ));
+        }
         let cluster_node_ids = self.cluster_group.node_ids().await?;
         if cluster_node_ids.is_empty() {
             return Err(IgniteError::from("Cluster group is empty."));

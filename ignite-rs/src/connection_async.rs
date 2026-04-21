@@ -97,6 +97,11 @@ pub(crate) struct ConnectionCapabilities {
     /// INDEX_QUERY_LIMIT (bit 15), which controls whether the trailing
     /// `limit` field is emitted.
     pub(crate) index_query: bool,
+    /// Java `ProtocolBitmaskFeature.EXECUTE_TASK_BY_NAME` (bit 1). Required to
+    /// send `COMPUTE_TASK_EXECUTE`; Java throws
+    /// `ClientFeatureNotSupportedByServerException` when absent
+    /// (`ClientComputeImpl.java:284-287@2.17.0`).
+    pub(crate) execute_task_by_name: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -477,6 +482,10 @@ where
                 ),
                 cache_invoke: feature_supported(&features, FEATURE_CACHE_INVOKE),
                 index_query: feature_supported(&features, FEATURE_INDEX_QUERY),
+                execute_task_by_name: feature_supported(
+                    &features,
+                    FEATURE_EXECUTE_TASK_BY_NAME,
+                ),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)
