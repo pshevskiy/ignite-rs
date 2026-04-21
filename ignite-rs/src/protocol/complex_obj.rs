@@ -33,7 +33,12 @@ pub enum IgniteValue {
     Array(Vec<IgniteValue>),
     Enum(Enum),
     Timestamp(i64, i32), // milliseconds since 1 Jan 1970 UTC, Nanosecond fraction of a millisecond.
-    Decimal(i32, Vec<u8>), // scale, big int value in bytes
+    /// `(scale, magnitude)` — unscaled big-integer bytes in Java's
+    /// `BigInteger.toByteArray()` convention (two's-complement big-endian, with
+    /// sign stored in the top bit of the first byte). Callers constructing a
+    /// negative decimal must encode the magnitude using Java's convention, not
+    /// raw unsigned magnitude — see `IgniteValue::decimal_from_signed_i128`.
+    Decimal(i32, Vec<u8>),
     Null,
     /// Map: (map_subtype, entries). Subtype: 1=HashMap, 2=LinkedHashMap.
     Map(u8, Vec<(IgniteValue, IgniteValue)>),
@@ -401,6 +406,48 @@ impl WritableType for IgniteValue {
 }
 
 impl IgniteValue {
+    /// Construct an `IgniteValue::Decimal` from a signed 128-bit unscaled value and
+    /// a scale. Encodes the magnitude using Java's `BigInteger.toByteArray()`
+    /// convention (two's-complement big-endian) so that the value round-trips
+    /// byte-identically with a Java client reading the same bytes.
+    ///
+    /// The conversion mirrors `java.math.BigInteger.toByteArray`:
+    /// - Positive values are encoded as minimal big-endian bytes, with a leading
+    ///   `0x00` prepended if the top bit of the first byte would otherwise be set.
+    /// - Negative values are encoded as the minimal two's-complement big-endian
+    ///   bytes, with a leading `0xFF` prepended if the top bit of the first byte
+    ///   would otherwise be clear.
+    /// - Zero is encoded as a single `0x00` byte.
+    pub fn decimal_from_signed_i128(unscaled: i128, scale: i32) -> Self {
+        if unscaled == 0 {
+            return IgniteValue::Decimal(scale, vec![0]);
+        }
+        let bytes = unscaled.to_be_bytes();
+        if unscaled > 0 {
+            // Trim leading zero bytes, but keep a leading 0x00 if next byte has
+            // its sign bit set (so the value isn't mistaken for negative).
+            let mut start = 0usize;
+            while start < 15 && bytes[start] == 0 {
+                start += 1;
+            }
+            if bytes[start] & 0x80 != 0 && start > 0 {
+                start -= 1;
+            }
+            IgniteValue::Decimal(scale, bytes[start..].to_vec())
+        } else {
+            // Trim leading 0xFF bytes, but keep a leading 0xFF if next byte has
+            // its sign bit clear (so the value isn't mistaken for positive).
+            let mut start = 0usize;
+            while start < 15 && bytes[start] == 0xFF {
+                start += 1;
+            }
+            if bytes[start] & 0x80 == 0 && start > 0 {
+                start -= 1;
+            }
+            IgniteValue::Decimal(scale, bytes[start..].to_vec())
+        }
+    }
+
     pub fn ignite_type(&self) -> IgniteType {
         match self {
             IgniteValue::Byte(_) => IgniteType::Byte,
@@ -1207,6 +1254,42 @@ mod tests {
     use super::*;
     use crate::protocol::complex_obj::ComplexObject;
     use std::convert::TryInto;
+
+    /// FND-015: Java's `BigInteger.toByteArray()` produces two's-complement
+    /// big-endian magnitude bytes. The Rust helper must match byte-for-byte
+    /// so a round-tripped decimal is interpreted identically on both sides.
+    #[test]
+    fn decimal_from_signed_matches_java_big_integer_to_byte_array() {
+        // Known Java BigInteger.toByteArray() values.
+        let cases: &[(i128, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (127, &[0x7F]),
+            (128, &[0x00, 0x80]),
+            (255, &[0x00, 0xFF]),
+            (256, &[0x01, 0x00]),
+            (-1, &[0xFF]),
+            (-128, &[0x80]),
+            (-129, &[0xFF, 0x7F]),
+            (-256, &[0xFF, 0x00]),
+        ];
+        for &(val, expected) in cases {
+            match IgniteValue::decimal_from_signed_i128(val, 0) {
+                IgniteValue::Decimal(scale, bytes) => {
+                    assert_eq!(scale, 0);
+                    assert_eq!(
+                        bytes.as_slice(),
+                        expected,
+                        "val {} produced {:02X?}, expected {:02X?}",
+                        val,
+                        bytes,
+                        expected
+                    );
+                }
+                other => panic!("expected Decimal, got {:?}", other),
+            }
+        }
+    }
 
     /// FND-013: Java §2.1 `ENUM_ARR = 29 (0x1D)` — `i32 componentTypeId; i32 length;
     /// length × (code + body)`. Previously fell through to `Unknown type: ArrEnum`.
