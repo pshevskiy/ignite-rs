@@ -59,7 +59,17 @@ pub enum TypeCode {
     ArrEnum = 29,
     BinaryEnum = 38,
     Null = 101,
+    /// Self-reference to a previously-written object by absolute offset.
+    /// Body: `i32 offset` into the enclosing stream. See Java §2.1.
+    Handle = 102,
     ComplexObj = 103,
+    /// `Class<?>` descriptor — body: `i32 typeId`.
+    Class = 32,
+    /// Java `Proxy` marker — platform-only, opaque body.
+    Proxy = 35,
+    /// Transformed wrapper — opaque (same round-trip discipline as
+    /// `OptimizedMarshaller`). Signed Java byte `-3` / `0xFD`.
+    Transformed = 253,
     /// Java optimized marshaller object (JDK-serialized, opaque to the thin client).
     OptimizedMarshaller = 254,
 }
@@ -104,8 +114,12 @@ impl TryFrom<u8> for TypeCode {
             24 => Ok(TypeCode::Collection),
             25 => Ok(TypeCode::Map),
             27 => Ok(TypeCode::WrappedData),
+            32 => Ok(TypeCode::Class),
+            35 => Ok(TypeCode::Proxy),
+            102 => Ok(TypeCode::Handle),
             103 => Ok(TypeCode::ComplexObj),
             101 => Ok(TypeCode::Null),
+            253 => Ok(TypeCode::Transformed),
             254 => Ok(TypeCode::OptimizedMarshaller),
             _ => Err(IgniteError::from(
                 format!("Cannot read TypeCode {}", value).as_str(),
@@ -355,4 +369,39 @@ pub fn write_enum(writer: &mut dyn Write, val: Enum) -> io::Result<()> {
 pub fn write_null(writer: &mut dyn Write) -> io::Result<()> {
     write_u8(writer, TypeCode::Null as u8)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Java §2.1: HANDLE = 102 (0x66). Previously rejected with
+    /// "Cannot read TypeCode 102", causing any response with a self-reference
+    /// to fail to decode.
+    #[test]
+    fn type_code_handle_0x66_decodes() {
+        assert_eq!(TypeCode::try_from(0x66u8).unwrap(), TypeCode::Handle);
+        assert_eq!(TypeCode::Handle as u8, 0x66);
+    }
+
+    /// Java §2.1: CLASS = 32 (0x20). Previously rejected.
+    #[test]
+    fn type_code_class_0x20_decodes() {
+        assert_eq!(TypeCode::try_from(0x20u8).unwrap(), TypeCode::Class);
+        assert_eq!(TypeCode::Class as u8, 0x20);
+    }
+
+    /// Java §2.1: PROXY = 35 (0x23). Previously rejected.
+    #[test]
+    fn type_code_proxy_0x23_decodes() {
+        assert_eq!(TypeCode::try_from(0x23u8).unwrap(), TypeCode::Proxy);
+        assert_eq!(TypeCode::Proxy as u8, 0x23);
+    }
+
+    /// Java §2.1: TRANSFORMED = −3 (0xFD). Previously rejected.
+    #[test]
+    fn type_code_transformed_0xfd_decodes() {
+        assert_eq!(TypeCode::try_from(0xFDu8).unwrap(), TypeCode::Transformed);
+        assert_eq!(TypeCode::Transformed as u8, 0xFD);
+    }
 }
