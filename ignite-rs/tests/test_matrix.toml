@@ -694,3 +694,23 @@ profile = "none"
 scope = "none"
 features = ["ssl"]
 serial = false
+
+# Tier-3 byte-fixture tests: pure bucket, no server needed. Run alongside
+# other pure-bucket tests.
+[[suite]]
+test = "byte_fixtures"
+bucket = "pure"
+profile = "none"
+scope = "none"
+features = []
+serial = false
+
+# Tier-2 cross-client parity tests: parity bucket. Needs a single-node
+# Ignite fixture + the Java parity driver JAR (xtask pre-flight builds it).
+[[suite]]
+test = "parity"
+bucket = "parity"
+profile = "single-node"
+scope = "cargo_session"
+features = []
+serial = true

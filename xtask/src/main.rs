@@ -33,7 +33,7 @@ fn parse_bucket_arg(args: &[String]) -> Result<Option<Bucket>> {
         [] => Ok(None),
         [flag, value] if flag == "--bucket" => Ok(Some(Bucket::parse(value)?)),
         _ => bail!(
-            "usage: test-matrix [--bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl>]"
+            "usage: test-matrix [--bucket <pure|single_node|cluster3|cluster3_churn|auth|ssl|parity>]"
         ),
     }
 }
@@ -110,6 +110,54 @@ fn load_matrix(workspace_root: &Path) -> Result<TestMatrix> {
     Ok(matrix)
 }
 
+fn build_parity_driver(workspace_root: &Path) -> Result<()> {
+    let driver_dir = workspace_root.join("tests/java-parity-driver");
+    if !driver_dir.exists() {
+        eprintln!(
+            "warning: parity driver dir {} missing — skipping JAR build",
+            driver_dir.display()
+        );
+        return Ok(());
+    }
+    // Is `mvn` available?
+    let mvn_probe = Command::new("mvn").arg("--version").output();
+    if mvn_probe.is_err() {
+        eprintln!(
+            "warning: `mvn` not found on PATH — skipping parity driver JAR build. \
+             Install Maven to exercise Tier-2 parity; tests detect missing JAR and skip."
+        );
+        return Ok(());
+    }
+    println!("==> pre-flight: building Java parity driver JAR");
+    let status = Command::new("mvn")
+        .arg("-q")
+        .arg("-e")
+        .arg("package")
+        .current_dir(&driver_dir)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("==> parity driver JAR built");
+            Ok(())
+        }
+        Ok(s) => {
+            eprintln!(
+                "warning: `mvn package` exited with {} — parity tests will skip. \
+                 Fix the JAR build to enable Tier-2.",
+                s
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: failed to start `mvn`: {} — parity tests will skip",
+                e
+            );
+            Ok(())
+        }
+    }
+}
+
 fn run_cargo_check(workspace_root: &Path) -> Result<()> {
     run_command(
         workspace_root,
@@ -179,6 +227,13 @@ fn run_bucket(workspace_root: &Path, matrix: &TestMatrix, bucket: Bucket) -> Res
             "bucket {} has no suites in the test matrix",
             bucket.as_str()
         );
+    }
+
+    // Pre-flight: the parity bucket requires the Java driver JAR. Build it
+    // via `mvn` before any test runs. If mvn is missing, print a skip note
+    // and continue — parity tests detect a missing JAR at runtime and skip.
+    if bucket == Bucket::Parity {
+        build_parity_driver(workspace_root)?;
     }
 
     let live_profiles = suites
@@ -646,10 +701,11 @@ enum Bucket {
     Cluster3Churn,
     Auth,
     Ssl,
+    Parity,
 }
 
 impl Bucket {
-    fn ordered() -> [Bucket; 6] {
+    fn ordered() -> [Bucket; 7] {
         [
             Bucket::Pure,
             Bucket::SingleNode,
@@ -657,6 +713,7 @@ impl Bucket {
             Bucket::Cluster3Churn,
             Bucket::Auth,
             Bucket::Ssl,
+            Bucket::Parity,
         ]
     }
 
@@ -668,6 +725,7 @@ impl Bucket {
             "cluster3_churn" => Ok(Bucket::Cluster3Churn),
             "auth" => Ok(Bucket::Auth),
             "ssl" => Ok(Bucket::Ssl),
+            "parity" => Ok(Bucket::Parity),
             other => bail!("unknown bucket: {other}"),
         }
     }
@@ -680,6 +738,7 @@ impl Bucket {
             Bucket::Cluster3Churn => "cluster3_churn",
             Bucket::Auth => "auth",
             Bucket::Ssl => "ssl",
+            Bucket::Parity => "parity",
         }
     }
 
