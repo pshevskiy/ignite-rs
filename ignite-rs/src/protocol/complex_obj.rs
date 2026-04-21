@@ -851,19 +851,22 @@ impl ReadableType for ComplexObject {
                         TypeCode::WrappedData => {
                             // `BINARY_OBJ` field-level wrapper — Java `BinaryWriterExImpl
                             // .writeBinaryObject`: `[type_code(1) | length(4) | bytes(length) |
-                            // start_offset(4)]`. Decode into an inner ComplexObject so field
-                            // access (`obj.field("...")`) works on the wrapped value.
+                            // start_offset(4)]`. Preserve the entire envelope verbatim via
+                            // `PreEncoded` so a re-encode of the surrounding object emits the
+                            // same BINARY_OBJ shape (I2 / REG-2 round-trip parity; FND-016).
+                            // The envelope has already had its leading TypeCode byte consumed;
+                            // re-prepend it so the PreEncoded bytes are ready to write as-is.
                             let len = read_i32(&mut remainder)? as usize;
                             let mut buf = vec![0u8; len];
                             remainder.read_exact(&mut buf)?;
-                            let start_offset = read_i32(&mut remainder)? as usize;
-                            let mut inner = Cursor::new(&buf[start_offset..]);
-                            let inner_type = TypeCode::try_from(read_u8(&mut inner)?)?;
-                            let inner_obj = ComplexObject::read_unwrapped(inner_type, &mut inner)?;
-                            match inner_obj {
-                                Some(obj) => IgniteValue::Object(Box::new(obj)),
-                                None => IgniteValue::Null,
-                            }
+                            let start_offset = read_i32(&mut remainder)?;
+                            let mut envelope =
+                                Vec::with_capacity(1 + 4 + len + 4);
+                            envelope.push(TypeCode::WrappedData as u8);
+                            envelope.extend_from_slice(&(len as i32).to_le_bytes());
+                            envelope.extend_from_slice(&buf);
+                            envelope.extend_from_slice(&start_offset.to_le_bytes());
+                            IgniteValue::PreEncoded(envelope)
                         }
                         _ => {
                             let msg = format!("Unknown type: {:?}", field_type);
@@ -1254,6 +1257,94 @@ mod tests {
     use super::*;
     use crate::protocol::complex_obj::ComplexObject;
     use std::convert::TryInto;
+
+    /// FND-016: a `ComplexObject` field typed `BinaryObject` on the Java side
+    /// is serialized via the `BINARY_OBJ` envelope (TypeCode 0x1B): `[0x1B |
+    /// i32 length | length bytes | i32 offset]`. Decoding and re-encoding the
+    /// surrounding object must preserve those envelope bytes verbatim — a
+    /// server reading the re-encoded field expects the same wrapper shape,
+    /// not a plain ComplexObj.
+    #[test]
+    fn wrapped_data_field_round_trips_byte_identically() {
+        // Build a minimal inner ComplexObject (a string "hi" in field "s")
+        let schema = ComplexObjectSchema {
+            type_name: "t.Inner".to_string(),
+            fields: vec![IgniteField {
+                name: "s".to_string(),
+                r#type: IgniteType::String,
+            }],
+        };
+        let inner = ComplexObject {
+            schema: Arc::new(schema),
+            values: vec![IgniteValue::String("hi".to_string())],
+        };
+        let mut inner_bytes = Vec::new();
+        inner.write(&mut inner_bytes).unwrap();
+
+        // Outer ComplexObject with one field: `w: BinaryObject` written as
+        // `[0x1B | i32 length | inner_bytes | i32 offset=0]`
+        let mut field_bytes: Vec<u8> = Vec::new();
+        field_bytes.push(TypeCode::WrappedData as u8);
+        field_bytes.extend_from_slice(&(inner_bytes.len() as i32).to_le_bytes());
+        field_bytes.extend_from_slice(&inner_bytes);
+        field_bytes.extend_from_slice(&0i32.to_le_bytes());
+
+        let data_len = field_bytes.len() as i32;
+        let footer_start_abs = COMPLEX_OBJ_HEADER_LEN + data_len;
+        let mut schema_entry = Vec::new();
+        schema_entry.extend_from_slice(&0x0000BEEFi32.to_le_bytes()); // field id
+        schema_entry.extend_from_slice(&(COMPLEX_OBJ_HEADER_LEN).to_le_bytes());
+        let total_len = footer_start_abs + schema_entry.len() as i32;
+
+        let mut wire: Vec<u8> = Vec::new();
+        wire.push(TypeCode::ComplexObj as u8);
+        wire.push(1u8); // version
+        let flags: u16 = FLAG_HAS_SCHEMA | FLAG_USER_TYPE;
+        wire.extend_from_slice(&flags.to_le_bytes());
+        wire.extend_from_slice(&0x01020304i32.to_le_bytes()); // type_id
+        wire.extend_from_slice(&0i32.to_le_bytes()); // hash
+        wire.extend_from_slice(&total_len.to_le_bytes());
+        wire.extend_from_slice(&0i32.to_le_bytes()); // schema_id
+        wire.extend_from_slice(&footer_start_abs.to_le_bytes());
+        wire.extend_from_slice(&field_bytes);
+        wire.extend_from_slice(&schema_entry);
+
+        // Decode the outer object.
+        let mut cur = Cursor::new(&wire);
+        let code = read_u8(&mut cur).unwrap();
+        let outer = ComplexObject::read_unwrapped(code.try_into().unwrap(), &mut cur)
+            .unwrap()
+            .unwrap();
+
+        // Re-encode; the wrapped-data field bytes must round-trip verbatim.
+        // To make this test order-independent, register the schema and write.
+        // We construct a new ComplexObject with the same schema metadata and
+        // decoded values (matching what a real caller would do).
+        let schema_out = Arc::new(ComplexObjectSchema {
+            type_name: "re.encoded.schema".to_string(),
+            fields: vec![IgniteField {
+                name: "w".to_string(),
+                r#type: IgniteType::Binary,
+            }],
+        });
+        let obj_out = ComplexObject {
+            schema: schema_out,
+            values: outer.values.clone(),
+        };
+        let mut re = Vec::new();
+        obj_out.write(&mut re).unwrap();
+
+        // Locate the re-encoded field bytes within `re` and assert they match
+        // the original wrapped-data field-bytes verbatim.
+        let found_offset = re
+            .windows(field_bytes.len())
+            .position(|w| w == field_bytes.as_slice());
+        assert!(
+            found_offset.is_some(),
+            "wrapped-data envelope not present verbatim in re-encoded bytes; re-encoded wire = {:02X?}",
+            re
+        );
+    }
 
     /// FND-015: Java's `BigInteger.toByteArray()` produces two's-complement
     /// big-endian magnitude bytes. The Rust helper must match byte-for-byte

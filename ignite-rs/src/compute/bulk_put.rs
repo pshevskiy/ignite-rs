@@ -880,11 +880,14 @@ mod tests {
             Some(IgniteValue::Int(v)) => assert_eq!(*v, 0),
             other => panic!("index: {:?}", other),
         }
-        // Nested BinaryObject lookups work — the `object` field should be
-        // Object-typed (either wrapped or flattened into its single primitive).
+        // `object` is written via `BINARY_OBJ` (WrappedData, TypeCode 0x1B).
+        // Post-FND-016 the envelope round-trips verbatim via `PreEncoded` so
+        // re-encoding preserves the server-expected wire shape.
         match obj.field("object") {
-            Some(IgniteValue::Object(_)) => {}
-            other => panic!("object: expected Object, got {:?}", other),
+            Some(IgniteValue::PreEncoded(bytes)) => {
+                assert_eq!(bytes[0], TypeCode::WrappedData as u8);
+            }
+            other => panic!("object: expected PreEncoded WrappedData envelope, got {:?}", other),
         }
         match obj.field("indexContext") {
             Some(IgniteValue::Object(_)) => {}
