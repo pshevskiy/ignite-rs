@@ -2084,27 +2084,26 @@ impl ChannelManager {
         Err(aggregate_connect_errors(errors))
     }
 
-    fn encode_request(
+    // FND-007: Java's `TcpClientChannel.java:394@2.17.0` back-patches the
+    // frame length (`req.writeInt(0, req.position() - 4)`) after writing
+    // the payload, so mismatches between `WriteableReq::size()` and actual
+    // written bytes can't corrupt the length prefix. Rust now mirrors
+    // Java: reserve 4 bytes up-front, write header and payload, then
+    // patch `buf.len() - 4` back at offset 0.
+    pub(super) fn encode_request(
         op_code: i16,
         corr_id: i64,
         payload: &impl WriteableReq,
     ) -> IgniteResult<Vec<u8>> {
         let mut buf = Vec::with_capacity(payload.size() + (REQ_HEADER_SIZE_BYTES as usize));
-        Self::write_req_header(&mut buf, payload.size(), op_code, corr_id)?;
+        // Reserve 4 bytes for length prefix (back-patched after write).
+        write_i32(&mut buf, 0)?;
+        write_i16(&mut buf, op_code)?;
+        write_i64(&mut buf, corr_id)?;
         payload.write(&mut buf).map_err(IgniteError::from)?;
+        let payload_len = (buf.len() - 4) as i32;
+        buf[..4].copy_from_slice(&payload_len.to_le_bytes());
         Ok(buf)
-    }
-
-    fn write_req_header(
-        writer: &mut dyn Write,
-        payload_len: usize,
-        op_code: i16,
-        corr_id: i64,
-    ) -> io::Result<()> {
-        write_i32(writer, payload_len as i32 + REQ_HEADER_SIZE_BYTES)?;
-        write_i16(writer, op_code)?;
-        write_i64(writer, corr_id)?;
-        Ok(())
     }
 }
 
@@ -2263,8 +2262,75 @@ fn is_read_only_op(op_code: i16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{initial_start_index, lowest_port_indices, NEXT_DEFAULT_START_INDEX};
+    use super::{
+        initial_start_index, lowest_port_indices, ChannelManager, NEXT_DEFAULT_START_INDEX,
+        REQ_HEADER_SIZE_BYTES,
+    };
+    use crate::WriteableReq;
+    use std::io::{self, Write};
     use std::sync::atomic::Ordering;
+
+    /// FND-007: Request frame's length prefix must be written as the actual
+    /// payload size, not `size()` estimate. Java's `TcpClientChannel.java:394@2.17.0`
+    /// back-patches `position - 4` after writing, so mismatches between
+    /// `size()` and `write()` can't corrupt the length prefix.
+    ///
+    /// This test constructs a payload whose `size()` lies (reports 3 but
+    /// writes 7 bytes). A correct implementation writes the length prefix
+    /// from the *actual* written bytes, so the receiver can parse the
+    /// frame. A lazy implementation using `size()` will emit the wrong
+    /// length prefix, and the server drops the frame.
+    struct LyingPayload;
+
+    impl WriteableReq for LyingPayload {
+        fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
+            writer.write_all(b"0123456") // 7 bytes
+        }
+
+        fn size(&self) -> usize {
+            3 // lies: claims 3, writes 7
+        }
+    }
+
+    #[test]
+    fn encode_request_backpatches_length_on_size_mismatch() {
+        let buf = ChannelManager::encode_request(0x42i16, 0x11_22_33_44_55_66_77_88i64, &LyingPayload)
+            .expect("encode");
+        // Frame layout:
+        //   [0..4]  i32 length (should equal buf.len() - 4 per Java)
+        //   [4..6]  i16 op_code
+        //   [6..14] i64 corr_id
+        //   [14..]  payload
+        let written_len = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let header_and_payload = (buf.len() - 4) as i32;
+        assert_eq!(
+            written_len, header_and_payload,
+            "length prefix must match actual bytes written after the prefix \
+             (Java TcpClientChannel.java:394 back-patches `position - 4`)"
+        );
+        assert_eq!(
+            written_len,
+            REQ_HEADER_SIZE_BYTES + 7,
+            "op_code (2) + corr_id (8) + 7 payload bytes = 10 + 7 = 17"
+        );
+    }
+
+    #[test]
+    fn encode_request_backpatches_length_on_size_match() {
+        // Baseline: when size() is honest, the length is still right.
+        struct HonestPayload;
+        impl WriteableReq for HonestPayload {
+            fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
+                writer.write_all(b"abc")
+            }
+            fn size(&self) -> usize {
+                3
+            }
+        }
+        let buf = ChannelManager::encode_request(0x01i16, 42i64, &HonestPayload).expect("encode");
+        let written_len = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(written_len, (buf.len() - 4) as i32);
+    }
 
     /// Migrated from Apache Ignite `ReliableChannelTest.testDefaultChannelBalancing`:
     /// <https://github.com/apache/ignite/blob/ignite-2.15.0/modules/core/src/test/java/org/apache/ignite/internal/client/thin/ReliableChannelTest.java#L95-L118>
