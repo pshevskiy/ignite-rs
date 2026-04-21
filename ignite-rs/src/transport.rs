@@ -1643,6 +1643,13 @@ impl ChannelManager {
         self.default_channel().await.supports_transactions()
     }
 
+    /// True if the default channel negotiated `FORCE_DEACTIVATION_FLAG` (bit 19).
+    /// Gates the trailing `bool forceDeactivation` on `CLUSTER_CHANGE_STATE`
+    /// (Java §9, FND-056).
+    pub(crate) async fn supports_force_deactivation_flag(&self) -> bool {
+        self.default_channel().await.supports_force_deactivation_flag()
+    }
+
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {
         let channel = {
             let _connect_guard = self.channel_connect_guard.lock().await;

@@ -119,6 +119,15 @@ impl Cluster {
         state: ClusterState,
         force_deactivation: bool,
     ) -> IgniteResult<()> {
+        let supports_force_deactivation_flag = self.core.exec.supports_force_deactivation_flag().await;
+        // Java 2.17.0 rejects `forceDeactivation=false` when the bit is absent
+        // (`ClientClusterImpl.java:87-91`). Preserve the same semantics so
+        // downstream users get a clear error instead of a silently-dropped flag.
+        if !supports_force_deactivation_flag && !force_deactivation {
+            return Err(IgniteError::from(
+                "Force deactivation flag is not supported by the server",
+            ));
+        }
         self.core
             .exec
             .send(
@@ -126,6 +135,7 @@ impl Cluster {
                 ClusterChangeStateRequest {
                     state,
                     force_deactivation,
+                    supports_force_deactivation_flag,
                 },
             )
             .await
@@ -473,17 +483,29 @@ impl WriteableReq for EmptyRequest {
 struct ClusterChangeStateRequest {
     state: ClusterState,
     force_deactivation: bool,
+    /// True when the channel negotiated `FORCE_DEACTIVATION_FLAG` (bit 19).
+    /// Java 2.17.0's `ClientClusterImpl.state@85-91` omits the trailing
+    /// `forceDeactivation` bool when the bit is absent, and rejects any
+    /// `forceDeactivation=false` request client-side. Mirrors that gate here
+    /// (FND-056).
+    supports_force_deactivation_flag: bool,
 }
 
 impl WriteableReq for ClusterChangeStateRequest {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
         crate::protocol::write_u8(writer, self.state as u8)?;
-        write_bool(writer, self.force_deactivation)?;
+        if self.supports_force_deactivation_flag {
+            write_bool(writer, self.force_deactivation)?;
+        }
         Ok(())
     }
 
     fn size(&self) -> usize {
-        2
+        1 + if self.supports_force_deactivation_flag {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -622,14 +644,34 @@ mod tests {
         bytes
     }
 
+    /// FND-056 — When `FORCE_DEACTIVATION_FLAG` (bit 19) is negotiated, the
+    /// request writes `state` byte + `forceDeactivation` bool, matching Java
+    /// `ClientClusterImpl.java:83-86@2.17.0`.
     #[test]
-    fn should_encode_cluster_change_state_request() {
+    fn should_encode_cluster_change_state_request_with_force_deactivation_bit() {
         let bytes = encode_request(&ClusterChangeStateRequest {
             state: ClusterState::ActiveReadOnly,
             force_deactivation: false,
+            supports_force_deactivation_flag: true,
         });
 
         assert_eq!(bytes, vec![ClusterState::ActiveReadOnly as u8, 0]);
+    }
+
+    /// FND-056 — When `FORCE_DEACTIVATION_FLAG` is NOT negotiated, Java omits
+    /// the trailing bool entirely (`ClientClusterImpl.java:85-91@2.17.0` — the
+    /// `writeBoolean` call sits under an `isFeatureSupported` check). Rust
+    /// was always writing the byte, mis-aligning the server's frame state
+    /// against older servers.
+    #[test]
+    fn should_encode_cluster_change_state_request_without_force_deactivation_bit() {
+        let bytes = encode_request(&ClusterChangeStateRequest {
+            state: ClusterState::ActiveReadOnly,
+            force_deactivation: true,
+            supports_force_deactivation_flag: false,
+        });
+
+        assert_eq!(bytes, vec![ClusterState::ActiveReadOnly as u8]);
     }
 
     #[test]

@@ -142,6 +142,10 @@ impl TokioExec {
         self.transport.supports_transactions().await
     }
 
+    pub(crate) async fn supports_force_deactivation_flag(&self) -> bool {
+        self.transport.supports_force_deactivation_flag().await
+    }
+
     pub(crate) fn register_cache_listener_name(
         &self,
         cache_id: i32,
