@@ -4,7 +4,8 @@ use crate::error::{IgniteError, IgniteResult};
 use crate::exec::TokioExec;
 use crate::protocol::complex_obj::IgniteValue;
 use crate::protocol::{
-    read_i32, read_string, read_u8, write_i32, write_i64, write_string, write_u8,
+    read_i32, read_string, read_u8, write_i32, write_i64, write_string, write_string_type_code,
+    write_u8,
 };
 use crate::transport::RequestRoute;
 use crate::{ReadableReq, ReadableType, WritableType, WriteableReq};
@@ -253,7 +254,11 @@ struct ServiceInvokeRequest<'a> {
 
 impl WriteableReq for ServiceInvokeRequest<'_> {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
-        write_string(writer, &self.service_name)?;
+        // FND-046: service_name and method_name are typed strings — Java
+        // `writer.writeString(...)` emits `[STRING_CODE (9), i32 len, bytes]`.
+        // Raw strings caused the server's `BinaryReaderEx.readString()` to
+        // read the length prefix as the type-code byte.
+        write_string_type_code(writer, &self.service_name)?;
         write_u8(writer, 0)?;
         write_i64(writer, self.timeout_ms)?;
         write_i32(writer, self.cluster_node_ids.len() as i32)?;
@@ -263,7 +268,7 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
             write_i64(writer, most)?;
             write_i64(writer, least)?;
         }
-        write_string(writer, &self.method_name)?;
+        write_string_type_code(writer, &self.method_name)?;
         write_i32(writer, self.args.len() as i32)?;
         for arg in self.args {
             arg.write(writer)?;
@@ -273,13 +278,13 @@ impl WriteableReq for ServiceInvokeRequest<'_> {
     }
 
     fn size(&self) -> usize {
-        4 + self.service_name.len()
+        // Typed strings add a 1-byte TypeCode::String prefix.
+        1 + 4 + self.service_name.len()
             + 1
             + 8
             + 4
             + self.cluster_node_ids.len() * 16
-            + 4
-            + self.method_name.len()
+            + 1 + 4 + self.method_name.len()
             + 4
             + self.args.iter().map(WritableType::size).sum::<usize>()
             + nullable_map_size(self.call_context.map(|ctx| &ctx.values))
@@ -376,5 +381,66 @@ fn nullable_map_size(values: Option<&HashMap<String, IgniteValue>>) -> usize {
                 .sum::<usize>()
         }
         None => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TypeCode;
+
+    const TYPE_CODE_STRING: u8 = TypeCode::String as u8;
+
+    fn build_request<'a>(
+        args: &'a [IgniteValue],
+        call_context: Option<&'a ServiceCallContext>,
+    ) -> ServiceInvokeRequest<'a> {
+        ServiceInvokeRequest {
+            service_name: "svc".to_string(),
+            timeout_ms: 0,
+            cluster_node_ids: Vec::new(),
+            method_name: "m".to_string(),
+            args,
+            call_context,
+        }
+    }
+
+    /// FND-046: Java `writer.writeString(name)` emits
+    /// `[STRING_CODE (9), i32 len, bytes]`. The Rust request must write the
+    /// service name and method name as typed strings — not raw — so the
+    /// server's `BinaryReaderEx.readString()` succeeds.
+    #[test]
+    fn service_and_method_names_are_typed_strings() {
+        let req = build_request(&[], None);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // service_name typed string at byte 0.
+        assert_eq!(
+            buf[0], TYPE_CODE_STRING,
+            "service_name must be typed string (TypeCode::String = 9)"
+        );
+        let svc_len = i32::from_le_bytes(buf[1..5].try_into().unwrap());
+        assert_eq!(svc_len as usize, "svc".len());
+        assert_eq!(&buf[5..5 + "svc".len()], b"svc");
+
+        // Typed-svc header = 1+4+3 = 8; flags = 1; timeout = 8; node_count = 4.
+        // method_name typed string starts at 8+1+8+4 = 21.
+        let method_offset = 1 + 4 + "svc".len() + 1 + 8 + 4;
+        assert_eq!(
+            buf[method_offset], TYPE_CODE_STRING,
+            "method_name must be typed string"
+        );
+    }
+
+    /// FND-046: `size()` must exactly equal the written byte count so the
+    /// 4-byte request-length pre-allocation is correct.
+    #[test]
+    fn service_invoke_size_matches_written_bytes() {
+        let args = [IgniteValue::from("ping".to_string())];
+        let req = build_request(&args, None);
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+        assert_eq!(req.size(), buf.len());
     }
 }

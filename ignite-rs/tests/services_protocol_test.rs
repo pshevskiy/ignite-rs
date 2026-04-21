@@ -238,6 +238,9 @@ enum CtxValue {
 
 fn decode_service_invoke_payload(payload: &[u8]) -> DecodedInvokePayload {
     let mut cursor = Cursor::new(payload);
+    // FND-046: service_name is a typed string (TypeCode::String byte + raw).
+    let svc_code = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
+    assert_eq!(svc_code, ignite_rs::protocol::TypeCode::String as u8);
     let service_name = ignite_rs::protocol::read_string(&mut cursor).unwrap();
     let _flags = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
     let timeout_ms = ignite_rs::protocol::read_i64(&mut cursor).unwrap();
@@ -248,6 +251,9 @@ fn decode_service_invoke_payload(payload: &[u8]) -> DecodedInvokePayload {
         let least = ignite_rs::protocol::read_i64(&mut cursor).unwrap();
         node_ids.push(MockUuid::new(most, least).as_string());
     }
+    // FND-046: method_name is also a typed string.
+    let method_code = ignite_rs::protocol::read_u8(&mut cursor).unwrap();
+    assert_eq!(method_code, ignite_rs::protocol::TypeCode::String as u8);
     let method_name = ignite_rs::protocol::read_string(&mut cursor).unwrap();
     let arg_count = ignite_rs::protocol::read_i32(&mut cursor).unwrap();
     let arg0 = if arg_count > 0 {
