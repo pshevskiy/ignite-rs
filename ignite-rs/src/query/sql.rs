@@ -945,10 +945,22 @@ pub(crate) fn read_sql_value_unwrapped(
             Ok(SqlValue::Map(entries))
         }
         TypeCode::WrappedData => {
-            read_i32(reader).map_err(IgniteError::from)?;
-            let value = read_sql_value(reader)?;
-            read_i32(reader).map_err(IgniteError::from)?;
-            Ok(value)
+            // Java §2.1: `BINARY_OBJ = 27 (0x1B)` is `i32 length; bytes[length];
+            // i32 offset`. Inner typed value starts at `bytes[offset]`, not at
+            // the reader's current position. Previously we called
+            // `read_sql_value(reader)` which read past the envelope into
+            // whatever followed (FND-021).
+            let len = read_i32(reader).map_err(IgniteError::from)? as usize;
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).map_err(IgniteError::from)?;
+            let offset = read_i32(reader).map_err(IgniteError::from)? as usize;
+            if offset > len {
+                return Err(IgniteError::from(
+                    format!("WrappedData offset {} exceeds body length {}", offset, len).as_str(),
+                ));
+            }
+            let mut inner = std::io::Cursor::new(&buf[offset..]);
+            read_sql_value(&mut inner)
         }
         TypeCode::Enum | TypeCode::BinaryEnum => read_enum(reader)
             .map(SqlValue::Enum)
@@ -1047,6 +1059,43 @@ mod tests {
     use crate::transport::SqlFieldsCapabilities;
     use crate::{ReadableReq, WriteableReq};
     use std::io::Cursor;
+
+    /// FND-021: Java §2.1 `BINARY_OBJ = 27 (0x1B)` wire format is
+    /// `i32 length; bytes[length]; i32 offset`. The inner typed value starts
+    /// at `bytes[offset]`, and after the envelope the reader must be at
+    /// position `bytes_end + 4` (offset consumed). Rust previously read
+    /// length (ignored), then ran `read_sql_value` on the raw reader — which
+    /// worked only for offset=0 and only when the inner value happened to
+    /// consume exactly `length` bytes, misreading anything else.
+    #[test]
+    fn should_decode_wrapped_data_with_non_zero_offset() {
+        // Construct a BINARY_OBJ envelope: four bytes of leading padding,
+        // then an Int SqlValue (1 code byte + 4 data bytes = 5 bytes).
+        let inner_type_code = TypeCode::Int as u8;
+        let inner_value_bytes: [u8; 4] = 0x1234_5678i32.to_le_bytes();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0u8; 4]); // padding
+        buf.push(inner_type_code);
+        buf.extend_from_slice(&inner_value_bytes);
+        let offset: i32 = 4;
+
+        // Outer envelope: 0x1B code byte, then length, bytes, offset.
+        let mut wire: Vec<u8> = Vec::new();
+        wire.push(TypeCode::WrappedData as u8);
+        wire.extend_from_slice(&(buf.len() as i32).to_le_bytes());
+        wire.extend_from_slice(&buf);
+        wire.extend_from_slice(&offset.to_le_bytes());
+        // Trailing sentinel: a single Null value after the envelope — ensures
+        // the reader is positioned correctly (not under- or over-consumed).
+        wire.push(TypeCode::Null as u8);
+
+        let mut cur = Cursor::new(wire);
+        let v = read_sql_value(&mut cur).unwrap();
+        assert_eq!(v, SqlValue::Int(0x1234_5678));
+        // After decoding, a Null follows.
+        let next = read_sql_value(&mut cur).unwrap();
+        assert_eq!(next, SqlValue::Null);
+    }
 
     #[test]
     fn should_decode_sql_value_arrays_and_nulls() {
