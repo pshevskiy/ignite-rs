@@ -113,6 +113,11 @@ pub(crate) struct ConnectionCapabilities {
     /// `ClientFeatureNotSupportedByServerException` when absent
     /// (`ClientClusterImpl.java:78-81@2.17.0`).
     pub(crate) cluster_states: bool,
+    /// Java `ProtocolBitmaskFeature.DATA_REPLICATION_OPERATIONS` (bit 12).
+    /// Required to send `CACHE_PUT_ALL_CONFLICT` / `CACHE_REMOVE_ALL_CONFLICT`.
+    /// Java throws `ClientFeatureNotSupportedByServerException`
+    /// (`TcpClientCache.java:1607-1611@2.17.0`).
+    pub(crate) data_replication_operations: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -499,6 +504,10 @@ where
                 ),
                 cluster_groups: feature_supported(&features, FEATURE_CLUSTER_GROUPS),
                 cluster_states: feature_supported(&features, FEATURE_CLUSTER_STATES),
+                data_replication_operations: feature_supported(
+                    &features,
+                    FEATURE_DATA_REPLICATION_OPERATIONS,
+                ),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

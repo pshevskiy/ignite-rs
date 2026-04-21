@@ -1482,6 +1482,15 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
 
     pub async fn put_all_conflict(&self, entries: &[(K, ConflictEntry<V>)]) -> IgniteResult<()> {
         self.ensure_tx_cache_ops_allowed().await?;
+        // FND gate: Java `TcpClientCache.checkDataReplicationSupported` throws
+        // `ClientFeatureNotSupportedByServerException` when
+        // `DATA_REPLICATION_OPERATIONS` (bit 12) is not negotiated
+        // (`TcpClientCache.java:1607-1611@2.17.0`).
+        if !self.exec.supports_data_replication_operations().await {
+            return Err(IgniteError::from(
+                "DATA_REPLICATION_OPERATIONS is not supported by the server",
+            ));
+        }
         self.map_tx_err(
             self.exec
                 .send_with_route(
@@ -1499,6 +1508,15 @@ impl<K: WritableType + ReadableType, V: WritableType + ReadableType> CacheCore<K
 
     pub async fn remove_all_conflict(&self, entries: &[(K, CacheVersion)]) -> IgniteResult<()> {
         self.ensure_tx_cache_ops_allowed().await?;
+        // FND gate: Java `TcpClientCache.checkDataReplicationSupported` throws
+        // `ClientFeatureNotSupportedByServerException` when
+        // `DATA_REPLICATION_OPERATIONS` (bit 12) is not negotiated
+        // (`TcpClientCache.java:1607-1611@2.17.0`).
+        if !self.exec.supports_data_replication_operations().await {
+            return Err(IgniteError::from(
+                "DATA_REPLICATION_OPERATIONS is not supported by the server",
+            ));
+        }
         self.map_tx_err(
             self.exec
                 .send_with_route(

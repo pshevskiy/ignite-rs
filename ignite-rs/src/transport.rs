@@ -460,6 +460,10 @@ impl Channel {
         self.metadata.capabilities.cluster_states
     }
 
+    fn supports_data_replication_operations(&self) -> bool {
+        self.metadata.capabilities.data_replication_operations
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -2075,6 +2079,15 @@ impl ChannelManager {
     /// (`ClientClusterImpl.java:78-81@2.17.0`).
     pub(crate) async fn supports_cluster_states(&self) -> bool {
         self.default_channel().await.supports_cluster_states()
+    }
+
+    /// True if the default channel negotiated `DATA_REPLICATION_OPERATIONS`
+    /// (bit 12). Gates `CACHE_PUT_ALL_CONFLICT` and
+    /// `CACHE_REMOVE_ALL_CONFLICT` (`TcpClientCache.java:1607-1611@2.17.0`).
+    pub(crate) async fn supports_data_replication_operations(&self) -> bool {
+        self.default_channel()
+            .await
+            .supports_data_replication_operations()
     }
 
     async fn connect_specific(&self, address: String) -> IgniteResult<Arc<Channel>> {
