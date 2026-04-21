@@ -177,4 +177,36 @@ mod tests {
         );
         assert_eq!(req.size(), buf.len());
     }
+
+    /// FND-060: a failed CACHE_INVOKE response with server status
+    /// `ENTRY_PROCESSOR_EXCEPTION (1040)` must surface as
+    /// `ErrorKind::EntryProcessorException`, distinct from any other server
+    /// error. Java `TcpClientCache.java:922-923@2.17.0` rethrows as
+    /// `javax.cache.processor.EntryProcessorException(serverErrMsg)`. All
+    /// invoke dispatch goes through `exec.send_and_read_with_route`, which
+    /// funnels `Flag::Failure { status, err_msg }` into
+    /// `IgniteError::from_server_status(status, err_msg)` — the mapping is
+    /// pinned here so a future refactor of the error plumbing keeps the
+    /// EntryProcessorException channel distinguishable from generic
+    /// `ErrorKind::Server`.
+    #[test]
+    fn invoke_entry_processor_exception_maps_to_distinct_error_kind() {
+        use crate::error::{ErrorKind, IgniteError};
+
+        let err = IgniteError::from_server_status(1040, "UserProcessor failed: NPE at line 7");
+        assert_eq!(err.kind(), ErrorKind::EntryProcessorException);
+        assert_eq!(err.server_status(), Some(1040));
+        assert!(err.to_string().contains("UserProcessor failed"));
+
+        // Any other non-zero status stays a generic ServerError — a caller
+        // that specifically checks for 1040 must not accidentally match.
+        for other in [1, 1000, 1011, 1012, 1020, 1021] {
+            let err = IgniteError::from_server_status(other, "");
+            assert_ne!(
+                err.kind(),
+                ErrorKind::EntryProcessorException,
+                "status {other} must not be mistaken for 1040"
+            );
+        }
+    }
 }
