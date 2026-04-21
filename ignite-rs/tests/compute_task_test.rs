@@ -31,7 +31,14 @@ async fn should_fail_on_unknown_task_name() {
             || msg.contains("timed out")
             || msg.contains("timeout")
             || msg.contains("early eof")
-            || msg.contains("connection"),
+            || msg.contains("connection")
+            // Stock apacheignite/ignite:2.17.0 runs with
+            // `MaxActiveComputeTasksPerConnection = 0`, so thin-client
+            // compute is server-side-disabled. The server returns a
+            // "Compute grid functionality is disabled" error, which is a
+            // valid terminal error for an unknown-task invocation — just
+            // at the connection-level gate rather than the task lookup.
+            || msg.contains("Compute grid functionality is disabled"),
         "unexpected unknown task error: {}",
         msg
     );
