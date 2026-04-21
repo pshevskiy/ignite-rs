@@ -1,9 +1,11 @@
-use crate::api::key_value::{cache_info_size, write_cache_info, CacheInfo, CacheReq};
+use crate::api::key_value::{CacheInfo, CacheReq, KEEP_BINARY_FLAG_MASK};
 use crate::api::OpCode;
 use crate::connection_async::NotificationFrame;
 use crate::error::{IgniteError, IgniteResult};
 use crate::exec::TokioExec;
-use crate::protocol::{read_i32, read_i64, read_u8, write_bool, write_i32, write_i64, write_null};
+use crate::protocol::{
+    read_i32, read_i64, read_u8, write_bool, write_i32, write_i64, write_null, write_u8,
+};
 use crate::{ReadableReq, ReadableType, WriteableReq};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -85,7 +87,12 @@ pub(crate) struct ContinuousQueryRequest {
 
 impl WriteableReq for ContinuousQueryRequest {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
-        write_cache_info(writer, self.cache_info)?;
+        // Java `ClientCacheEntryListenerHandler.java:92-143@2.17.0` — continuous
+        // query is not transactional; prefix is `cacheId + keepBinary flag`
+        // only. `write_cache_info` would emit expiry-policy / tx-id bytes that
+        // mis-align the rest of the frame (FND-020).
+        write_i32(writer, self.cache_info.cache_id)?;
+        write_u8(writer, self.cache_info.flags & KEEP_BINARY_FLAG_MASK)?;
         write_i32(writer, self.query.page_size)?;
         write_i64(writer, self.query.time_interval.as_millis() as i64)?;
         write_bool(writer, self.query.include_expired)?;
@@ -94,7 +101,9 @@ impl WriteableReq for ContinuousQueryRequest {
     }
 
     fn size(&self) -> usize {
-        cache_info_size(self.cache_info) + 4 + 8 + 1 + 1
+        // cacheId(4) + flags(1) + pageSize(4) + timeInterval(8) +
+        // includeExpired(1) + null filter-factory(1).
+        4 + 1 + 4 + 8 + 1 + 1
     }
 }
 
@@ -325,6 +334,53 @@ impl<K: ReadableType, V: ReadableType> Drop for RegisteredCacheEntryListener<K, 
         if let Some(close_tx) = self.registry.deregister(self.cache_id, &self.name) {
             let _ = close_tx.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::key_value::KEEP_BINARY_FLAG_MASK;
+    use crate::cache::{ExpiryDuration, ExpiryPolicy};
+
+    /// FND-020: `ClientCacheEntryListenerHandler.java:92-143@2.17.0` expects the
+    /// continuous-query prefix to be `cacheId (i32) + flags (i8)` followed by
+    /// `pageSize (i32) + timeInterval (i64) + includeExpired (bool) + null
+    /// filter-factory`. No expiry-policy triple, no tx-id — those fields are
+    /// part of `write_cache_info` but continuous-query is not transactional.
+    /// Rust previously called `write_cache_info`, so any caller that set an
+    /// expiry policy or tx id mis-aligned the rest of the frame.
+    #[test]
+    fn continuous_query_request_uses_cache_id_and_flags_only() {
+        let cache_info = CacheInfo::new(0x11223344)
+            .with_keep_binary(true)
+            .with_expiry_policy(Some(ExpiryPolicy::new(
+                ExpiryDuration::Zero,
+                ExpiryDuration::Unchanged,
+                ExpiryDuration::Zero,
+            )));
+        let req = ContinuousQueryRequest {
+            cache_info,
+            query: ContinuousQuery::default()
+                .with_page_size(32)
+                .with_time_interval(Duration::from_millis(1_000))
+                .with_include_expired(true),
+        };
+        let mut actual = Vec::new();
+        req.write(&mut actual).unwrap();
+
+        // Expected Java wire shape: cacheId + flags + pageSize + timeInterval
+        // + includeExpired + null filter-factory.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0x11223344i32.to_le_bytes());
+        expected.push(KEEP_BINARY_FLAG_MASK);
+        expected.extend_from_slice(&32i32.to_le_bytes());
+        expected.extend_from_slice(&1_000i64.to_le_bytes());
+        expected.push(1u8); // true
+        expected.push(crate::protocol::TypeCode::Null as u8);
+
+        assert_eq!(actual, expected);
+        assert_eq!(req.size(), actual.len());
     }
 }
 
