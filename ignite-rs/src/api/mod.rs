@@ -100,6 +100,8 @@ pub(crate) enum OpCode {
     SetClear = 9021,
     SetIteratorStart = 9022,
     SetIteratorGetPage = 9023,
+    /// Java `ClientOperation.OP_STOP_WARMUP=10000@2.17.0` — cluster warmup stop op.
+    OpStopWarmup = 10000,
 }
 
 impl Into<i16> for OpCode {
@@ -123,4 +125,12 @@ mod tests {
         assert_eq!(code, 0, "Java RESOURCE_CLOSE=0");
     }
 
+    /// FND-002: Java 2.17.0 defines `OP_STOP_WARMUP = 10000`
+    /// (`ClientOperation.OP_STOP_WARMUP(10000)`). Rust must expose the
+    /// same op for parity with the Java opcode table.
+    #[test]
+    fn opcode_stop_warmup_matches_java_2_17_0() {
+        let code: i16 = OpCode::OpStopWarmup.into();
+        assert_eq!(code, 10000, "Java OP_STOP_WARMUP=10000");
+    }
 }
