@@ -76,6 +76,16 @@ pub(crate) struct ConnectionCapabilities {
     pub(crate) service_invoke_callctx: bool,
     /// Java `ProtocolVersionFeature.TRANSACTIONS` (V1_5_0+). Gate for tx_start.
     pub(crate) transactions: bool,
+    /// Java `ProtocolBitmaskFeature.ALL_AFFINITY_MAPPINGS` (bit 13). Gates
+    /// the `bool customMappingsRequired` field in `CACHE_PARTITIONS` request
+    /// and the `bool defaultAffinity` field in the response (Java §9.1,
+    /// FND-053 / FND-054).
+    pub(crate) all_affinity_mappings: bool,
+    /// Java `ProtocolBitmaskFeature.FORCE_DEACTIVATION_FLAG` (bit 19). Gates
+    /// the trailing `bool forceDeactivation` field in `CLUSTER_CHANGE_STATE`
+    /// (Java §9, FND-056). When not negotiated, the field is omitted and
+    /// `forceDeactivation=false` is unsupported server-side.
+    pub(crate) force_deactivation_flag: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -434,6 +444,14 @@ where
                     FEATURE_SERVICE_INVOKE_CALLCTX,
                 ),
                 transactions: version_supports_transactions(V_MAJOR, V_MINOR, V_PATCH),
+                all_affinity_mappings: feature_supported(
+                    &features,
+                    FEATURE_ALL_AFFINITY_MAPPINGS,
+                ),
+                force_deactivation_flag: feature_supported(
+                    &features,
+                    FEATURE_FORCE_DEACTIVATION_FLAG,
+                ),
             };
             let server_node_id = if capabilities.partition_awareness {
                 Some(read_typed_uuid_string(&mut rdr)?)

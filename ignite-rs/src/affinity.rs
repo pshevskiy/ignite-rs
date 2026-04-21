@@ -1,7 +1,8 @@
 use crate::connection_async::read_uuid_string;
 use crate::error::{IgniteError, IgniteResult};
 use crate::protocol::{
-    read_bool, read_i16, read_i32, read_i64, read_string, write_i32, write_string, TypeCode,
+    read_bool, read_i16, read_i32, read_i64, read_string, write_bool, write_i32, write_string,
+    TypeCode,
 };
 use crate::topology::TopologyVersion;
 use crate::utils::string_to_java_hashcode;
@@ -18,6 +19,21 @@ const MAX_AFFINITY_PARTITION_ID: i32 = 65_535;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CachePartitionsRequest {
+    /// ALL_AFFINITY_MAPPINGS bit (13) negotiated on the channel this request is
+    /// sent on. When true, the Java wire shape prepends a `bool
+    /// customMappingsRequired` before the cache-id array (Java §9.1,
+    /// `ClientCacheAffinityMapping.writeRequest@2.17.0`).
+    pub(crate) all_affinity_mappings: bool,
+    /// Matches Java's `customMappingsRequired` flag — set when the client wants
+    /// the server to include custom (non-Rendezvous) affinity mappings in the
+    /// response. Ignored when `all_affinity_mappings == false`.
+    pub(crate) custom_mappings_required: bool,
+    /// Gridgain-downstream DC_AWARE extension (bit 22, not present in Java
+    /// 2.17.0). Only true when both the client user-attribute
+    /// `IGNITE_DATA_CENTER_ID` is set AND the server advertises bit 22 (FND-005
+    /// gate in `connection_async.rs`). When the DC_AWARE bit is negotiated the
+    /// server expects a typed-string (or `-1 i32` nullable) after the
+    /// `customMappingsRequired` bool.
     pub(crate) include_dc_id: bool,
     pub(crate) dc_id: Option<String>,
     pub(crate) cache_ids: Vec<i32>,
@@ -25,6 +41,9 @@ pub(crate) struct CachePartitionsRequest {
 
 impl WriteableReq for CachePartitionsRequest {
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
+        if self.all_affinity_mappings {
+            write_bool(writer, self.custom_mappings_required)?;
+        }
         if self.include_dc_id {
             match self.dc_id.as_deref() {
                 Some(dc_id) => write_string(writer, dc_id)?,
@@ -39,11 +58,13 @@ impl WriteableReq for CachePartitionsRequest {
     }
 
     fn size(&self) -> usize {
-        (if self.include_dc_id {
-            4 + self.dc_id.as_ref().map(|dc_id| dc_id.len()).unwrap_or(0)
-        } else {
-            0
-        }) + 4
+        (if self.all_affinity_mappings { 1 } else { 0 })
+            + (if self.include_dc_id {
+                4 + self.dc_id.as_ref().map(|dc_id| dc_id.len()).unwrap_or(0)
+            } else {
+                0
+            })
+            + 4
             + (self.cache_ids.len() * 4)
     }
 }
@@ -517,13 +538,95 @@ fn array_hash_bool(reader: &mut impl Read) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        affinity_hash_marshaled, marshal_key, rendezvous_partition, CachePartitionsResponse,
+        affinity_hash_marshaled, marshal_key, rendezvous_partition, CachePartitionsRequest,
+        CachePartitionsResponse,
     };
     use crate::connection_async::read_uuid_string;
     use crate::protocol::{write_bool, write_i32, write_i64};
     use crate::topology::TopologyVersion;
+    use crate::WriteableReq;
     use std::io::Cursor;
     use std::sync::Arc;
+
+    /// FND-053 — Java `ClientCacheAffinityMapping.writeRequest@2.17.0` emits
+    /// `bool customMappingsRequired` before the cache-id array when the
+    /// `ALL_AFFINITY_MAPPINGS` feature bit (13) is negotiated. Against any
+    /// 2.17.0 server the bit is always advertised — so the bool must always
+    /// precede `cacheIdCount` on the wire.
+    #[test]
+    fn cache_partitions_request_matches_java_layout_when_all_affinity_mappings_supported() {
+        let req = CachePartitionsRequest {
+            all_affinity_mappings: true,
+            custom_mappings_required: false,
+            include_dc_id: false,
+            dc_id: None,
+            cache_ids: vec![99, 100],
+        };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let mut expected = Vec::new();
+        write_bool(&mut expected, false).unwrap(); // customMappingsRequired
+        write_i32(&mut expected, 2).unwrap(); // cacheIdCount
+        write_i32(&mut expected, 99).unwrap();
+        write_i32(&mut expected, 100).unwrap();
+
+        assert_eq!(buf, expected);
+        assert_eq!(req.size(), buf.len());
+    }
+
+    /// When the `ALL_AFFINITY_MAPPINGS` bit is NOT negotiated (old server), the
+    /// Java client omits the bool — `writeRequest` writes only
+    /// `i32 cacheIdCount` + the cache-id array.
+    #[test]
+    fn cache_partitions_request_omits_custom_mappings_when_bit_not_negotiated() {
+        let req = CachePartitionsRequest {
+            all_affinity_mappings: false,
+            custom_mappings_required: false,
+            include_dc_id: false,
+            dc_id: None,
+            cache_ids: vec![42],
+        };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let mut expected = Vec::new();
+        write_i32(&mut expected, 1).unwrap();
+        write_i32(&mut expected, 42).unwrap();
+
+        assert_eq!(buf, expected);
+        assert_eq!(req.size(), buf.len());
+    }
+
+    /// Gridgain-downstream DC_AWARE extension (bit 22, not in Java 2.17.0):
+    /// when negotiated, the dc-id typed-string follows the
+    /// `customMappingsRequired` bool. Preserved here for downstream
+    /// compatibility. See FND-005 / FND-053 (Rust keeps this branch as the
+    /// gridgain wire extension).
+    #[test]
+    fn cache_partitions_request_prepends_custom_mappings_bool_even_with_dc_aware() {
+        let req = CachePartitionsRequest {
+            all_affinity_mappings: true,
+            custom_mappings_required: true,
+            include_dc_id: true,
+            dc_id: Some("dc1".to_string()),
+            cache_ids: vec![7],
+        };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        let mut expected = Vec::new();
+        write_bool(&mut expected, true).unwrap();
+        crate::protocol::write_string(&mut expected, "dc1").unwrap();
+        write_i32(&mut expected, 1).unwrap();
+        write_i32(&mut expected, 7).unwrap();
+
+        assert_eq!(buf, expected);
+        assert_eq!(req.size(), buf.len());
+    }
 
     #[test]
     fn should_compute_affinity_hash_for_primitives_and_strings() {

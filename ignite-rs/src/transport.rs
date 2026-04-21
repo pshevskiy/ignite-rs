@@ -286,6 +286,14 @@ impl Channel {
         self.metadata.capabilities.transactions
     }
 
+    fn supports_all_affinity_mappings(&self) -> bool {
+        self.metadata.capabilities.all_affinity_mappings
+    }
+
+    fn supports_force_deactivation_flag(&self) -> bool {
+        self.metadata.capabilities.force_deactivation_flag
+    }
+
     fn server_node_id(&self) -> Option<&str> {
         self.metadata.server_node_id.as_deref()
     }
@@ -1707,12 +1715,16 @@ impl ChannelManager {
             return Ok(());
         }
 
-        let dc_aware_request = self.active.read().await.supports_dc_aware();
+        let active = self.active.read().await.clone();
+        let dc_aware_request = active.supports_dc_aware();
+        let all_affinity_mappings = active.supports_all_affinity_mappings();
         let dc_id = self.data_center_id().map(str::to_owned);
         let (raw, meta): (RawPayload, ResponseMeta) = match self
             .send_and_read_with_meta(
                 OpCode::CachePartitions,
                 CachePartitionsRequest {
+                    all_affinity_mappings,
+                    custom_mappings_required: false,
                     include_dc_id: dc_aware_request,
                     dc_id,
                     cache_ids: vec![cache_id],
