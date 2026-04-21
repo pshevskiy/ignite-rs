@@ -7,3 +7,16 @@ members = [
   "example",
   "xtask"
 ]
+
+# F.3 — PGO (Profile-Guided Optimization) release profile.
+# Two-phase build flow:
+#   1. Instrument: cargo +nightly rustc --bench hot_path --release -- -Cprofile-generate=/tmp/pgo-data
+#      Run the bench once to collect profile data.
+#   2. Optimize: merge raw data with llvm-profdata merge -o /tmp/pgo-data/merged.profdata /tmp/pgo-data
+#      Rebuild: cargo +nightly rustc --bench hot_path --release -- -Cprofile-use=/tmp/pgo-data/merged.profdata
+#
+# Inherits from release but tightens codegen for PGO effectiveness.
+[profile.release-pgo]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
