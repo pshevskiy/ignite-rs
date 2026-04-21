@@ -110,7 +110,9 @@ impl IndexQueryCriterion {
                 upper_inclusive,
             } => {
                 crate::protocol::write_u8(writer, CRITERION_TYPE_RANGE)?;
-                crate::protocol::write_string(writer, field_name)?;
+                // FND-036: Java writes `range.field()` as a typed string via
+                // `w.writeString(range.field())` in `TcpClientCache.indexQuery`.
+                write_string_type_code(writer, field_name)?;
                 write_bool(writer, *lower_inclusive)?;
                 write_bool(writer, *upper_inclusive)?;
                 let lower_null = lower.is_none();
@@ -128,7 +130,8 @@ impl IndexQueryCriterion {
             }
             IndexQueryCriterion::In { field_name, values } => {
                 crate::protocol::write_u8(writer, CRITERION_TYPE_IN)?;
-                crate::protocol::write_string(writer, field_name)?;
+                // FND-036: typed string for field name, same as Range branch.
+                write_string_type_code(writer, field_name)?;
                 write_i32(writer, values.len() as i32)?;
                 for val in values {
                     val.write(writer)?;
@@ -147,7 +150,7 @@ impl IndexQueryCriterion {
                 ..
             } => {
                 1 // criterion type
-                + 4 + field_name.len() // string (len prefix + bytes)
+                + 1 + 4 + field_name.len() // typed string: code + len + bytes
                 + 1 + 1 // lower_inclusive, upper_inclusive
                 + 1 + 1 // lower_null, upper_null
                 + match lower { Some(val) => val.size(), None => 1 } // lower bound or null
@@ -155,7 +158,7 @@ impl IndexQueryCriterion {
             }
             IndexQueryCriterion::In { field_name, values } => {
                 1 // criterion type
-                + 4 + field_name.len() // string
+                + 1 + 4 + field_name.len() // typed string
                 + 4 // value count
                 + values.iter().map(|v| v.size()).sum::<usize>()
             }
@@ -363,6 +366,50 @@ mod tests {
         assert_eq!(buf[offset], TYPE_CODE_STRING);
         let len = i32::from_le_bytes(buf[offset + 1..offset + 5].try_into().unwrap());
         assert_eq!(len as usize, "idx_name".len());
+    }
+
+    /// FND-036: Range criterion `field_name` is a typed string.
+    #[test]
+    fn range_criterion_field_name_is_typed_string() {
+        let query = IndexQuery::new("Person").with_criterion(IndexQueryCriterion::eq(
+            "age",
+            IgniteValue::Int(42),
+        ));
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // Layout so far: cache_info(5) + page_size(4) + local(1) + partition(4) + limit(4) = 18
+        // + typed valueType (1+4+6) = 29, + indexName NULL (1) = 30
+        // + criteria collection marker (1) + count (4) = 35
+        // → criterion byte at 35 (type=0 for Range), field_name typed string at 36.
+        assert_eq!(buf[35], 0u8, "Range criterion type");
+        assert_eq!(buf[36], TYPE_CODE_STRING, "field_name must be typed string");
+        let len = i32::from_le_bytes(buf[37..41].try_into().unwrap());
+        assert_eq!(len as usize, "age".len());
+        assert_eq!(&buf[41..41 + "age".len()], b"age");
+    }
+
+    /// FND-036: In-list criterion `field_name` is a typed string.
+    #[test]
+    fn in_list_criterion_field_name_is_typed_string() {
+        let query = IndexQuery::new("Person").with_criterion(IndexQueryCriterion::in_list(
+            "city",
+            vec![IgniteValue::String("NYC".to_string())],
+        ));
+        let req = IndexQueryRequest {
+            cache_info: CacheInfo::new(1),
+            query: &query,
+        };
+        let mut buf = Vec::new();
+        req.write(&mut buf).unwrap();
+
+        // Criterion byte at offset 35 (see above), field_name starts at 36.
+        assert_eq!(buf[35], 1u8, "In-list criterion type");
+        assert_eq!(buf[36], TYPE_CODE_STRING, "field_name must be typed string");
     }
 
     /// FND-033: `indexName` when None is a single NULL type code byte.
