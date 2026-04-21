@@ -352,3 +352,60 @@ impl WriteableReq for TxEndRequest {
         4 + 1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TransactionConcurrency, TransactionIsolation, TransactionOptions, TxStartRequest,
+    };
+    use crate::WriteableReq;
+    use std::time::Duration;
+
+    const TYPE_CODE_STRING: u8 = 0x09;
+    const TYPE_CODE_NULL: u8 = 0x65;
+
+    /// FND-029: `TxStart` options must be laid out as
+    /// `u8 concurrency; u8 isolation; i64 timeout_ms; typed-string label-or-null`.
+    /// Matches Java `TcpClientTransactions.txStart0` writer.
+    #[test]
+    fn tx_start_request_matches_java_layout() {
+        let options = TransactionOptions::new()
+            .with_concurrency(TransactionConcurrency::Pessimistic)
+            .with_isolation(TransactionIsolation::Serializable)
+            .with_timeout(Duration::from_millis(777))
+            .with_label("phase3");
+        let req = TxStartRequest { options: &options };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).expect("serialize");
+        assert_eq!(buf.len(), req.size(), "declared size must match encoded len");
+
+        assert_eq!(buf[0], TransactionConcurrency::Pessimistic as u8);
+        assert_eq!(buf[1], TransactionIsolation::Serializable as u8);
+        assert_eq!(i64::from_le_bytes(buf[2..10].try_into().unwrap()), 777);
+        // Label is encoded as typed string: 0x09 + i32 len + UTF-8 bytes.
+        assert_eq!(buf[10], TYPE_CODE_STRING);
+        assert_eq!(i32::from_le_bytes(buf[11..15].try_into().unwrap()), 6);
+        assert_eq!(&buf[15..21], b"phase3");
+    }
+
+    /// FND-029: null label is encoded as the typed-NULL marker (0x65),
+    /// matching Java `BinaryWriterEx.writeString(null)`.
+    #[test]
+    fn tx_start_request_encodes_null_label_as_typed_null() {
+        let options = TransactionOptions::new()
+            .with_concurrency(TransactionConcurrency::Optimistic)
+            .with_isolation(TransactionIsolation::ReadCommitted);
+        let req = TxStartRequest { options: &options };
+
+        let mut buf = Vec::new();
+        req.write(&mut buf).expect("serialize");
+        assert_eq!(buf.len(), req.size());
+
+        assert_eq!(buf[0], TransactionConcurrency::Optimistic as u8);
+        assert_eq!(buf[1], TransactionIsolation::ReadCommitted as u8);
+        assert_eq!(i64::from_le_bytes(buf[2..10].try_into().unwrap()), 0);
+        assert_eq!(buf[10], TYPE_CODE_NULL);
+        assert_eq!(buf.len(), 11);
+    }
+}
