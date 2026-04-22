@@ -117,7 +117,7 @@ async fn should_emit_reconnect_events_after_connection_recovery() {
         return;
     }
 
-    let addr = env.addr().to_string();
+    let addr = &env.addr().to_string();
 
     let mut conf = env.client_config().unwrap();
     conf.event_subscriptions = EventSubscriptions {

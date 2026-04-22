@@ -152,7 +152,12 @@ enum TestEnvHandle {
 
 #[derive(Debug)]
 pub struct IgniteTestEnv {
-    addr: String,
+    // Boxed in a Mutex because a managed container's host port may change
+    // across stop/start (Docker auto-publish picks a fresh ephemeral port
+    // on restart unless an explicit host port was pinned at create time).
+    // Keeping the addr behind a lock lets `start()` refresh it after
+    // `docker start` completes.
+    addr: std::sync::Mutex<String>,
     username: Option<String>,
     password: Option<String>,
     tls_server_name: Option<String>,
@@ -165,7 +170,7 @@ pub struct IgniteTestEnv {
 impl IgniteTestEnv {
     fn external(addr: String) -> Self {
         Self {
-            addr,
+            addr: std::sync::Mutex::new(addr),
             username: None,
             password: None,
             tls_server_name: None,
@@ -178,7 +183,7 @@ impl IgniteTestEnv {
 
     fn external_auth(addr: String, username: String, password: String) -> Self {
         Self {
-            addr,
+            addr: std::sync::Mutex::new(addr),
             username: Some(username),
             password: Some(password),
             tls_server_name: None,
@@ -198,7 +203,7 @@ impl IgniteTestEnv {
         client_key_pem: Option<String>,
     ) -> Self {
         Self {
-            addr,
+            addr: std::sync::Mutex::new(addr),
             username: None,
             password: None,
             tls_server_name: Some(server_name),
@@ -211,13 +216,17 @@ impl IgniteTestEnv {
 
     fn containerized(profile: &str) -> Self {
         let managed = block_on_fixture(create_single_node(profile));
-        let addr = format!("{}:{}", docker_host_addr(), managed.port);
+        let addr = format!(
+            "{}:{}",
+            docker_host_addr(),
+            managed.port.load(std::sync::atomic::Ordering::SeqCst)
+        );
         let (username, password) = auth_defaults_for_profile(profile);
         let (tls_server_name, ca_pem, client_cert_pem, client_key_pem) =
             tls_defaults_for_profile(profile);
 
         Self {
-            addr,
+            addr: std::sync::Mutex::new(addr),
             username,
             password,
             tls_server_name,
@@ -228,8 +237,10 @@ impl IgniteTestEnv {
         }
     }
 
-    pub fn addr(&self) -> &str {
-        &self.addr
+    /// Current published address. Rebuilt by `start()` after a container
+    /// restart may have swapped the host port.
+    pub fn addr(&self) -> String {
+        self.addr.lock().unwrap().clone()
     }
 
     pub fn is_managed(&self) -> bool {
@@ -262,7 +273,7 @@ impl IgniteTestEnv {
 
     pub fn client_config(&self) -> IgniteResult<ClientConfig> {
         let mut conf = build_fixture_client_config(
-            self.addr(),
+            &self.addr(),
             self.tls_server_name(),
             self.ca_pem(),
             self.client_cert_pem(),
@@ -292,7 +303,14 @@ impl IgniteTestEnv {
             .as_ref()
             .expect("control requires managed fixture");
         start_container(&m.name);
-        let addr = format!("{}:{}", docker_host_addr(), m.port);
+        // `docker start` on an auto-published container may reassign the
+        // host port, so re-inspect the mapping and refresh both the managed
+        // port and the env address before probing.
+        let current_port = block_on_fixture(get_mapped_port(&m.name));
+        m.port
+            .store(current_port, std::sync::atomic::Ordering::SeqCst);
+        let addr = format!("{}:{}", docker_host_addr(), current_port);
+        *self.addr.lock().unwrap() = addr.clone();
         block_on_fixture(wait_for_tcp_ready(&addr, LOG_READY_TIMEOUT));
         ensure_profile_container_ready(&m.name, &m.profile);
     }
@@ -501,7 +519,10 @@ impl Drop for DelayedHandshakeEnv {
 struct ManagedContainer {
     name: String,
     profile: String,
-    port: u16,
+    // Atomic because docker's `publish-all` can reassign the host port across
+    // stop/start. `start()` refreshes this after `docker start` completes so
+    // subsequent `client_config()` calls see the new mapping.
+    port: std::sync::atomic::AtomicU16,
 }
 
 impl Drop for ManagedContainer {
@@ -1375,7 +1396,7 @@ async fn create_single_node(profile: &str) -> ManagedContainer {
     ManagedContainer {
         name,
         profile: profile.to_string(),
-        port,
+        port: std::sync::atomic::AtomicU16::new(port),
     }
 }
 
@@ -2068,7 +2089,7 @@ pub fn delayed_handshake_env(delay: Duration) -> io::Result<DelayedHandshakeEnv>
     }
 
     let env = ignite_test_env();
-    let target_addr = env.addr().to_string();
+    let target_addr = env.addr();
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?.to_string();
     let join = thread::spawn(move || {

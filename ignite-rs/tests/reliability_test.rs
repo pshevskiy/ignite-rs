@@ -24,7 +24,7 @@ async fn should_keep_idle_client_connected_with_heartbeats() {
     }
     env.wait_for_ready().await.unwrap();
 
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.heartbeat_enabled = true;
     conf.heartbeat_interval = Some(Duration::from_millis(250));
 
@@ -145,7 +145,7 @@ async fn should_allow_idle_connection_to_drop_when_heartbeats_are_disabled() {
     }
     env.wait_for_ready().await.unwrap();
 
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.retry_policy = RetryPolicy::Never;
 
     let client = new_client(conf).await.unwrap();
@@ -182,7 +182,7 @@ async fn should_recover_single_server_after_connection_drop() {
     env.wait_for_ready().await.unwrap();
 
     let cache_name = unique_name("reliability_single_server");
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.partition_awareness_enabled = false;
     conf.retry_limit = 1;
     conf.reconnect_backoff = Some(Duration::from_millis(100));
@@ -254,7 +254,7 @@ async fn should_retry_cache_get_with_read_only_retry_policy_after_connection_dro
     env.wait_for_ready().await.unwrap();
 
     let cache_name = unique_name("reliability_read_only_retry");
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.partition_awareness_enabled = false;
     conf.retry_policy = RetryPolicy::ReadOnly;
     conf.retry_limit = 16;
@@ -296,7 +296,7 @@ async fn should_throttle_reconnect_attempts_within_configured_window() {
         window: Duration::from_millis(700),
         max_attempts: 2,
     };
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.partition_awareness_enabled = false;
     conf.retry_limit = 1;
     conf.reconnect_backoff = Some(Duration::from_millis(100));

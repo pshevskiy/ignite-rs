@@ -387,9 +387,9 @@ async fn should_hold_lock_for_pessimistic_repeatable_read_transaction() {
     let env = ignite_test_env();
     env.wait_for_ready().await.unwrap();
 
-    let mut conf1 = ClientConfig::new(env.addr());
+    let mut conf1 = ClientConfig::new(&env.addr());
     conf1.request_timeout = Some(Duration::from_secs(10));
-    let mut conf2 = ClientConfig::new(env.addr());
+    let mut conf2 = ClientConfig::new(&env.addr());
     conf2.request_timeout = Some(Duration::from_secs(5));
     let client1 = new_client(conf1).await.unwrap();
     let client2 = new_client(conf2).await.unwrap();
@@ -646,9 +646,9 @@ async fn should_hold_lock_for_pessimistic_serializable_transaction() {
     let env = ignite_test_env();
     env.wait_for_ready().await.unwrap();
 
-    let mut conf2 = ClientConfig::new(env.addr());
+    let mut conf2 = ClientConfig::new(&env.addr());
     conf2.request_timeout = Some(Duration::from_secs(5));
-    let mut conf1 = ClientConfig::new(env.addr());
+    let mut conf1 = ClientConfig::new(&env.addr());
     conf1.request_timeout = Some(Duration::from_secs(10));
     let client1 = new_client(conf1).await.unwrap();
     let client2 = new_client(conf2).await.unwrap();
@@ -717,9 +717,9 @@ async fn should_detect_read_write_conflict_for_optimistic_serializable_transacti
     let env = ignite_test_env();
     env.wait_for_ready().await.unwrap();
 
-    let mut conf1 = ClientConfig::new(env.addr());
+    let mut conf1 = ClientConfig::new(&env.addr());
     conf1.request_timeout = Some(Duration::from_secs(10));
-    let mut conf2 = ClientConfig::new(env.addr());
+    let mut conf2 = ClientConfig::new(&env.addr());
     conf2.request_timeout = Some(Duration::from_secs(10));
     let client1 = new_client(conf1).await.unwrap();
     let client2 = new_client(conf2).await.unwrap();

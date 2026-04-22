@@ -128,7 +128,7 @@ async fn should_reconnect_to_same_live_address_when_dynamic_address_set_is_stabl
 #[tokio::test]
 async fn should_connect_using_next_configured_address_when_first_is_unreachable() {
     let env = ignite_test_env();
-    let addr = env.addr().to_string();
+    let addr = env.addr();
     let dead_addr = unused_local_addr();
     let conf = ClientConfig::from_addresses([dead_addr.as_str(), addr.as_str()]);
 

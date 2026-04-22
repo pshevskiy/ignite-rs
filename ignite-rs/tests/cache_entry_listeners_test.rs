@@ -259,7 +259,7 @@ async fn should_fail_live_continuous_query_when_single_node_fixture_stops() {
 
     env.wait_for_ready().await.unwrap();
 
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.partition_awareness_enabled = false;
     let client = new_client(conf).await.unwrap();
     let cache_name = unique_name("cq_live_disconnect");
@@ -574,7 +574,7 @@ async fn should_fail_both_cq_and_jcache_listeners_on_disconnect() {
 
     env.wait_for_ready().await.unwrap();
 
-    let mut conf = ClientConfig::new(env.addr());
+    let mut conf = ClientConfig::new(&env.addr());
     conf.partition_awareness_enabled = false;
     let client = new_client(conf).await.unwrap();
     let cache_name = unique_name("cq_live_disconnect_both");
@@ -646,7 +646,7 @@ async fn should_fail_both_cq_and_jcache_listeners_on_disconnect() {
     env.start();
     env.wait_for_ready().await.unwrap();
 
-    let reconnect_client = new_client(ClientConfig::new(env.addr())).await.unwrap();
+    let reconnect_client = new_client(ClientConfig::new(&env.addr())).await.unwrap();
     let reconnect_cache = reconnect_client
         .get_or_create_cache::<i32, i32>(&cache_name)
         .await
